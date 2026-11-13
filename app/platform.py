@@ -1,0 +1,330 @@
+"""Platform adapters (Telegram + Bale) behind one shared interface.
+
+Verified against official docs (2026-11):
+- Telegram Bot API 10.4: https://core.telegram.org/bots/api
+- Bale Bot API: https://docs.bale.ai/ (base https://tapi.bale.ai/bot<TOKEN>/METHOD)
+
+Key verified Bale differences implemented here:
+- No parse_mode (Bale always applies its own Markdown) -> we send plain text.
+- No sendSticker / no inline mode / no secret_token on webhooks (only `url`).
+- sendInvoice requires provider_token; LabeledPrice.amount is in Rial.
+- Webhook ports: 443 and 88 only.
+- answerCallbackQuery must always be called (buttons stay waiting otherwise).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any, Optional
+
+import httpx
+
+log = logging.getLogger("kanar.platform")
+
+RETRYABLE = {429, 500, 502, 503, 504}
+MAX_RETRIES = 4
+
+MEDIA_SEND = {
+    "photo": "sendPhoto", "voice": "sendVoice", "video": "sendVideo",
+    "document": "sendDocument", "audio": "sendAudio", "animation": "sendAnimation",
+    "video_note": "sendVideoNote", "location": "sendLocation", "contact": "sendContact",
+}
+# Cross-platform-safe types (documented on BOTH platforms):
+CROSS_OK = {"text", "photo", "voice", "video", "document", "audio", "animation", "location", "contact"}
+# Sticker: Telegram sendSticker exists; Bale sendSticker is NOT documented -> cross & bale disabled.
+# video_note: Bale sendVideoNote is NOT documented -> cross disabled.
+
+
+class PlatformError(Exception):
+    def __init__(self, method: str, error_code: int, description: str):
+        super().__init__(f"{method}: {error_code} {description}")
+        self.method, self.error_code, self.description = method, error_code, description
+
+
+class UnsupportedMethod(PlatformError):
+    def __init__(self, method: str, why: str):
+        super().__init__(method, 400, why)
+
+
+class BaseAdapter:
+    platform = ""
+    api_base = ""
+    file_base = ""
+
+    def __init__(self, token: str):
+        self.token = token
+        self._client: Optional[httpx.AsyncClient] = None
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    async def client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0))
+        return self._client
+
+    async def close(self):
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+
+    def chat_lock(self, chat_id: str) -> asyncio.Lock:
+        key = str(chat_id)
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
+
+    async def call(self, method: str, payload: Optional[dict] = None,
+                   files: Optional[dict] = None) -> Any:
+        """POST with 429/backoff handling and bounded retries."""
+        url = f"{self.api_base}{method}"
+        attempt = 0
+        backoff = 1.0
+        while True:
+            attempt += 1
+            try:
+                cli = await self.client()
+                if files:
+                    data = {k: (str(v) if not isinstance(v, (bytes, tuple)) else v)
+                            for k, v in (payload or {}).items()}
+                    resp = await cli.post(url, data=data, files=files)
+                else:
+                    resp = await cli.post(url, json=payload or {})
+                body = resp.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                if attempt >= MAX_RETRIES:
+                    raise PlatformError(method, 0, f"network: {exc}") from exc
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 15.0)
+                continue
+            if body.get("ok"):
+                return body.get("result")
+            err_code = body.get("error_code", resp.status_code)
+            desc = body.get("description", "unknown error")
+            if err_code == 429 and attempt < MAX_RETRIES:
+                params = body.get("parameters") or {}
+                retry = min(float(params.get("retry_after", 5)), 60.0)
+                log.warning("429 on %s.%s retry after %ss", self.platform, method, retry)
+                await asyncio.sleep(retry + 0.2)
+                continue
+            if err_code in RETRYABLE and attempt < MAX_RETRIES:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 15.0)
+                continue
+            raise PlatformError(method, err_code, desc)
+
+    # ---------------------------------------------------- messaging API ----
+    async def send_message(self, chat_id: int | str, text: str,
+                           keyboard: Optional[list[list[dict]]] = None,
+                           reply_to: Optional[int] = None) -> dict:
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text[:4096]}
+        if keyboard:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+        return await self.call("sendMessage", payload)
+
+    async def edit_message(self, chat_id: int | str, message_id: int, text: str,
+                           keyboard: Optional[list[list[dict]]] = None) -> Any:
+        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text[:4096]}
+        if keyboard:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
+        return await self.call("editMessageText", payload)
+
+    async def answer_callback(self, callback_query_id: str, text: str = "",
+                              alert: bool = False) -> Any:
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text[:200]
+        if alert:
+            payload["show_alert"] = True
+        return await self.call("answerCallbackQuery", payload)
+
+    async def send_media(self, chat_id: int | str, msg_type: str,
+                         file_id: Optional[str] = None, *, caption: str = "",
+                         bytes_data: Optional[bytes] = None, filename: str = "file",
+                         reply_to: Optional[int] = None, extra: Optional[dict] = None) -> dict:
+        if msg_type not in MEDIA_SEND:
+            raise UnsupportedMethod(msg_type, "media type not supported by adapter")
+        method = MEDIA_SEND[msg_type]
+        payload: dict[str, Any] = {"chat_id": chat_id}
+        if caption:
+            payload["caption"] = caption[:1024]
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+        payload.update(extra or {})
+        if bytes_data is not None:
+            files = {msg_type: (filename, bytes_data)}
+            return await self.call(method, payload, files=files)
+        if not file_id:
+            raise ValueError("file_id or bytes_data required")
+        payload[msg_type] = file_id
+        return await self.call(method, payload)
+
+    async def send_chat_action(self, chat_id: int | str, action: str) -> Any:
+        return await self.call("sendChatAction", {"chat_id": chat_id, "action": action})
+
+    async def get_file(self, file_id: str) -> dict:
+        return await self.call("getFile", {"file_id": file_id})
+
+    async def download_file(self, file_id: str, max_bytes: int) -> bytes:
+        info = await self.get_file(file_id)
+        path = info.get("file_path")
+        if not path:
+            raise PlatformError("getFile", 0, "no file_path")
+        size = info.get("file_size") or 0
+        if size and size > max_bytes:
+            raise UnsupportedMethod("download", f"file exceeds {max_bytes} bytes limit")
+        url = f"{self.file_base}{path}"
+        cli = await self.client()
+        # Bounded streaming download.
+        buf = bytearray()
+        async with cli.stream("GET", url) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes(64 * 1024):
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise UnsupportedMethod("download", f"stream exceeded {max_bytes} bytes")
+        return bytes(buf)
+
+    async def set_webhook(self, url: str) -> Any:
+        raise NotImplementedError
+
+    async def get_webhook_info(self) -> dict:
+        return await self.call("getWebhookInfo", {})
+
+    async def set_my_commands(self, commands: list[dict]) -> Any:
+        return await self.call("setMyCommands", {"commands": commands})
+
+    # -------------------------------------------------------- payments ----
+    async def send_invoice(self, chat_id: int | str, title: str, description: str,
+                           payload: str, prices: list[dict],
+                           provider_token: str = "") -> dict:
+        raise NotImplementedError
+
+    async def refund_payment(self, user_id: int, charge_id: str) -> Any:
+        raise NotImplementedError
+
+    # --------------------------------------------------------- polling ----
+    async def poll_updates(self, handler, stop: asyncio.Event):
+        """Long-polling fallback loop."""
+        offset = 0
+        while not stop.is_set():
+            try:
+                params = {"timeout": 25, "offset": offset, "limit": 50}
+                result = await self.call("getUpdates", params)
+                for upd in result or []:
+                    offset = max(offset, int(upd.get("update_id", 0)) + 1)
+                    try:
+                        await handler(upd)
+                    except Exception:
+                        log.exception("update handler failed (polling %s)", self.platform)
+            except PlatformError as exc:
+                log.warning("poll error %s: %s", self.platform, exc)
+                await asyncio.sleep(3)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("poll loop crash %s", self.platform)
+                await asyncio.sleep(5)
+
+
+class TelegramAdapter(BaseAdapter):
+    platform = "telegram"
+
+    def __init__(self, token: str, webhook_secret: str = ""):
+        super().__init__(token)
+        self.api_base = f"https://api.telegram.org/bot{token}/"
+        self.file_base = f"https://api.telegram.org/file/bot{token}/"
+        self.webhook_secret = webhook_secret
+
+    async def send_message(self, chat_id, text, keyboard=None, reply_to=None):
+        # Telegram supports HTML parse_mode.
+        import html as _h
+        payload = {"chat_id": chat_id, "text": _h.escape(text)[:4096], "parse_mode": "HTML"}
+        if keyboard:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
+        if reply_to:
+            payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+        return await self.call("sendMessage", payload)
+
+    async def send_media(self, chat_id, msg_type, file_id=None, *, caption="", bytes_data=None,
+                         filename="file", reply_to=None, extra=None):
+        if msg_type == "sticker":
+            payload = {"chat_id": chat_id, "sticker": file_id}
+            if bytes_data is not None:
+                return await self.call("sendSticker", payload, files={"sticker": (filename, bytes_data)})
+            return await self.call("sendSticker", payload)
+        return await super().send_media(chat_id, msg_type, file_id, caption=caption,
+                                         bytes_data=bytes_data, filename=filename,
+                                         reply_to=reply_to, extra=extra)
+
+    async def send_sticker(self, chat_id: int | str, file_id: str) -> dict:
+        return await self.call("sendSticker", {"chat_id": chat_id, "sticker": file_id})
+
+    async def set_webhook(self, url: str) -> Any:
+        return await self.call("setWebhook", {
+            "url": url, "secret_token": self.webhook_secret,
+            "max_connections": 60,
+            "allowed_updates": ["message", "callback_query", "pre_checkout_query"],
+            "drop_pending_updates": False})
+
+    async def send_invoice(self, chat_id, title, description, payload, prices, provider_token=""):
+        # Telegram Stars: currency XTR, empty provider_token, exactly one price item.
+        return await self.call("sendInvoice", {
+            "chat_id": chat_id, "title": title[:32], "description": description[:255],
+            "payload": payload, "currency": "XTR", "provider_token": "",
+            "prices": prices})
+
+    async def refund_payment(self, user_id: int, charge_id: str) -> Any:
+        return await self.call("refundStarPayment", {
+            "user_id": user_id, "telegram_payment_charge_id": charge_id})
+
+    def verify_webhook_secret(self, header: Optional[str]) -> bool:
+        import hmac
+        return bool(self.webhook_secret) and hmac.compare_digest(header or "", self.webhook_secret)
+
+
+class BaleAdapter(BaseAdapter):
+    platform = "bale"
+
+    def __init__(self, token: str, provider_token: str = ""):
+        super().__init__(token)
+        self.api_base = f"https://tapi.bale.ai/bot{token}/"
+        self.file_base = f"https://tapi.bale.ai/file/bot{token}/"
+        self.provider_token = provider_token
+
+    async def send_message(self, chat_id, text, keyboard=None, reply_to=None):
+        # Verified: Bale has NO parse_mode; text is always Bale-Markdown formatted,
+        # so we neutralise markdown metacharacters to guarantee plain-text rendering.
+        safe = text.replace("*", "\\*").replace("_", "\\_").replace("`", "\\`").replace("[", "\\[")
+        return await super().send_message(chat_id, safe, keyboard, reply_to)
+
+    async def send_media(self, chat_id, msg_type, file_id=None, *, caption="", bytes_data=None,
+                         filename="file", reply_to=None, extra=None):
+        if msg_type in ("sticker", "video_note", "poll"):
+            # NOT documented on Bale (no sendSticker/sendVideoNote in docs.bale.ai).
+            raise UnsupportedMethod(msg_type, f"{msg_type} is not supported by Bale Bot API")
+        return await super().send_media(chat_id, msg_type, file_id, caption=caption,
+                                         bytes_data=bytes_data, filename=filename,
+                                         reply_to=reply_to, extra=extra)
+
+    async def set_webhook(self, url: str) -> Any:
+        # Verified: Bale setWebhook accepts only `url` (no secret_token documented).
+        return await self.call("setWebhook", {"url": url})
+
+    async def send_invoice(self, chat_id, title, description, payload, prices, provider_token=""):
+        if not (provider_token or self.provider_token):
+            raise UnsupportedMethod("sendInvoice", "BALE_PROVIDER_TOKEN not configured")
+        # Verified: amounts are in Rial; provider_token required; no currency param.
+        return await self.call("sendInvoice", {
+            "chat_id": chat_id, "title": title[:32], "description": description[:255],
+            "payload": payload, "provider_token": provider_token or self.provider_token,
+            "prices": prices})
+
+    async def refund_payment(self, user_id: int, charge_id: str) -> Any:
+        # Verified absence: no refund method documented in Bale Bot API.
+        raise UnsupportedMethod("refund", "Bale Bot API documents no refund method; "
+                                          "refunds must be issued manually via the Bale wallet panel")
+
+    def verify_webhook_secret(self, header: Optional[str]) -> bool:
+        # No secret_token support documented on Bale; origin verified by URL secrecy.
+        return True
