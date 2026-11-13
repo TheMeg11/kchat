@@ -451,6 +451,21 @@ class ViolationLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow, index=True)
 
 
+class AnonThread(Base):
+    """One anonymous thread = one sender → one link owner (v3).
+    Lets the owner reply and report/block a persistent anonymous sender."""
+    __tablename__ = "anon_threads"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="open")  # open|blocked
+    last_text: Mapped[Optional[str]] = mapped_column(Text(), default=None)
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow)
+    __table_args__ = (UniqueConstraint("owner_id", "sender_id", name="uq_anon_thread"),)
+
+
 class DictionaryWord(Base):
     __tablename__ = "moderation_dictionary"
     id: Mapped[int] = mapped_column(primary_key=True)

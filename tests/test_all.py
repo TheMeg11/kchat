@@ -1210,3 +1210,108 @@ async def test_recent_pair_cooldown(adapters):
     async with db.session_scope() as s:
         assert (await s.execute(select(Chat).where(
             Chat.status == "active"))).scalar_one() is not None
+
+
+# ---------------------------------------------------- v3 feature tests ----
+@pytest.mark.asyncio
+async def test_anon_reply_report_block(adapters):
+    """v3: anonymous thread buttons — reply, report and block work end-to-end."""
+    from app import bot as bot_mod
+    from app.db import AnonThread
+    tg, bale = adapters
+    # owner on Telegram, stranger on Bale (cross-platform anon message)
+    await register_via_bot(adapters, "telegram", "990", "OwnerV3", 25, "male")
+    await register_via_bot(adapters, "bale", "991", "StrangerV3", 25, "female")
+    async with db.session_scope() as s:
+        owner = (await s.execute(select(User).where(User.platform_user_id == "990"))).scalar_one()
+        code = await service.ensure_anon_link(s, owner)
+    # stranger opens the BALE link (v3: two links, one per platform)
+    bale.sent.clear()
+    await bot_mod.process_update("bale", {"update_id": 500100, "message": {
+        "message_id": 1, "chat": {"id": 991}, "from": {"id": 991}, "text": f"/start msg_{code}"}})
+    assert any("ناشناس" in str(t[1]) for t in bale.sent)
+    await bot_mod.process_update("bale", {"update_id": 500101, "message": {
+        "message_id": 2, "chat": {"id": 991}, "from": {"id": 991}, "text": "پیام از بله"}})
+    # owner received with reply/report/block buttons
+    tg.sent.clear()
+    await bot_mod.process_update("bale", {"update_id": 500102, "message": {
+        "message_id": 3, "chat": {"id": 991}, "from": {"id": 991}, "text": "پیام دوم"}})
+    owner_msgs = [t for t in tg.sent if t[0] == "990"]
+    assert any("پیام دوم" in str(t[1]) for t in owner_msgs)
+    # thread exists
+    async with db.session_scope() as s:
+        th = (await s.execute(select(AnonThread))).scalar_one()
+        assert th.owner_id is not None and th.message_count == 2
+        thread_id = th.id
+    # owner taps REPLY and sends text -> stranger gets it
+    tg.sent.clear(); bale.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 500103, "callback_query": {
+        "id": "ar1", "from": {"id": 990}, "message": {"chat": {"id": 990}}, "data": "anonr_"}})
+    await bot_mod.process_update("telegram", {"update_id": 500104, "message": {
+        "message_id": 5, "chat": {"id": 990}, "from": {"id": 990}, "text": "جواب مالک"}})
+    assert any(t[0] == "991" and "جواب مالک" in str(t[1]) for t in bale.sent)
+    assert any("ارسال شد" in str(t[1]) for t in tg.sent)
+    # owner taps REPORT
+    await bot_mod.process_update("telegram", {"update_id": 500105, "callback_query": {
+        "id": "ar2", "from": {"id": 990}, "message": {"chat": {"id": 990}}, "data": f"anonrep_{thread_id}"}})
+    assert any("گزارش" in str(t[1]) and "ثبت شد" in str(t[1]) for t in tg.sent)
+    # owner taps BLOCK -> thread blocked + Block row
+    await bot_mod.process_update("telegram", {"update_id": 500106, "callback_query": {
+        "id": "ar3", "from": {"id": 990}, "message": {"chat": {"id": 990}}, "data": f"anonblk_{thread_id}"}})
+    assert any("بلاک" in str(t[1]) or "مسدود" in str(t[1]) for t in tg.sent)
+    async with db.session_scope() as s:
+        th = await s.get(AnonThread, thread_id)
+        assert th.status == "blocked"
+        blk = (await s.execute(select(Block).where(Block.blocker_id == th.owner_id))).scalar_one()
+        assert blk.blocked_id == th.sender_id
+    # stranger tries again via link -> gets blocked notice, owner gets nothing new
+    tg.sent.clear(); bale.sent.clear()
+    await bot_mod.process_update("bale", {"update_id": 500107, "message": {
+        "message_id": 6, "chat": {"id": 991}, "from": {"id": 991}, "text": f"/start msg_{code}"}})
+    await bot_mod.process_update("bale", {"update_id": 500108, "message": {
+        "message_id": 7, "chat": {"id": 991}, "from": {"id": 991}, "text": "باز هم می‌نویسم"}})
+    assert any("مسدود" in str(t[1]) for t in bale.sent)
+    assert not any("باز هم می‌نویسم" in str(t[1]) for t in tg.sent)
+
+
+@pytest.mark.asyncio
+async def test_two_anon_links(adapters):
+    """v3: /link shows BOTH a Telegram and a Bale link."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "995", "LinkUser", 25, "male")
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 500200, "message": {
+        "message_id": 1, "chat": {"id": 995}, "from": {"id": 995}, "text": "/link"}})
+    joined = "".join(str(t[1]) for t in tg.sent)
+    assert "t.me" in joined and "ble.ir" in joined
+
+
+@pytest.mark.asyncio
+async def test_no_privacy_in_registration(adapters):
+    """v3: registration shows rules only — no privacy policy."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 500300, "message": {
+        "message_id": 1, "chat": {"id": 996}, "from": {"id": 996, "first_name": "Priv"},
+        "text": "/start"}})
+    await bot_mod.process_update("telegram", {"update_id": 500301, "callback_query": {
+        "id": "pl", "from": {"id": 996}, "message": {"chat": {"id": 996}}, "data": "lang_fa"}})
+    joined = "".join(str(t[1]) for t in tg.sent)
+    assert "قوانین" in joined
+    assert "حریم خصوصی" not in joined
+
+
+@pytest.mark.asyncio
+async def test_profile_opens_after_registration(adapters):
+    """v3 regression: profile button must never crash (gender KeyError bug)."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "997", "ProfUser", 25, "female")
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 500400, "callback_query": {
+        "id": "pp", "from": {"id": 997}, "message": {"chat": {"id": 997}}, "data": "profile"}})
+    joined = "".join(str(t[1]) for t in tg.sent)
+    assert "پروفایل" in joined and "ProfUser" in joined
+    assert "👧" in joined

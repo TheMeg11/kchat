@@ -1,15 +1,16 @@
-"""User-facing bot logic (shared by Telegram and Bale) — v2."""
+"""User-facing bot logic (shared by Telegram and Bale) — v3."""
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import Any, Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from . import db, service
 from .config import RUNTIME, settings
-from .db import (Chat, ChatMessage, MediaType, Payment, QueueEntry, StorePackage,
-                 User, session_scope, utcnow)
+from .db import (AnonThread, Block, Chat, ChatMessage, MediaType, Payment,
+                 QueueEntry, Report, StorePackage, User, session_scope, utcnow)
 from .i18n import (GENDER_LABEL, GREGORIAN_MONTHS, JALALI_MONTHS, LANG_NAMES,
                    PLATFORM_LABEL, tr)
 from .platform import CROSS_OK, PlatformError, UnsupportedMethod
@@ -56,16 +57,21 @@ def search_cta(lang: str):
 
 async def main_menu(user: User) -> None:
     lang = user.language
-    await send(user, "main_menu", keyboard=kb(
+    rows = [
         [btn(tr(lang, "btn_search"), "search"),
          btn(tr(lang, "btn_profile"), "profile")],
+        [btn(tr(lang, "btn_anon_link"), "anon_link"),
+         btn(tr(lang, "btn_direct_msg"), "direct_msg")],
         [btn(tr(lang, "btn_coins"), "coins"),
          btn(tr(lang, "btn_store"), "store")],
         [btn(tr(lang, "btn_bonus"), "bonus"),
          btn(tr(lang, "btn_myref"), "referral")],
         [btn(tr(lang, "btn_language"), "language"),
          btn(tr(lang, "btn_help"), "help")],
-        [btn(tr(lang, "btn_admin"), "admin_open")] if await _is_admin(user) else []))
+    ]
+    if await _is_admin(user):
+        rows.append([btn(tr(lang, "btn_admin"), "admin_open")])
+    await send(user, "main_menu", keyboard=kb(*rows))
 
 
 async def _is_admin(user: User) -> bool:
@@ -94,10 +100,17 @@ async def partner_of(session, chat: Chat, user: User) -> Optional[User]:
     return await session.get(User, other)
 
 
-def deep_link(user: User, param: str) -> str:
-    if user.platform == "telegram":
-        return f"https://t.me/{RUNTIME.get('tg_username', 'kanarchatbot')}?start={param}"
+def tg_link(param: str) -> str:
+    return f"https://t.me/{RUNTIME.get('tg_username', 'kanarchatbot')}?start={param}"
+
+
+def bale_link(param: str) -> str:
     return f"https://ble.ir/{RUNTIME.get('bale_username', 'kchatbot')}?start={param}"
+
+
+def deep_link(user: User, param: str) -> str:
+    """The link on the user's OWN platform."""
+    return tg_link(param) if user.platform == "telegram" else bale_link(param)
 
 
 # ------------------------------------------------------------ registration ----
@@ -107,49 +120,56 @@ async def cmd_start(user: User, payload: str = "") -> None:
         if u.status == "deleted":
             u.status = "active"
             u.deleted_at = None
-        if u.age == 0 or not u.accepted_rules_at:
-            # referral capture
-            if payload.startswith("ref_"):
-                r = await s.execute(select(User).where(User.referral_code == payload[4:]))
-                ref = r.scalar_one_or_none()
-                if ref and ref.id != u.id and ref.platform == u.platform:
-                    from .db import Referral
-                    existing = await s.execute(select(Referral).where(
-                        Referral.referrer_id == ref.id, Referral.referred_id == u.id))
-                    if not existing.scalar_one_or_none():
-                        s.add(Referral(code=payload[4:], referrer_id=ref.id, referred_id=u.id))
-                        u.referred_by_id = ref.id
-            # anonymous-link message capture (item 4)
-            if payload.startswith("msg_"):
-                target = await service.find_by_anon_code(s, payload[4:])
-                if target and target.id != u.id and target.status == "active":
-                    u.state = {"step": "anon_msg", "target": target.id}
-                    await send(u, "anon_msg_intro")
+        # --- deep-link payloads work for BOTH new and already-registered users ---
+        if payload.startswith("msg_"):
+            target = await service.find_by_anon_code(s, payload[4:])
+            if target and target.id != u.id and target.status == "active":
+                blocked = await s.execute(select(Block).where(
+                    Block.blocker_id == target.id, Block.blocked_id == u.id))
+                if blocked.scalar_one_or_none():
+                    await main_menu(u)
                     return
-                # invalid/expired link or owner self
+                u.state = {"step": "anon_msg", "target": target.id}
+                await send(u, "anon_msg_intro")
+                return
+            # invalid/expired code or the owner themself -> normal entry
+            if u.age == 0 or not u.accepted_rules_at:
                 u.state = {"step": "language"}
                 await send(u, "welcome", keyboard=kb(
                     [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
                      btn(LANG_NAMES["ru"], "lang_ru")]))
+            else:
+                await main_menu(u)
+            return
+        if payload.startswith("lnk_"):
+            r = await s.execute(select(User).where(User.link_code == payload[4:]))
+            initiator = r.scalar_one_or_none()
+            if initiator and initiator.id != u.id and initiator.platform != u.platform:
+                eco = await service.get_setting(s, "economy")
+                await send(u, "link_confirm_q",
+                           platform=PLATFORM_LABEL[initiator.platform][u.language],
+                           coins=eco.get("accountLinkReward", 50),
+                           keyboard=kb([btn(tr(u.language, "link_confirm_btn"),
+                                            f"linkok_{payload[4:]}")]))
                 return
-            # account-link confirmation (item 5)
-            if payload.startswith("lnk_"):
-                r = await s.execute(select(User).where(User.link_code == payload[4:]))
-                initiator = r.scalar_one_or_none()
-                if initiator and initiator.id != u.id and initiator.platform != u.platform:
-                    eco = await service.get_setting(s, "economy")
-                    await send(u, "link_confirm_q",
-                               platform=PLATFORM_LABEL[initiator.platform][u.language],
-                               coins=eco.get("accountLinkReward", 50),
-                               keyboard=kb([btn(tr(u.language, "link_confirm_btn"),
-                                                f"linkok_{payload[4:]}")]))
-                    return
-                if initiator and initiator.platform == u.platform:
-                    await send(u, "link_same_platform")
-                    return
-                await send(u, "link_expired")
+            if initiator and initiator.platform == u.platform:
+                await send(u, "link_same_platform")
                 await main_menu(u)
                 return
+            await send(u, "link_expired")
+            await main_menu(u)
+            return
+        if payload.startswith("ref_") and (u.age == 0 or not u.accepted_rules_at):
+            r = await s.execute(select(User).where(User.referral_code == payload[4:]))
+            ref = r.scalar_one_or_none()
+            if ref and ref.id != u.id and ref.platform == u.platform:
+                from .db import Referral
+                existing = await s.execute(select(Referral).where(
+                    Referral.referrer_id == ref.id, Referral.referred_id == u.id))
+                if not existing.scalar_one_or_none():
+                    s.add(Referral(code=payload[4:], referrer_id=ref.id, referred_id=u.id))
+                    u.referred_by_id = ref.id
+        if u.age == 0 or not u.accepted_rules_at:
             u.state = {"step": "language"}
             await send(u, "welcome", keyboard=kb(
                 [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
@@ -171,11 +191,10 @@ async def _notify_ban(user: User, ban) -> None:
 
 
 async def begin_registration(user: User) -> None:
+    """Rules only (v3): read and accept — no privacy message."""
     user.state = {"step": "rules"}
     await send(user, "rules_title")
     await send(user, "rules_body")
-    await send(user, "privacy_title")
-    await send(user, "privacy_body")
     await send(user, "accept_rules", keyboard=kb([btn(tr(user.language, "accept"), "accept_rules")]))
 
 
@@ -205,9 +224,8 @@ async def handle_command(user: User, command: str, args: str) -> None:
             [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
              btn(LANG_NAMES["ru"], "lang_ru")], [btn(tr(lang, "btn_back"), "back_home")]))
     elif cmd == "/rules":
-        await send(user, "rules_title"); await send(user, "rules_body", keyboard=back_kb(lang))
-    elif cmd == "/privacy":
-        await send(user, "privacy_title"); await send(user, "privacy_body", keyboard=back_kb(lang))
+        await send(user, "rules_title")
+        await send(user, "rules_body", keyboard=back_kb(lang))
     elif cmd == "/paysupport":
         await send(user, "paysupport", keyboard=kb(
             [btn(tr(lang, "pay_support_btn"), "paysupport_ticket")],
@@ -224,7 +242,7 @@ async def handle_command(user: User, command: str, args: str) -> None:
     elif cmd == "/referral":
         await show_referral(user)
     elif cmd == "/link":
-        await show_anon_link(user)
+        await show_anon_links(user)
     elif cmd == "/msg":
         user.state = {"step": "direct_msg_target"}
         await send(user, "direct_msg_intro", keyboard=back_kb(lang))
@@ -261,18 +279,159 @@ async def handle_command(user: User, command: str, args: str) -> None:
 
 
 # --------------------------------------------------------- anon link (4) ----
-async def show_anon_link(user: User) -> None:
+async def show_anon_links(user: User) -> None:
+    """v3: every user gets TWO anonymous links — one for Telegram, one for Bale."""
     async with session_scope() as s:
         u = await s.get(User, user.id)
         code = await service.ensure_anon_link(s, u)
-        link = deep_link(u, f"msg_{code}")
-    await send(user, "anon_link_info", link=link, keyboard=back_kb(user.language))
+    await send(user, "anon_link_info",
+               tg_link=tg_link(f"msg_{code}"), bale_link=bale_link(f"msg_{code}"),
+               keyboard=back_kb(user.language))
+
+
+# ------------------------------------------------------ anon threads (v3) ----
+def anon_thread_kb(lang: str):
+    """Reply / Report / Block buttons under every received anonymous message."""
+    return kb([btn(tr(lang, "btn_anon_reply"), "anonr_"),
+               btn(tr(lang, "btn_anon_report"), "anonrep_"),
+               btn(tr(lang, "btn_anon_block"), "anonblk_")])
+
+
+async def deliver_anon_message(session, sender: User, owner: User, text: str,
+                               is_reply: bool = False) -> bool:
+    """Deliver an anonymous message to the link owner with action buttons.
+    Creates/updates the AnonThread. Returns True when delivered."""
+    blocked = await session.execute(select(Block).where(
+        Block.blocker_id == owner.id, Block.blocked_id == sender.id))
+    if blocked.scalar_one_or_none():
+        return False
+    thread = (await session.execute(select(AnonThread).where(
+        AnonThread.owner_id == owner.id, AnonThread.sender_id == sender.id))).scalar_one_or_none()
+    if thread is None:
+        thread = AnonThread(owner_id=owner.id, sender_id=sender.id,
+                            status="open", message_count=0, last_text="")
+        session.add(thread)
+        session.flush()
+    thread.last_text = text[:2000]
+    thread.message_count = (thread.message_count or 0) + 1
+    thread.updated_at = utcnow()
+    adp = adapter(owner.platform)
+    if adp is None:
+        return False
+    try:
+        key = "anon_reply_received" if is_reply else "anon_msg_received"
+        await adp.send_message(owner.platform_user_id, tr(owner.language, key, text=text[:3000]),
+                               keyboard=anon_thread_kb(owner.language))
+        return True
+    except PlatformError as exc:
+        log.info("anon delivery failed: %s", exc)
+        return False
+
+
+async def anon_reply_flow(owner: User, text: str) -> None:
+    """Owner replies to the most recent anonymous thread."""
+    async with session_scope() as s:
+        u = await s.get(User, owner.id)
+        u.state = None
+        ok, reason = await service.check_message(s, text)
+        if not ok:
+            await send(u, "msg_rejected_profanity" if reason == "profanity" else "msg_rejected_contact")
+            await service.apply_violation(s, u, reason, text[:60])
+            return
+        q = select(AnonThread).where(AnonThread.owner_id == u.id)
+        state = owner.state or {}
+        if state.get("thread"):
+            q = q.where(AnonThread.id == int(state["thread"]))
+        thread = (await s.execute(q.order_by(AnonThread.updated_at.desc())
+                                  .limit(1))).scalar_one_or_none()
+        if not thread or thread.status != "open":
+            await main_menu(u)
+            return
+        sender = await s.get(User, thread.sender_id)
+        if sender and sender.status == "active":
+            blocked = await s.execute(select(Block).where(
+                Block.blocker_id == sender.id, Block.blocked_id == u.id))
+            if not blocked.scalar_one_or_none():
+                adp = adapter(sender.platform)
+                if adp:
+                    try:
+                        await adp.send_message(
+                            sender.platform_user_id,
+                            tr(sender.language, "anon_reply_received", text=text[:3000]),
+                            keyboard=anon_thread_kb(sender.language))
+                    except PlatformError as exc:
+                        log.info("anon reply delivery failed: %s", exc)
+        # never reveal whether the sender received it
+    await send(owner, "anon_reply_sent")
+
+
+async def anon_report(owner: User, thread_marker: str = "") -> None:
+    """Report the sender of the most recent (or marked) anonymous thread."""
+    async with session_scope() as s:
+        u = await s.get(User, owner.id)
+        q = select(AnonThread).where(AnonThread.owner_id == u.id)
+        if thread_marker and thread_marker.isdigit():
+            q = q.where(AnonThread.id == int(thread_marker))
+        thread = (await s.execute(q.order_by(AnonThread.updated_at.desc())
+                                  .limit(1))).scalar_one_or_none()
+        if not thread:
+            await send(u, "invalid_input")
+            return
+        sender = await s.get(User, thread.sender_id)
+        if not sender:
+            return
+        dup = await s.execute(select(Report).where(
+            Report.reporter_id == u.id, Report.reported_id == sender.id,
+            Report.reason == "anon_message",
+            Report.created_at >= utcnow() - timedelta(hours=24)))
+        if dup.scalar_one_or_none():
+            await send(u, "report_dup", keyboard=anon_thread_kb(u.language))
+            return
+        s.add(Report(chat_id=0, reporter_id=u.id, reported_id=sender.id,
+                     reason="anon_message", details=(thread.last_text or "")[:500]))
+        sender.reports_received += 1
+        u.reports_sent += 1
+        cfg = await service.get_setting(s, "moderation")
+        window = utcnow() - timedelta(hours=cfg.get("autoBanWindowHours", 24))
+        unique = await s.execute(
+            select(func.count(func.distinct(Report.reporter_id))).where(
+                Report.reported_id == sender.id, Report.created_at >= window))
+        count = unique.scalar() or 0
+        if count >= cfg.get("autoBanReportThreshold", 3) and sender.status == "active":
+            await service.ban_user(s, sender, "temporary", "auto_3_reports",
+                                   f"{count} گزارش مستقل در ۲۴ ساعت", "system",
+                                   hours=cfg.get("autoBanDurationHours", 24))
+    await send(owner, "anon_report_done")
+
+
+async def anon_block(owner: User, thread_marker: str = "") -> None:
+    """Block the sender of the most recent (or marked) anonymous thread —
+    they can never send anonymous messages to this owner again."""
+    async with session_scope() as s:
+        u = await s.get(User, owner.id)
+        q = select(AnonThread).where(AnonThread.owner_id == u.id)
+        if thread_marker and thread_marker.isdigit():
+            q = q.where(AnonThread.id == int(thread_marker))
+        thread = (await s.execute(q.order_by(AnonThread.updated_at.desc())
+                                  .limit(1))).scalar_one_or_none()
+        if not thread:
+            await main_menu(u)
+            return
+        thread.status = "blocked"
+        sender = await s.get(User, thread.sender_id)
+        if sender:
+            dup = await s.execute(select(Block).where(
+                Block.blocker_id == u.id, Block.blocked_id == sender.id))
+            if not dup.scalar_one_or_none():
+                s.add(Block(blocker_id=u.id, blocked_id=sender.id))
+    await send(owner, "anon_blocked_info")
 
 
 # -------------------------------------------------------- direct msg (14) ----
 async def direct_message_flow(user: User, target_text: str) -> None:
     """Resolve target by @username or numeric ID, then ask for the message text."""
     target_text = target_text.strip()
+    target = None
     if target_text.startswith("@"):
         uname = target_text[1:]
         async with session_scope() as s:
@@ -283,33 +442,45 @@ async def direct_message_flow(user: User, target_text: str) -> None:
             r = await s.execute(select(User).where(
                 (User.platform_user_id == target_text) | (User.public_id == target_text.upper())))
             target = r.scalar_one_or_none()
-    else:
-        target = None
     async with session_scope() as s:
         u = await s.get(User, user.id)
         u.state = {"step": "direct_msg_text", "target": target.id if target else None}
     # deliberately identical prompt whether or not the target exists (mystery!)
-    await send(user, "direct_msg_intro_done" if False else "ask_msg_text",
-               keyboard=back_kb(user.language))
+    await send(user, "ask_msg_text", keyboard=back_kb(user.language))
 
 
 async def deliver_direct_message(sender: User, target_id: Optional[int], text: str) -> None:
     """Deliver anonymously; NEVER reveal the outcome to the sender (item 14)."""
-    from .moderation import sanitize_snippet
     async with session_scope() as s:
         u = await s.get(User, sender.id)
         u.state = None
         if target_id:
             target = await s.get(User, target_id)
             if target and target.status == "active":
-                adp = adapter(target.platform)
-                if adp:
-                    try:
-                        await adp.send_message(
-                            target.platform_user_id,
-                            tr(target.language, "anon_msg_received", text=text[:3000]))
-                    except PlatformError as exc:
-                        log.info("direct message delivery failed (by design, hidden): %s", exc)
+                blocked = await s.execute(select(Block).where(
+                    Block.blocker_id == target.id, Block.blocked_id == u.id))
+                if not blocked.scalar_one_or_none():
+                    # direct messages also create a thread so the target can reply
+                    thread = (await s.execute(select(AnonThread).where(
+                        AnonThread.owner_id == target.id,
+                        AnonThread.sender_id == u.id))).scalar_one_or_none()
+                    if thread is None:
+                        thread = AnonThread(owner_id=target.id, sender_id=u.id,
+                                            status="open", message_count=0, last_text="")
+                        s.add(thread)
+                        s.flush()
+                    thread.last_text = text[:2000]
+                    thread.message_count = (thread.message_count or 0) + 1
+                    thread.updated_at = utcnow()
+                    adp = adapter(target.platform)
+                    if adp:
+                        try:
+                            await adp.send_message(
+                                target.platform_user_id,
+                                tr(target.language, "anon_msg_received", text=text[:3000]),
+                                keyboard=anon_thread_kb(target.language))
+                        except PlatformError as exc:
+                            log.info("direct message delivery failed (hidden): %s", exc)
     # neutral response — no delivery status revealed
     await send(sender, "direct_msg_neutral")
 
@@ -356,7 +527,7 @@ async def start_gift(user: User) -> None:
             if user.platform == "telegram" else tr(user.language, "pay_bale", toman=toman, coins=coins)
         rows.append([btn("🎁 " + label, f"gift_{coins}")])
     rows.append([btn(tr(user.language, "btn_back"), "chat_back")])
-    await send(user, "gift_title", price=("۵ استارز" if user.platform == "telegram" else "۵۰٫۰۰۰ تومان"),
+    await send(user, "gift_title", price=("⭐ ۵ استارز" if user.platform == "telegram" else "💳 ۵۰٬۰۰۰ تومان"),
                coins=100, keyboard=rows)
 
 
@@ -373,14 +544,14 @@ async def send_gift_invoice(user: User, coins: int) -> None:
         payload = f"gift:{coins}:{user.id}:{partner.id}"
         try:
             if user.platform == "telegram":
-                await adp.send_invoice(user.platform_user_id, f"هدیه {coins} سکه",
+                await adp.send_invoice(user.platform_user_id, f"🎁 هدیه {coins} سکه",
                                        "اهدای سکه به هم‌چت ناشناس", payload,
                                        [{"label": f"gift {coins}", "amount": coins // 20}])
             else:
                 if not settings.bale_provider_token:
                     await send(user, "pay_unavailable")
                     return
-                await adp.send_invoice(user.platform_user_id, f"هدیه {coins} سکه",
+                await adp.send_invoice(user.platform_user_id, f"🎁 هدیه {coins} سکه",
                                        "اهدای سکه به هم‌چت ناشناس", payload,
                                        [{"label": f"gift {coins}", "amount": coins * 500 * 10}])
         except UnsupportedMethod:
@@ -401,21 +572,15 @@ async def start_search(user: User) -> None:
         if await service.active_chat_for(s, u.id):
             await do_next(u)
             return
-    eco = None
-    async with session_scope() as s:
         eco = await service.get_setting(s, "economy")
-    if not (await get_app()).get("enableGenderFilter", True):
+        app_cfg = await service.get_setting(s, "app")
+    if not app_cfg.get("enableGenderFilter", True):
         await _enqueue(user, "everyone")
         return
     await send(user, "gender_filter_q", cost=eco["genderFilterMatchCost"], keyboard=kb(
         [btn(tr(lang, "gf_everyone"), "gf_everyone")],
         [btn(tr(lang, "gf_girls"), "gf_female"), btn(tr(lang, "gf_boys"), "gf_male")],
         [btn(tr(lang, "btn_back"), "back_home")]))
-
-
-async def get_app() -> dict:
-    async with session_scope() as s:
-        return await service.get_setting(s, "app")
 
 
 async def _enqueue(user: User, gender_filter: str) -> None:
@@ -432,14 +597,12 @@ async def _enqueue(user: User, gender_filter: str) -> None:
 
 async def invite_recently_active(seeker: User) -> None:
     """If the queue is short, invite users active within the last 30 minutes (item 15)."""
-    from datetime import timedelta
     try:
         async with session_scope() as s:
-            in_queue = (await s.execute(select(func_count(QueueEntry.id)))).scalar() or 0
+            in_queue = (await s.execute(select(func.count(QueueEntry.id)))).scalar() or 0
             if in_queue >= 2:
                 return
             cutoff = utcnow() - timedelta(minutes=30)
-            # users busy in an active chat (either side)
             busy = {r[0] for r in (await s.execute(
                 select(Chat.user_a_id).where(Chat.status == "active"))).all()}
             busy |= {r[0] for r in (await s.execute(
@@ -450,9 +613,9 @@ async def invite_recently_active(seeker: User) -> None:
                     User.id != seeker.id,
                     (User.last_invite_at.is_(None)) | (User.last_invite_at < cutoff))
                 .limit(10))).scalars()
+            seeker_group = service.age_group(seeker.age)
             for cand in candidates:
-                # same age pool only, not busy in a chat, not in queue
-                if service.age_group(cand.age) != service.age_group(seeker.age):
+                if service.age_group(cand.age) != seeker_group:
                     continue
                 if cand.id in busy:
                     continue
@@ -467,11 +630,6 @@ async def invite_recently_active(seeker: User) -> None:
         log.exception("invite_recently_active failed")
 
 
-def func_count(col):
-    from sqlalchemy import func
-    return func.count(col)
-
-
 async def run_match_cycle() -> None:
     """Try to pair queued users; notify both on success."""
     while True:
@@ -481,7 +639,7 @@ async def run_match_cycle() -> None:
                 return
             ua, ub, _charged = matched
             for me, other in ((ua, ub), (ub, ua)):
-                gender = GENDER_LABEL[other.gender][me.language]
+                gender = GENDER_LABEL.get(other.gender or "male", GENDER_LABEL["male"])[me.language]
                 bio = other.bio or ""
                 card = tr(me.language, "matched", name=other.display_name, age=other.age,
                           gender=gender, bio=bio)
@@ -492,7 +650,8 @@ async def run_match_cycle() -> None:
                     if other.photo_file_id and other.platform == me.platform:
                         await adp.send_media(me.platform_user_id, "photo", other.photo_file_id,
                                              caption=card)
-                        await adp.send_message(me.platform_user_id, tr(me.language, "chat_controls_hint"),
+                        await adp.send_message(me.platform_user_id,
+                                               "⬇️💬 دکمه‌های کنترل گفتگو:",
                                                keyboard=chat_controls(me.language))
                     else:
                         if other.platform != me.platform:
@@ -562,7 +721,6 @@ async def do_block(user: User) -> None:
             await send(u, "not_in_chat", keyboard=search_cta(u.language))
             return
         partner = await partner_of(s, chat, u)
-        from .db import Block
         s.add(Block(blocker_id=u.id, blocked_id=partner.id))
         await service.end_chat(s, chat, "left", u.id)
         await send(partner, "blocked_by_partner", keyboard=search_cta(partner.language))
@@ -573,25 +731,28 @@ async def do_block(user: User) -> None:
 # ------------------------------------------------------------- profile ----
 async def show_profile(user: User) -> None:
     lang = user.language
-    gender = GENDER_LABEL[user.gender][user.gender and user.gender or "male"][lang] \
-        if user.gender in GENDER_LABEL else GENDER_LABEL["male"][lang]
+    # v3 FIX: safe gender lookup (gender may be unset during registration)
+    gender_entry = GENDER_LABEL.get(user.gender or "male", GENDER_LABEL["male"])
+    gender = gender_entry[lang]
     if user.birth_year:
         if user.birth_calendar == "jalali":
-            month_name = JALALI_MONTHS[(user.birth_month or 1) - 1]
-            cal = "شمسی"
+            month_name = JALALI_MONTHS[(user.birth_month or 1) - 1].strip()
+            cal = "شمسی 🌙"
         else:
-            month_name = GREGORIAN_MONTHS["fa"][(user.birth_month or 1) - 1]
-            cal = "میلادی"
+            month_name = GREGORIAN_MONTHS["fa"][(user.birth_month or 1) - 1].strip()
+            cal = "میلادی 🌍"
         bday = tr(lang, "birthday_set", date=f"{user.birth_day} {month_name} ({cal})")
     else:
         bday = tr(lang, "birthday_not_set")
     linked = ""
+    coins = user.coin_balance
     async with session_scope() as s:
-        eco = await service.get_setting(s, "economy")
-        if user.linked_user_id:
-            other = await s.get(User, user.linked_user_id)
+        u = await s.get(User, user.id)
+        coins = u.coin_balance
+        if u.linked_user_id:
+            other = await s.get(User, u.linked_user_id)
             if other:
-                linked = f"\n🔗 متصل به: حساب {PLATFORM_LABEL[other.platform][lang]}"
+                linked = f"\n🔗✅ متصل به: حساب {PLATFORM_LABEL[other.platform][lang]}"
     rows = [
         [btn(tr(lang, "btn_edit_name"), "edit_name"),
          btn(tr(lang, "btn_edit_age"), "edit_age")],
@@ -602,10 +763,8 @@ async def show_profile(user: User) -> None:
         [btn(tr(lang, "btn_direct_msg"), "direct_msg")],
         [btn(tr(lang, "btn_link_account"), "link_account")],
     ]
-    if not user.linked_user_id:
-        pass  # linking button always shown; flow reports if already linked
     await send(user, "profile_card", name=user.display_name, age=user.age,
-               gender=gender, bio=user.bio or "—", coins=user.coin_balance,
+               gender=gender, bio=user.bio or "—", coins=coins,
                birthday=bday + linked, keyboard=back_kb(lang, rows))
     if user.photo_file_id:
         adp = adapter(user.platform)
@@ -631,7 +790,7 @@ async def start_birthday(user: User) -> None:
         u.state = {"step": "birthday_month", "calendar": calendar}
         reward = eco.get("birthdayReward", 10)
     months = _months_for(user.language, calendar)
-    rows = [[btn(months[i], f"bmon_{i + 1}")] for i in range(12)]
+    rows = [[btn(months[i].strip(), f"bmon_{i + 1}")] for i in range(12)]
     rows.append([btn(tr(user.language, "btn_back"), "back_home")])
     await send(user, "birthday_intro", coins=reward, keyboard=rows)
 
@@ -644,7 +803,7 @@ async def birthday_month_chosen(user: User, month: int) -> None:
         u = await s.get(User, user.id)
         u.state = {"step": "birthday_day", "calendar": calendar, "month": month, "maxday": maxday}
     months = _months_for(user.language, calendar)
-    await send(user, "birthday_ask_day", month=months[month - 1], maxday=maxday,
+    await send(user, "birthday_ask_day", month=months[month - 1].strip(), maxday=maxday,
                keyboard=back_kb(user.language))
 
 
@@ -658,27 +817,21 @@ async def birthday_day_entered(user: User, day: int) -> None:
         return
     import datetime as _dt
     today = _dt.date.today()
+    if calendar == "jalali" and month == 12 and day == 30:
+        day = 29  # esfand 30 only in leap years — clamp
+    age = user.age or 15
     if calendar == "jalali":
         jy, jm, jd = service.gregorian_to_jalali(today.year, today.month, today.day)
-        if month == 12 and day == 30:  # esfand 30 only in leap years — clamp
-            day = 29
-        gy, gm, gd = service.jalali_to_gregorian(jy - (user.age or 15), month, day)
+        gy, gm, gd = service.jalali_to_gregorian(jy - age, month, day)
     else:
-        gy = today.year - (user.age or 15)
-        gm, gd = month, day
-    # derive exact birth year from current age and current date
-    age = user.age or 15
-    birth_year = today.year - age
-    if (today.month, today.day) < (gm, gd):
-        birth_year -= 0  # birthday not passed yet this year -> age correct as-is
-    # verify computed age stays within 13-60
-    new_age = service.compute_age_from_birthday(birth_year, gm, gd)
+        gy, gm, gd = today.year - age, month, day
+    new_age = service.compute_age_from_birthday(gy, gm, gd)
     if not (13 <= new_age <= 60):
         new_age = max(13, min(60, new_age))
-        birth_year = today.year - new_age
+        gy = today.year - new_age
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.birth_year, u.birth_month, u.birth_day = birth_year, gm, gd
+        u.birth_year, u.birth_month, u.birth_day = gy, gm, gd
         u.birth_calendar = calendar
         u.age = new_age
         eco = await service.get_setting(s, "economy")
@@ -721,7 +874,7 @@ async def apply_edit_name(user: User, name: str) -> None:
         eco = await service.get_setting(s, "economy")
         cost = eco.get("nameChangeCost", NAME_AGE_CHANGE_COST)
         txn = await service.debit(s, u, cost, "name_change", "هزینه تغییر نام",
-                                   idempotency_key=f"namechg:{u.id}:{u.display_name}")
+                                  idempotency_key=f"namechg:{u.id}:{u.display_name}")
         if txn is None:
             await send(u, "no_coins", keyboard=back_kb(u.language))
             return
@@ -741,12 +894,11 @@ async def apply_edit_age(user: User, age: int) -> None:
         cost = eco.get("ageChangeCost", NAME_AGE_CHANGE_COST)
         old = u.age
         txn = await service.debit(s, u, cost, "age_change", "هزینه تغییر سن",
-                                   idempotency_key=f"agechg:{u.id}:{old}")
+                                  idempotency_key=f"agechg:{u.id}:{old}")
         if txn is None:
             await send(u, "no_coins", keyboard=back_kb(u.language))
             return
         u.age = age
-        # age-group change -> re-queue into the correct pool
         if service.age_group(age) != service.age_group(old):
             await s.execute(delete(QueueEntry).where(QueueEntry.user_id == u.id))
         u.state = None
@@ -796,11 +948,11 @@ async def start_purchase(user: User, package_id: str) -> None:
         payload = f"pkg:{pkg.id}:{u.id}"
         try:
             if u.platform == "telegram":
-                await adp.send_invoice(u.platform_user_id, f"{pkg.coins} سکه کانار",
+                await adp.send_invoice(u.platform_user_id, f"🪙 {pkg.coins} سکه کانار",
                                        "خرید سکه برای چت ناشناس کانار", payload,
                                        [{"label": f"{pkg.coins} coins", "amount": pkg.telegram_stars_price}])
             else:
-                await adp.send_invoice(u.platform_user_id, f"{pkg.coins} سکه کانار",
+                await adp.send_invoice(u.platform_user_id, f"🪙 {pkg.coins} سکه کانار",
                                        "خرید سکه برای چت ناشناس کانار", payload,
                                        [{"label": f"{pkg.coins} coins", "amount": pkg.bale_toman_price * 10}])
         except UnsupportedMethod as exc:
@@ -846,7 +998,7 @@ async def handle_successful_payment(platform: str, msg: dict) -> None:
                           provider_payment_charge_id=sp.get("provider_payment_charge_id"),
                           invoice_payload=payload))
             await service.credit(s, partner, coins, "gift_received",
-                                 f"هدیه از هم‌چت ناشناس",
+                                 "هدیه از هم‌چت ناشناس",
                                  reference_id=charge, idempotency_key=f"pay:{charge}")
             await send(payer, "gift_sent_payer", coins=coins)
             await send(partner, "gift_received", coins=coins)
@@ -892,7 +1044,6 @@ async def handle_message(platform: str, msg: dict) -> None:
             s.add(user)
             await s.flush()
         user.last_seen_at = utcnow()
-        # keep username fresh for /msg lookups
         if from_u.get("username") and from_u["username"] != user.username:
             user.username = from_u["username"]
 
@@ -954,7 +1105,8 @@ async def handle_message(platform: str, msg: dict) -> None:
             user.age = age
             user.state = {"step": "gender"}
             await send(user, "ask_gender", keyboard=kb(
-                [btn(tr(user.language, "girl"), "reg_female"), btn(tr(user.language, "boy"), "reg_male")]))
+                [btn(tr(user.language, "girl"), "reg_female"),
+                 btn(tr(user.language, "boy"), "reg_male")]))
             return
         if step == "bio":
             if text.strip() != "/skip":
@@ -986,29 +1138,26 @@ async def handle_message(platform: str, msg: dict) -> None:
             await birthday_day_entered(user, day)
             return
         if step == "anon_msg":
-            # anonymous link message (item 4)
-            from .moderation import check_contact, check_profanity
-            from . import moderation as _mod
+            # anonymous link message (item 4) — delivered with reply/report/block buttons
             ok, reason = await service.check_message(s, text)
             if not ok:
-                if reason == "profanity":
-                    await send(user, "msg_rejected_profanity")
-                else:
-                    await send(user, "msg_rejected_contact")
+                await send(user, "msg_rejected_profanity" if reason == "profanity"
+                           else "msg_rejected_contact")
                 await service.apply_violation(s, user, reason, text[:60])
                 return
             target = await s.get(User, state.get("target", 0))
-            user.state = None
+            # keep the anon_msg state so the sender can continue the thread
             if target and target.status == "active":
-                adp_t = adapter(target.platform)
-                if adp_t:
-                    try:
-                        await adp_t.send_message(
-                            target.platform_user_id,
-                            tr(target.language, "anon_msg_received", text=text[:3000]))
-                    except PlatformError as exc:
-                        log.info("anon link delivery failed: %s", exc)
+                delivered = await deliver_anon_message(s, user, target, text)
+                if not delivered:
+                    user.state = None
+                    await send(user, "anon_sender_blocked_notice")
+                    return
             await send(user, "anon_msg_sent")
+            return
+        if step == "anon_reply":
+            await s.commit()
+            await anon_reply_flow(user, text)
             return
         if step == "direct_msg_target":
             await s.commit()
@@ -1017,10 +1166,8 @@ async def handle_message(platform: str, msg: dict) -> None:
         if step == "direct_msg_text":
             ok, reason = await service.check_message(s, text)
             if not ok:
-                if reason == "profanity":
-                    await send(user, "msg_rejected_profanity")
-                else:
-                    await send(user, "msg_rejected_contact")
+                await send(user, "msg_rejected_profanity" if reason == "profanity"
+                           else "msg_rejected_contact")
                 await service.apply_violation(s, user, reason, text[:60])
                 return
             await s.commit()
@@ -1097,10 +1244,8 @@ async def handle_message(platform: str, msg: dict) -> None:
         if text:
             ok, reason = await service.check_message(s, text)
             if not ok:
-                if reason == "profanity":
-                    await send(user, "msg_rejected_profanity")
-                else:
-                    await send(user, "msg_rejected_contact")
+                await send(user, "msg_rejected_profanity" if reason == "profanity"
+                           else "msg_rejected_contact")
                 res = await service.apply_violation(s, user, reason if reason == "profanity" else "contact",
                                                     text[:60])
                 if res["action"] != "warn":
@@ -1115,7 +1260,7 @@ async def handle_message(platform: str, msg: dict) -> None:
         cost = eco.get("messageCost", 1)
         if cost > 0:
             txn = await service.debit(s, user, cost, "message_cost", "هزینه ارسال پیام",
-                                       idempotency_key=None)
+                                      idempotency_key=None)
             if txn is None:
                 await send(user, "no_coins", keyboard=back_kb(user.language))
                 return
@@ -1259,7 +1404,7 @@ async def handle_callback(platform: str, query: dict) -> None:
             return
         if data == "anon_link":
             await s.commit()
-            await show_anon_link(user)
+            await show_anon_links(user)
             return
         if data == "direct_msg":
             user.state = {"step": "direct_msg_target"}
@@ -1294,6 +1439,23 @@ async def handle_callback(platform: str, query: dict) -> None:
                 await send(user, "link_already")
             else:
                 await send(user, "link_expired")
+            return
+        # --- anonymous thread actions (v3) ---
+        if data.startswith("anonrep_"):
+            marker = data[len("anonrep_"):]
+            await s.commit()
+            await anon_report(user, marker)
+            return
+        if data.startswith("anonblk_"):
+            marker = data[len("anonblk_"):]
+            await s.commit()
+            await anon_block(user, marker)
+            return
+        if data.startswith("anonr"):
+            marker = data[len("anonr_"):]
+            user.state = {"step": "anon_reply",
+                          "thread": int(marker) if marker.isdigit() else None}
+            await send(user, "anon_reply_prompt")
             return
         if data.startswith("gift_"):
             await s.commit()
