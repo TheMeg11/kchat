@@ -59,7 +59,9 @@ class BaseAdapter:
 
     async def client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0))
+            # Short timeouts: Bale is often unreachable from non-Iranian IPs;
+            # calls must fail fast so startup and schedulers never block.
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=8.0))
         return self._client
 
     async def close(self):
@@ -205,12 +207,17 @@ class BaseAdapter:
 
     # --------------------------------------------------------- polling ----
     async def poll_updates(self, handler, stop: asyncio.Event):
-        """Long-polling fallback loop."""
+        """Long-polling fallback loop (backs off hard after repeated failures)."""
         offset = 0
+        fails = 0
         while not stop.is_set():
             try:
+                if fails >= 10:
+                    # platform unreachable (e.g. geo-blocked); check rarely
+                    await asyncio.sleep(600)
                 params = {"timeout": 25, "offset": offset, "limit": 50}
                 result = await self.call("getUpdates", params)
+                fails = 0
                 for upd in result or []:
                     offset = max(offset, int(upd.get("update_id", 0)) + 1)
                     try:
@@ -218,8 +225,10 @@ class BaseAdapter:
                     except Exception:
                         log.exception("update handler failed (polling %s)", self.platform)
             except PlatformError as exc:
-                log.warning("poll error %s: %s", self.platform, exc)
-                await asyncio.sleep(3)
+                fails += 1
+                if fails <= 3:
+                    log.warning("poll error %s: %s", self.platform, exc)
+                await asyncio.sleep(min(3 * fails, 60))
             except asyncio.CancelledError:
                 raise
             except Exception:

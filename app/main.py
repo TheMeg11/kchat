@@ -48,6 +48,7 @@ async def init_app() -> None:
 
 
 async def setup_commands() -> None:
+    import asyncio
     commands = [
         {"command": "start", "description": "شروع / منوی اصلی"},
         {"command": "search", "description": "جستجوی هم‌چت ناشناس"},
@@ -71,8 +72,8 @@ async def setup_commands() -> None:
         adp = RUNTIME.get(f"adapter_{plat}")
         if adp:
             try:
-                await adp.set_my_commands(commands)
-            except PlatformError as exc:
+                await asyncio.wait_for(adp.set_my_commands(commands), timeout=20)
+            except (PlatformError, asyncio.TimeoutError) as exc:
                 log.warning("setMyCommands failed on %s: %s", plat, exc)
 
 
@@ -86,10 +87,11 @@ async def setup_webhooks() -> None:
             continue
         url = f"{settings.public_url.rstrip('/')}/webhook/{plat}/{RUNTIME['path_secret']}"
         try:
-            await adp.set_webhook(url)
+            import asyncio as _a
+            await _a.wait_for(adp.set_webhook(url), timeout=20)
             RUNTIME[f"webhook_set_{plat}"] = True
             log.info("webhook registered for %s -> %s", plat, url)
-        except PlatformError as exc:
+        except (PlatformError, _a.TimeoutError) as exc:
             log.warning("setWebhook failed for %s: %s (falling back to polling)", plat, exc)
 
 
