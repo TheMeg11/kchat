@@ -161,7 +161,7 @@ async def daily_maintenance_jobs() -> None:
     from .i18n import tr
     try:
         async with session_scope() as s:
-            changed = service.update_dynamic_ages(s)
+            changed = await service.update_dynamic_ages(s)
             if changed:
                 log.info("dynamic age refresh: %d users", changed)
         async with session_scope() as s:

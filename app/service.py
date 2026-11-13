@@ -329,10 +329,10 @@ def compute_age_from_birthday(by: int, bm: int, bd: int) -> int:
     return years
 
 
-def update_dynamic_ages(session) -> int:
+async def update_dynamic_ages(session) -> int:
     """Refresh ages from stored birthdays (called daily)."""
     import datetime as _dt
-    res = session.execute(select(User).where(User.birth_year.isnot(None)))
+    res = await session.execute(select(User).where(User.birth_year.isnot(None)))
     changed = 0
     today = _dt.date.today()
     for u in res.scalars():
@@ -342,7 +342,7 @@ def update_dynamic_ages(session) -> int:
             u.age = max(13, min(60, new_age))
             # If the age-group changed, drop them from the queue so they re-join the right pool.
             if age_group(u.age) != old_group:
-                session.execute(delete(QueueEntry).where(QueueEntry.user_id == u.id))
+                await session.execute(delete(QueueEntry).where(QueueEntry.user_id == u.id))
             changed += 1
     return changed
 
