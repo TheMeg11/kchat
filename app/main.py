@@ -35,7 +35,11 @@ async def init_app() -> None:
     await db.create_all(engine)
     async with session_scope() as s:
         await service.seed(s)
-    RUNTIME["path_secret"] = pysecrets.token_urlsafe(16)
+    # STABLE webhook path secret: derived from WEBHOOK_SECRET so redeploys never
+    # invalidate the URLs registered with Telegram/Bale (v3 fix).
+    import hashlib
+    RUNTIME["path_secret"] = hashlib.sha256(
+        ("path:" + settings.webhook_secret).encode()).hexdigest()[:22]
     if settings.telegram_bot_token:
         RUNTIME["adapter_telegram"] = TelegramAdapter(
             settings.telegram_bot_token, settings.webhook_secret)
