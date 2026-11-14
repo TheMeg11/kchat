@@ -155,6 +155,14 @@ async def cmd_start(user: User, payload: str = "") -> None:
         if anon_code:
             target = await service.find_by_anon_code(s, anon_code)
             if target and target.id != u.id and target.status == "active":
+                # v2.3.4: deep-link features are registered-only — no anon
+                # messaging for people who skipped the signup.
+                if needs_registration(u):
+                    u.state = {"step": "language"}
+                    await send(u, "welcome", keyboard=kb(
+                        [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
+                         btn(LANG_NAMES["ru"], "lang_ru")]))
+                    return
                 blocked = await s.execute(select(Block).where(
                     Block.blocker_id == target.id, Block.blocked_id == u.id))
                 if blocked.scalar_one_or_none():
@@ -173,6 +181,13 @@ async def cmd_start(user: User, payload: str = "") -> None:
                 await main_menu(u)
             return
         if payload.startswith("lnk_"):
+            # v2.3.4: link-confirm rewards are registered-only as well.
+            if needs_registration(u):
+                u.state = {"step": "language"}
+                await send(u, "welcome", keyboard=kb(
+                    [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
+                     btn(LANG_NAMES["ru"], "lang_ru")]))
+                return
             r = await s.execute(select(User).where(User.link_code == payload[4:]))
             initiator = r.scalar_one_or_none()
             if initiator and initiator.id != u.id and initiator.platform != u.platform:
@@ -227,6 +242,36 @@ async def begin_registration(user: User) -> None:
     await send(user, "rules_title")
     await send(user, "rules_body")
     await send(user, "accept_rules", keyboard=kb([btn(tr(user.language, "accept"), "accept_rules")]))
+
+
+# v2.3.4: hard registration gate — nothing outside the signup FSM may be used
+# until age is set and the rules are accepted.
+REG_CB_PREFIXES = ("lang_", "reg_", "bage_", "bcal_", "bmon_", "bday_", "byear_", "bypage_")
+
+
+def needs_registration(u: User) -> bool:
+    return u.age == 0 or not u.accepted_rules_at
+
+
+def _reg_callback(data: str) -> bool:
+    return (data == "accept_rules" or data == "back_name"
+            or data.startswith(REG_CB_PREFIXES))
+
+
+async def resume_registration(user: User) -> None:
+    """Push an unfinished signup back onto the FSM at the right step."""
+    if not user.accepted_rules_at:
+        user.state = {"step": "language"}
+        await send(user, "welcome", keyboard=kb(
+            [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
+             btn(LANG_NAMES["ru"], "lang_ru")]))
+        return
+    if (user.state or {}).get("step") == "name":
+        await send(user, "ask_name")
+        return
+    cal = (user.state or {}).get("calendar", "jalali")
+    user.state = {"step": "birth_year", "calendar": cal, "page": 0}
+    await send_birth_year_page(user, 0)
 
 
 # ------------------------------------------------------------- commands ----
@@ -1368,6 +1413,13 @@ async def handle_message(platform: str, msg: dict) -> None:
         if text.startswith("/"):
             await s.commit()
             cmd, _, args = text.partition(" ")
+            # v2.3.4: unfinished signups may only use the harmless commands —
+            # /search, /profile, /store … used to bypass the whole signup.
+            if (needs_registration(user) and cmd.split("@")[0].lower()
+                    not in ("/start", "/help", "/language")):
+                await resume_registration(user)
+                await s.commit()
+                return
             await handle_command(user, cmd, args.strip())
             return
         # --- admin chat flows ---
@@ -1701,11 +1753,19 @@ async def handle_callback(platform: str, query: dict) -> None:
         if user is None:
             return
         user.last_seen_at = utcnow()
+        # v2.3.4: global registration gate — an unfinished signup may only press
+        # registration-related buttons; everything else (search, wallet, chat
+        # actions…) pushes the user back into the signup instead of executing.
+        if needs_registration(user) and not _reg_callback(data):
+            await resume_registration(user)
+            return
         if data.startswith("lang_"):
             user.language = data[5:]
             await send(user, "language_set")
             if not user.accepted_rules_at:
                 await begin_registration(user)
+            elif user.age == 0:
+                await resume_registration(user)
             else:
                 await main_menu(user)
             return
@@ -1728,6 +1788,11 @@ async def handle_callback(platform: str, query: dict) -> None:
             await send(user, "ask_name")
             return
         if data in ("reg_female", "reg_male"):
+            # v2.3.4: final sanity check — gender can only finalize a signup
+            # whose birthdate step actually produced an age.
+            if user.age == 0:
+                await resume_registration(user)
+                return
             user.gender = data[4:]
             user.state = None
             eco = await service.get_setting(s, "economy")

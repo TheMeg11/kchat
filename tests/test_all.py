@@ -652,17 +652,32 @@ async def test_anon_link_flow(adapters):
     async with db.session_scope() as s:
         owner = (await s.execute(select(User).where(User.platform_user_id == "950"))).scalar_one()
         code = owner.anon_link_code
-    # a NEW user starts with the NEW payload
+    # v2.3.4 policy: deep-link features (incl. anon messaging) are
+    # registered-only. An unregistered stranger gets the signup FSM instead.
     tg.sent.clear()
     await bot_mod.process_update("telegram", {"update_id": 3001, "message": {
         "message_id": 2, "chat": {"id": 951}, "from": {"id": 951, "first_name": "Stranger"},
         "text": f"/start m{code}"}})
+    async with db.session_scope() as s:
+        stranger = (await s.execute(select(User).where(
+            User.platform_user_id == "951"))).scalar_one()
+        assert stranger.age == 0 and stranger.state["step"] == "language"
     await bot_mod.process_update("telegram", {"update_id": 3002, "message": {
         "message_id": 3, "chat": {"id": 951}, "from": {"id": 951}, "text": "سلام ناشناس!"}})
+    assert not any(t[0] == "950" and "سلام ناشناس!" in str(t[1]) for t in tg.sent)
+    # only after completing registration can the stranger use the anon link
+    await register_via_bot(adapters, "telegram", "951", "Stranger", 25, "male")
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 3011, "message": {
+        "message_id": 12, "chat": {"id": 951}, "from": {"id": 951, "first_name": "Stranger"},
+        "text": f"/start m{code}"}})
+    await bot_mod.process_update("telegram", {"update_id": 3012, "message": {
+        "message_id": 13, "chat": {"id": 951}, "from": {"id": 951}, "text": "سلام ناشناس!"}})
     assert any("سلام ناشناس!" in str(t[1]) for t in tg.sent)  # delivered to owner (chat 950)
     delivered = [t for t in tg.sent if t[0] == "950" and "سلام ناشناس!" in str(t[1])]
     assert delivered
-    # LEGACY payload still works (old links shared before v2.2)
+    # LEGACY payload still works for REGISTERED users (links shared before v2.2)
+    await register_via_bot(adapters, "telegram", "952", "OldLink", 25, "male")
     tg.sent.clear()
     await bot_mod.process_update("telegram", {"update_id": 3003, "message": {
         "message_id": 4, "chat": {"id": 952}, "from": {"id": 952, "first_name": "OldLink"},
@@ -1561,15 +1576,15 @@ async def test_anon_reply_targets_exact_thread(adapters):
     from app import bot as bot_mod
     from app.db import AnonThread
     tg, bale = adapters
-    await register_via_bot(adapters, "telegram", "997", "OwnerT", 25, "male")
-    await register_via_bot(adapters, "bale", "998", "SenderA", 25, "female")
-    await register_via_bot(adapters, "bale", "999", "SenderB", 25, "male")
-    # defensive: ensure maintenance is OFF (a failed earlier test could leave it on)
+    # defensive reset must run BEFORE registrations (fresh DB + no settings row)
     async with db.session_scope() as s:
         cfg = await service.get_setting(s, "app")
         if cfg.get("maintenanceMode"):
             cfg["maintenanceMode"] = False
             await service.set_setting(s, "app", cfg)
+    await register_via_bot(adapters, "telegram", "997", "OwnerT", 25, "male")
+    await register_via_bot(adapters, "bale", "998", "SenderA", 25, "female")
+    await register_via_bot(adapters, "bale", "999", "SenderB", 25, "male")
     async with db.session_scope() as s:
         owner = (await s.execute(select(User).where(User.platform_user_id == "997"))).scalar_one()
         a = (await s.execute(select(User).where(User.platform_user_id == "998"))).scalar_one()
@@ -2159,3 +2174,139 @@ async def test_incomplete_signup_category():
     async with db.session_scope() as s:
         await s.execute(delete(User).where(User.platform_user_id.in_(["inc-1", "inc-2"])))
         await s.execute(delete(WebAdmin).where(WebAdmin.username == "probe.inc"))
+
+
+# ------------------------------------------------- v2.3.4 gate tests ----
+@pytest.mark.asyncio
+async def test_unregistered_cannot_use_bot_features(adapters):
+    """v2.3.4: age 0 / rules not accepted = signup unfinished. Callbacks,
+    commands and deep-links must never bypass the signup FSM."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    seq = [900000]
+
+    def upd(**kw):
+        seq[0] += 1
+        return {"update_id": seq[0], **kw}
+
+    def cq(data):
+        seq[0] += 1
+        return bot_mod.process_update("telegram", upd(callback_query={
+            "id": str(seq[0]), "from": {"id": 7001},
+            "message": {"chat": {"id": 7001}}, "data": data}))
+
+    def msg(text):
+        return bot_mod.process_update("telegram", upd(message={
+            "message_id": seq[0], "chat": {"id": 7001},
+            "from": {"id": 7001, "first_name": "Gate"}, "text": text}))
+
+    async def row():
+        async with db.session_scope() as s:
+            return (await s.execute(select(User).where(
+                User.platform_user_id == "7001"))).scalar_one()
+
+    # fresh user — first touch creates the row
+    await msg("/start")
+    u = await row()
+    assert u.age == 0 and u.state["step"] == "language"
+
+    # 1) search callback must NOT queue an unregistered user
+    await cq("search")
+    async with db.session_scope() as s:
+        q = (await s.execute(select(QueueEntry))).scalars().all()
+    assert not q
+    # 2) /search command equally blocked
+    await msg("/search")
+    async with db.session_scope() as s:
+        q = (await s.execute(select(QueueEntry))).scalars().all()
+    assert not q
+    # 3) anon-message deep link must not open the anon flow unregistered
+    async with db.session_scope() as s:
+        t = User(platform="telegram", platform_user_id="7002",
+                 display_name="Target", age=30, gender="female",
+                 accepted_rules_at=utcnow(), registration_rewarded=True,
+                 anon_link_code="GATEST1")
+        s.add(t)
+    await msg("/start mGATEST1")
+    u = await row()
+    assert u.state["step"] == "language"     # pushed back to signup, not anon_msg
+    # 4) rules accepted but age still 0 -> lang_ callback resumes the signup,
+    #    never main_menu
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(
+            User.platform_user_id == "7001"))).scalar_one()
+        u.accepted_rules_at = utcnow()
+        u.state = {"step": "birth_year", "calendar": "jalali", "page": 0}
+    await cq("lang_fa")
+    u = await row()
+    assert u.language == "fa"
+    assert u.state["step"] == "birth_year"   # resumed, not freed
+    # 5) /profile and /store blocked too
+    await msg("/profile")
+    await msg("/store")
+    u = await row()
+    assert u.state["step"] == "birth_year"
+    # 6) full signup still completes through the gate
+    await cq("bcal_gregorian")
+
+
+@pytest.mark.asyncio
+async def test_registered_user_unaffected_by_gate(adapters):
+    """The gate must not block registered users (regression safety)."""
+    await register_via_bot(adapters, "telegram", "7101", "Nima", 25, "male")
+    from app import bot as bot_mod
+    await bot_mod.process_update("telegram", {"update_id": 950001, "callback_query": {
+        "id": "cq950", "from": {"id": 7101},
+        "message": {"chat": {"id": 7101}}, "data": "gf_everyone"}})
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(
+            User.platform_user_id == "7101"))).scalar_one()
+        q = (await s.execute(select(QueueEntry).where(
+            QueueEntry.user_id == u.id))).scalar_one_or_none()
+        assert q is not None and u.age == 25
+
+
+# ------------------------------------------------ v2.3.4 coin endpoints ----
+@pytest.mark.asyncio
+async def test_coin_adjust_errors_and_success():
+    """Panel coin add/subtract: valid ops work; over-deduct is a clean 400."""
+    import httpx
+    from app.main import app
+    await _mk_admin("probe.coins")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+        r = await cli.post("/api/admin/v1/auth/login",
+                           json={"username": "probe.coins", "password": "InitialPass123!"})
+        cookies = dict(r.cookies)
+        csrf = r.headers.get("x-csrf-token")
+        async with db.session_scope() as s:
+            u = User(platform="telegram", platform_user_id="coins-1",
+                     display_name="WalletTest", age=22, gender="male",
+                     coin_balance=40, accepted_rules_at=utcnow())
+            s.add(u)
+        uid = str(u.id)
+        # over-deduct -> 400 with Persian message
+        r = await cli.post(f"/api/admin/v1/users/{uid}/coins", cookies=cookies,
+                           json={"amount": -100, "reason": "تست کسر"},
+                           headers={"X-CSRF-Token": csrf})
+        assert r.status_code == 400
+        assert "کافی نیست" in r.json()["detail"]
+        # grant works
+        r = await cli.post(f"/api/admin/v1/users/{uid}/coins", cookies=cookies,
+                           json={"amount": 25, "reason": "تست اعطا"},
+                           headers={"X-CSRF-Token": csrf})
+        assert r.status_code == 200 and r.json()["user"]["coinBalance"] == 65
+        # valid deduct works
+        r = await cli.post(f"/api/admin/v1/users/{uid}/coins", cookies=cookies,
+                           json={"amount": -65, "reason": "تست کسر"},
+                           headers={"X-CSRF-Token": csrf})
+        assert r.status_code == 200 and r.json()["user"]["coinBalance"] == 0
+    async with db.session_scope() as s:
+        await s.execute(delete(User).where(User.platform_user_id == "coins-1"))
+        await s.execute(delete(WebAdmin).where(WebAdmin.username == "probe.coins"))
+
+
+def test_bundle_no_username_leak():
+    """Login page must not ship the admin username in defaults/placeholder."""
+    bundle = (Path(__file__).resolve().parents[1] / "webadmin" / "index.html").read_text("utf-8")
+    assert "hamchat.admin" not in bundle

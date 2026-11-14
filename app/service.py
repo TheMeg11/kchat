@@ -96,7 +96,11 @@ def tehran_day(d: Optional[datetime] = None) -> str:
 async def get_setting(session, key: str) -> Any:
     row = await session.get(AppSetting, key)
     if row is None:
-        return DEFAULT_SETTINGS.get(key)
+        # v2.3.4: hand out a COPY — the live DEFAULT_SETTINGS dict must never
+        # leak to callers (a caller mutating the returned config corrupted the
+        # process-wide defaults, e.g. maintenanceMode sticking on).
+        base = DEFAULT_SETTINGS.get(key)
+        return dict(base) if isinstance(base, dict) else base
     base = DEFAULT_SETTINGS.get(key)
     if isinstance(base, dict) and isinstance(row.value, dict):
         merged = dict(base)
