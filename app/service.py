@@ -40,6 +40,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
                 "backupRetentionDisclosureFa": "آرشیوهای پشتیبان رمزنگاری‌شده ممکن است متن گفتگوهای قدیمی‌تر از ۳۰ روز را در نسخه‌های قبلی خود حفظ کنند."},
     "backup": {"autoBackupEnabled": True, "scheduleTimeTehran": "03:00",
                "retentionDays": 90, "encryptionEnabled": True, "lastRunDate": ""},
+    # v2.2: coin-store conversion rates (changeable via settings/economy)
+    "store": {"tomanPerCoin": 500,        # 500 Toman = 1 coin
+              "coinsPerStar": 20,         # 1 Telegram Star = 20 coins
+              "customMinCoins": 10, "customMaxCoins": 5000,
+              "updatedBy": "system", "updatedAt": None},
     "platforms": {
         "telegram": {"pollingFallback": True, "dropPendingOnRestart": False,
                      "webhookMaxConnections": 60, "retryAttempts": 4},
@@ -706,20 +711,49 @@ AUDIENCE_LABELS = {
 
 
 # ----------------------------------------------------------------- seed ----
-# Pricing rule (v2): 100 coins = 50,000 Toman = 5 Stars
+# v2.2 packages (item 3): 10k=20, 20k=40, 50k=100, 75k=150, 100k=200 coins
+# Stars price = ceil(coins / coinsPerStar) with coinsPerStar = 20.
+V22_PACKAGES = [
+    ("pkg_20", 20, "۲۰ سکه", None, 1, 10_000),
+    ("pkg_40", 40, "۴۰ سکه", None, 2, 20_000),
+    ("pkg_100", 100, "۱۰۰ سکه", "محبوب", 5, 50_000),
+    ("pkg_150", 150, "۱۵۰ سکه", "پرفروش", 8, 75_000),      # 7.5 stars -> 8
+    ("pkg_200", 200, "۲۰۰ سکه", "بهترین ارزش", 10, 100_000),
+]
+
+
+def coins_price_toman(store_cfg: dict, coins: int) -> int:
+    """Item 3: Toman price for N coins (rate kept in settings, changeable)."""
+    return int(coins) * int(store_cfg.get("tomanPerCoin", 500))
+
+
+def coins_price_stars(store_cfg: dict, coins: int) -> int:
+    """Item 3: Telegram Stars price for N coins (Star invoices are integers)."""
+    cps = max(1, int(store_cfg.get("coinsPerStar", 20)))
+    import math
+    return math.ceil(int(coins) / cps)
+
+
+# Pricing rule (v2.2): 500 Toman = 1 coin, 1 Star = 20 coins; packages migrated
+# in-place (old rows are deactivated, never deleted — payment history keeps working).
 async def seed(session) -> None:
-    packages = await session.execute(select(StorePackage))
-    if list(packages.scalars()) == []:
-        session.add_all([
-            StorePackage(id="pkg_100", coins=100, title="۱۰۰ سکه", badge=None,
-                         telegram_stars_price=5, bale_toman_price=50000),
-            StorePackage(id="pkg_300", coins=300, title="۳۰۰ سکه", badge="محبوب",
-                         telegram_stars_price=15, bale_toman_price=150000),
-            StorePackage(id="pkg_700", coins=700, title="۷۰۰ سکه", badge="پرفروش",
-                         telegram_stars_price=35, bale_toman_price=350000),
-            StorePackage(id="pkg_1500", coins=1500, title="۱۵۰۰ سکه", badge="بهترین ارزش",
-                         telegram_stars_price=75, bale_toman_price=750000),
-        ])
+    marker = await session.get(AppSetting, "storePackagesVersion")
+    if marker is None or marker.value != 2:
+        v22_ids = {pid for pid, *_rest in V22_PACKAGES}
+        for pid, coins, title, badge, stars, toman in V22_PACKAGES:
+            p = await session.get(StorePackage, pid)
+            if p is None:
+                session.add(StorePackage(id=pid, coins=coins, title=title, badge=badge,
+                                         telegram_stars_price=stars, bale_toman_price=toman,
+                                         bale_enabled=True))
+            else:
+                p.coins, p.title, p.badge = coins, title, badge
+                p.telegram_stars_price, p.bale_toman_price = stars, toman
+                p.bale_enabled = True
+        for p in (await session.execute(select(StorePackage))).scalars():
+            if p.id not in v22_ids:
+                p.active = False          # retire legacy packages, keep history
+        await set_setting(session, "storePackagesVersion", 2)
     medias = await session.execute(select(MediaType))
     if list(medias.scalars()) == []:
         session.add_all([MediaType(key=k, enabled=True) for k in MEDIA_KEYS])
