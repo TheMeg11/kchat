@@ -17,13 +17,20 @@ from .db import (AdminNotification, AllowlistPhrase, Appeal, AppSetting, AuditLo
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "economy": {"initialReward": 20, "messageCost": 1, "dailyBonus": 5,
-                "genderFilterMatchCost": 5, "referralRewardPerParty": 20,
+                "genderFilterMatchCost": 5, "referralRewardPerParty": 50,
                 "nameChangeCost": 10, "ageChangeCost": 10, "birthdayReward": 10,
                 "accountLinkReward": 50,
                 "updatedBy": "system", "updatedAt": None},
+    # v2.4: friend-list feature + signup-rescue cadence + panel alerting
+    "growth": {"rescueEnabled": True, "rescueMaxPerDay": 200,
+               "reminderHours": [6, 24, 72], "maxFriends": 50,
+               "updatedBy": "system", "updatedAt": None},
+    # v2.4: age-group separation between 13-17 and 18-60 is REMOVED by product
+    # decision (chats are fully moderated) — the matching engine no longer
+    # filters on age_group; the column stays for analytics only.
     "matching": {"enabled": True, "maxQueueSize": 1000, "searchTimeoutSec": 300,
                  "idleTimeoutSec": 900, "repeatMatchCooldownMin": 30,
-                 "genderFilterEnabled": True},
+                 "genderFilterEnabled": True, "ageGroupSeparation": False},
     "moderation": {"blockUrls": True, "blockTelegramHandles": True, "blockPhoneNumbers": True,
                    "blockInstagramIds": True, "autoBanReportThreshold": 3,
                    "autoBanWindowHours": 24, "autoBanDurationHours": 24,
@@ -347,11 +354,9 @@ async def update_dynamic_ages(session) -> int:
     for u in res.scalars():
         new_age = compute_age_from_birthday(u.birth_year, u.birth_month, u.birth_day)
         if new_age != u.age:
-            old_group = age_group(u.age)
             u.age = max(13, min(60, new_age))
-            # If the age-group changed, drop them from the queue so they re-join the right pool.
-            if age_group(u.age) != old_group:
-                await session.execute(delete(QueueEntry).where(QueueEntry.user_id == u.id))
+            # v2.4: queue re-join on age-group change is no longer needed —
+            # matching no longer separates age groups.
             changed += 1
     return changed
 
@@ -479,8 +484,8 @@ async def try_match(session) -> Optional[tuple[User, User, bool]]:
     for i in range(len(entries)):
         for j in range(i + 1, len(entries)):
             a, b = entries[i], entries[j]
-            if a.age_group != b.age_group:       # strict 13-17 / 18-60 separation (locked)
-                continue
+            # v2.4: age-group separation (13-17 vs 18-60) REMOVED by product
+            # decision — chats are fully moderated; matching is open to all ages.
             if await is_blocked(session, a.user_id, b.user_id) or await is_blocked(session, b.user_id, a.user_id):
                 continue
             if not _filters_compatible(a, b):
@@ -654,10 +659,14 @@ async def purge_expired(session) -> dict:
         ViolationLog.created_at < cutoff))).rowcount
     d = (await session.execute(delete(RecentPair).where(
         RecentPair.ended_at < utcnow() - timedelta(days=7)))).rowcount
+    # v2.4: expired web-admin sessions (30-day trusted-device lifetime)
+    w = (await session.execute(delete(db.WebSession).where(
+        db.WebSession.created_at < utcnow() - timedelta(days=30)))).rowcount
     # expired temporary bans
     await session.execute(update(Ban).where(
         Ban.type == "temporary", Ban.status == "active", Ban.expires_at < utcnow()).values(status="expired"))
-    return {"messages": m, "chats": c, "updates": u, "violations": v, "pairs": d}
+    return {"messages": m, "chats": c, "updates": u, "violations": v, "pairs": d,
+            "web_sessions": w}
 
 
 async def delete_account(session, user: User) -> None:
@@ -692,7 +701,7 @@ async def delete_account(session, user: User) -> None:
 
 # ------------------------------------------------------------ broadcast ----
 async def broadcast_targets(session, audience: str) -> list[User]:
-    q = select(User).where(User.status == "active")
+    q = select(User).where(User.status == "active", User.bot_blocked == False)  # noqa
     if audience == "telegram":
         q = q.where(User.platform == "telegram")
     elif audience == "bale":
@@ -701,8 +710,13 @@ async def broadcast_targets(session, audience: str) -> list[User]:
         q = q.where(User.language == audience.split("_", 1)[1])
     elif audience == "active_7d":
         q = q.where(User.last_seen_at >= utcnow() - timedelta(days=7))
+    elif audience == "inactive_7d":
+        q = q.where(User.last_seen_at < utcnow() - timedelta(days=7), User.age > 0)
     elif audience == "low_balance":
         q = q.where(User.coin_balance < 10)
+    elif audience == "incomplete":
+        # v2.4 segmented broadcast: users whose registration never completed
+        q = q.where(User.age == 0)
     return list((await session.execute(q)).scalars())
 
 
@@ -710,7 +724,8 @@ AUDIENCE_LABELS = {
     "all": "همه کاربران (تلگرام + بله)", "telegram": "مخاطبان تلگرام", "bale": "مخاطبان بله",
     "language_fa": "کاربران فارسی‌زبان", "language_en": "کاربران انگلیسی‌زبان",
     "language_ru": "کاربران روسی‌زبان", "active_7d": "کاربران فعال ۷ روز اخیر",
-    "low_balance": "کاربران با موجودی کمتر از ۱۰ سکه",
+    "inactive_7d": "کاربران غایب بیش از ۷ روز", "low_balance": "کاربران با موجودی کمتر از ۱۰ سکه",
+    "incomplete": "ثبت‌نام‌های ناتمام",
 }
 
 
@@ -758,6 +773,17 @@ async def seed(session) -> None:
             if p.id not in v22_ids:
                 p.active = False          # retire legacy packages, keep history
         await set_setting(session, "storePackagesVersion", 2)
+    # v2.4: referral reward raised 20 -> 50 per party — only when the stored
+    # value still equals the OLD default (admin-customized values are kept).
+    eco_ver = await session.get(AppSetting, "economyDefaultsVersion")
+    if eco_ver is None or eco_ver.value != 2:
+        eco = await get_setting(session, "economy")
+        if eco.get("referralRewardPerParty", 50) == 20:
+            eco["referralRewardPerParty"] = 50
+            eco["updatedBy"] = "seed:v2.4"
+            eco["updatedAt"] = utcnow().isoformat()
+            await set_setting(session, "economy", eco)
+        await set_setting(session, "economyDefaultsVersion", 2)
     medias = await session.execute(select(MediaType))
     if list(medias.scalars()) == []:
         session.add_all([MediaType(key=k, enabled=True) for k in MEDIA_KEYS])

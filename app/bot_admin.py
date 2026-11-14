@@ -258,7 +258,36 @@ async def admin_callback(user: User, data: str, chat_id) -> None:
 
     if data == "adm_bcast" and "broadcast.send" in perms:
         user.state = {"step": "adm_bcast_text"}
-        await _say(user, "متن پیام همگانی را بفرستید (به همه کاربران فعال هر دو پلتفرم ارسال می‌شود):")
+        await _say(user, "متن پیام همگانی را بفرستید. سپس مخاطب (سگمنت) را از دکمه‌های بعدی انتخاب می‌کنید.")
+        return
+
+    # v2.4 segmented broadcast: the audience is picked AFTER the text
+    if data.startswith("adm_baud_") and "broadcast.send" in perms:
+        audience = data[len("adm_baud_"):]
+        st = user.state or {}
+        if st.get("step") != "adm_bcast_aud" or not st.get("text"):
+            await _say(user, "ابتدا متن پیام را بفرستید (از منوی پیام همگانی).")
+            return
+        from .db import BroadcastCampaign
+        valid = {"all", "telegram", "bale", "incomplete", "active_7d", "inactive_7d", "low_balance"}
+        if audience not in valid:
+            await _say(user, "مخاطب نامعتبر است.")
+            return
+        async with session_scope() as s:
+            targets = await service.broadcast_targets(s, audience)
+            camp = BroadcastCampaign(title=f"bot-{secrets.token_hex(2)}",
+                                     message=st["text"][:4000], audience=audience,
+                                     audience_label=service.AUDIENCE_LABELS.get(audience, audience),
+                                     rate_limit_per_sec=20, status="sending",
+                                     target_count=len(targets),
+                                     created_by=f"bot:{user.platform_user_id}")
+            s.add(camp)
+            await s.flush()
+            camp_id = camp.id
+        user.state = None
+        RUNTIME.setdefault("broadcast_queue", []).append(camp_id)
+        await _say(user, f"📢 کمپین #{camp_id} برای «{service.AUDIENCE_LABELS.get(audience, audience)}» "
+                         f"به {len(targets)} کاربر آغاز شد.")
         return
 
     if data == "adm_backup" and "backups.view" in perms:
@@ -427,19 +456,18 @@ async def admin_text_flow(user: User, text: str) -> bool:
         return True
 
     if step == "adm_bcast_text" and "broadcast.send" in perms:
-        from .db import BroadcastCampaign
-        async with session_scope() as s:
-            targets = await service.broadcast_targets(s, "all")
-            camp = BroadcastCampaign(title=f"manual-{secrets.token_hex(2)}", message=text[:4000],
-                                     audience="all", audience_label="همه کاربران",
-                                     rate_limit_per_sec=20, status="sending",
-                                     target_count=len(targets),
-                                     created_by=f"bot:{user.platform_user_id}")
-            s.add(camp)
-            await s.flush()
-            camp_id = camp.id
-        RUNTIME.setdefault("broadcast_queue", []).append(camp_id)
-        await _say(user, f"📢 کمپین #{camp_id} برای {len(targets)} کاربر آغاز شد.")
+        # v2.4: save the text and ask for the target segment
+        user.state = {"step": "adm_bcast_aud", "text": text[:4000]}
+        rows = [[btn("👥 همه کاربران", "adm_baud_all")],
+                [btn("🔵 فقط تلگرام", "adm_baud_telegram"),
+                 btn("🟢 فقط بله", "adm_baud_bale")],
+                [btn("🧩 ثبت‌نام‌های ناتمام", "adm_baud_incomplete")],
+                [btn("🟢 فعال ۷ روز اخیر", "adm_baud_active_7d"),
+                 btn("😴 غایب ۷+ روز", "adm_baud_inactive_7d")],
+                [btn("🪙 موجودی کم", "adm_baud_low_balance")],
+                [btn("🏠 بازگشت به منوی اصلی", "back_home")]]
+        await _say(user, "✅ متن ذخیره شد. حالا مخاطب (سگمنت) پیام را انتخاب کن:",
+                   keyboard=kb(rows))
         return True
 
     if step == "adm_admins_set" and role == "owner":
@@ -549,6 +577,8 @@ async def admin_inline_action(user: User, data: str) -> bool:
                                     action="user.unbanned", module="bans",
                                     target_type="user", target_id=target.public_id)
                 await _say(user, f"✅ مسدودی {target.public_id} رفع شد.")
+                # v2.4: the user learns about it in their own PV
+                await _notify_target(target, "admin_unban_notice")
             else:
                 if act == "perm":
                     await service.ban_user(s, target, "permanent", "manual_admin",
@@ -559,16 +589,43 @@ async def admin_inline_action(user: User, data: str) -> bool:
                     await service.ban_user(s, target, "temporary", "manual_admin",
                                            "تصمیم مدیر", f"bot:{user.platform_user_id}", hours=hours)
                     await _say(user, f"⛔ {target.public_id} برای {hours} ساعت مسدود شد.")
+                # v2.4: the user learns about it in their own PV
+                await _notify_target(target, "admin_ban_notice",
+                                     reason="تصمیم مدیریت")
         elif data.startswith("admuc_") and "users.coins" in perms:
             amount = int(act)
             if amount >= 0:
                 await service.credit(s, target, amount, "admin_grant", "اعطای دستی مدیر")
             else:
-                await service.debit(s, target, -amount, "admin_deduct", "کسر دستی مدیر")
+                ok = await service.debit(s, target, -amount, "admin_deduct", "کسر دستی مدیر")
+                if ok is None:
+                    await _say(user, f"⚠️ موجودی {target.public_id} برای کسر کافی نیست.")
+                    return True
             await service.audit(s, actor_type="bot", admin_id=user.platform_user_id,
                                 admin_name=user.display_name, admin_role=role,
                                 action="user.coins_granted", module="economy",
                                 target_type="user", target_id=target.public_id,
                                 details=f"{amount:+d}")
             await _say(user, f"🪙 موجودی {target.public_id}: {target.coin_balance}")
+            # v2.4: the result of the admin action lands in the user's PV too
+            await _notify_target(target,
+                                 "admin_coins_grant" if amount >= 0 else "admin_coins_deduct",
+                                 amount=abs(amount), reason="تصمیم مدیریت",
+                                 balance=target.coin_balance)
     return True
+
+
+async def _notify_target(target: User, key: str, **kw) -> None:
+    """Send an admin-action notice to the target user's PV (best effort —
+    failures are logged, never raised; blocked bots land in the isolation list)."""
+    from . import bot as bot_mod
+    from .i18n import tr
+    adp = bot_mod.adapter(target.platform)
+    if not adp:
+        return
+    try:
+        await adp.send_message(target.platform_user_id, tr(target.language, key, **kw))
+    except PlatformError as exc:
+        from . import growth
+        await growth.mark_bot_blocked(target.id, target.platform, str(exc))
+        log.info("admin-action PV notify failed for %s: %s", target.public_id, exc)

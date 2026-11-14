@@ -9,12 +9,13 @@ from sqlalchemy import delete, func, select
 
 from . import db, service
 from .config import RUNTIME, settings
-from .db import (AnonThread, Block, Chat, ChatMessage, MediaType, Payment,
+from .db import (AnonThread, Block, Chat, ChatMessage, Friend, MediaType, Payment,
                  QueueEntry, Report, StorePackage, User, session_scope, utcnow)
 from .i18n import (GENDER_LABEL, GREGORIAN_MONTHS, JALALI_MONTHS, LANG_NAMES,
                    PLATFORM_LABEL, tr)
 from .platform import CROSS_OK, PlatformError, UnsupportedMethod
 from .moderation import check_display_name
+from . import growth
 
 log = logging.getLogger("kanar.bot")
 
@@ -48,6 +49,10 @@ async def send(user: User, key: str, keyboard=None, reply_to=None, **kw) -> None
         await adp.send_message(user.platform_user_id, tr(user.language, key, **kw),
                                keyboard=keyboard, reply_to=reply_to)
     except PlatformError as exc:
+        # v2.4: 403-class failures mean the user blocked the bot / deactivated
+        # their account — isolate them so reminders & broadcasts never retry.
+        if exc.error_code in (400, 403):
+            await growth.mark_bot_blocked(user.id, user.platform, str(exc))
         log.warning("send failed to %s/%s: %s", user.platform, user.public_id, exc)
 
 
@@ -77,6 +82,8 @@ async def main_menu(user: User) -> None:
     rows.append([btn(tr(lang, "btn_profile"), "profile")])
     rows.append([btn(tr(lang, "btn_anon_link"), "anon_link"),
                  btn(tr(lang, "btn_direct_msg"), "direct_msg")])
+    # v2.4: friends list lives in the main menu
+    rows.append([btn(tr(lang, "btn_friends"), "friends_list")])
     rows.append([btn(tr(lang, "btn_coins"), "wallet"),
                  btn(tr(lang, "btn_rewards"), "rewards")])
     rows.append([btn(tr(lang, "btn_help"), "help")])
@@ -109,10 +116,96 @@ async def _is_admin(user: User) -> bool:
         return r.scalar_one_or_none() is not None
 
 
+# ------------------------------------------------------- friends (v2.4) ----
+FRIENDS_PAGE = 15   # friends rendered per screen
+
+
+async def show_friends(user: User, page: int = 0) -> None:
+    """Friends list: every friend gets anonymous-message + remove buttons;
+    the referral ('invite friend') button sits at the bottom — same reward
+    flow as دعوت دوستان."""
+    lang = user.language
+    async with session_scope() as s:
+        u = await s.get(User, user.id)
+        rows_q = (await s.execute(select(Friend).where(Friend.user_id == u.id)
+                                  .order_by(Friend.id.desc()))).scalars()
+        friends = list(rows_q)
+        people = []
+        for f in friends:
+            p = await s.get(User, f.friend_id)
+            if p and p.status == "active":
+                people.append(p)
+    count = len(people)
+    if count == 0:
+        await send(user, "friends_empty", keyboard=back_kb(lang))
+        return
+    start = max(0, page) * FRIENDS_PAGE
+    chunk = people[start:start + FRIENDS_PAGE]
+    kb_rows = []
+    for p in chunk:
+        kb_rows.append([btn(f"💬 {p.display_name}", f"frdm_{p.id}"),
+                        btn(tr(lang, "btn_friend_del"), f"frdel_{p.id}")])
+    nav = []
+    if start + FRIENDS_PAGE < count:
+        nav.append(btn("◀️ قبلی", f"frpg_{page + 1}"))
+    if page > 0:
+        nav.append(btn("▶️ بعدی", f"frpg_{page - 1}"))
+    if nav:
+        kb_rows.append(nav)
+    # v2.4: invite-friend entry inside the friends submenu (referral reward)
+    kb_rows.append([btn(tr(lang, "btn_myref"), "referral")])
+    kb_rows.append([btn(tr(lang, "btn_back"), "back_home")])
+    await send(user, "friends_title", count=count, keyboard=kb(*kb_rows))
+
+
+async def add_friend_flow(user: User) -> None:
+    """Chat-options button: save the current partner into the friends list."""
+    lang = user.language
+    async with session_scope() as s:
+        u = await s.get(User, user.id)
+        chat = await service.active_chat_for(s, u.id)
+        if not chat:
+            await send(u, "not_in_chat", keyboard=search_cta(u.language))
+            return
+        partner = await partner_of(s, chat, u)
+        if not partner or partner.id == u.id:
+            await send(u, "invalid_input")
+            return
+        dup = (await s.execute(select(Friend).where(
+            Friend.user_id == u.id, Friend.friend_id == partner.id))).scalar_one_or_none()
+        if dup:
+            await send(u, "friend_exists")
+            return
+        s.add(Friend(user_id=u.id, friend_id=partner.id))
+        name = partner.display_name
+    await send(user, "friend_added", name=name)
+
+
+async def friend_message_flow(user: User, friend_id: int) -> None:
+    """Ask the message text for an anonymous DM to a saved friend."""
+    async with session_scope() as s:
+        u = await s.get(User, user.id)
+        target = await s.get(User, friend_id)
+        if not target or target.status != "active":
+            await send(u, "friend_gone")
+            await show_friends(u)
+            return
+        u.state = _st_with_after(u.state, {"step": "friend_msg", "target": target.id})
+        name = target.display_name
+    await send(user, "friend_msg_intro", name=name, keyboard=back_kb(user.language))
+
+
+async def deliver_friend_message(user: User, target_id: Optional[int], text: str) -> None:
+    """Anonymous delivery to a friend — same anonymous thread machinery as the
+    direct-message feature (no identity leak, no delivery status revealed)."""
+    await deliver_direct_message(user, target_id, text)
+
+
 def chat_controls(lang: str):
     return kb([btn(tr(lang, "btn_next"), "chat_next"), btn(tr(lang, "btn_end"), "chat_end")],
               [btn(tr(lang, "btn_report"), "chat_report"), btn(tr(lang, "btn_block"), "chat_block")],
-              [btn(tr(lang, "btn_gift"), "chat_gift")])
+              [btn(tr(lang, "btn_gift"), "chat_gift")],
+              [btn(tr(lang, "btn_add_friend"), "chat_addfriend")])
 
 
 async def partner_of(session, chat: Chat, user: User) -> Optional[User]:
@@ -140,6 +233,18 @@ def anon_start_payload(code: str) -> str:
     return "m" + code
 
 
+def _st_with_after(prev_state, new_state: dict) -> dict:
+    """v2.4: registration steps overwrite user.state wholesale — the pending
+    post-signup mission (after_reg, e.g. the anon-link target) must survive
+    every transition so the visitor lands in the anon-message flow right
+    after finishing the signup."""
+    after = (prev_state or {}).get("after_reg")
+    if after and "after_reg" not in new_state:
+        new_state = dict(new_state)
+        new_state["after_reg"] = after
+    return new_state
+
+
 async def cmd_start(user: User, payload: str = "") -> None:
     async with session_scope() as s:
         u = await s.get(User, user.id)
@@ -157,8 +262,12 @@ async def cmd_start(user: User, payload: str = "") -> None:
             if target and target.id != u.id and target.status == "active":
                 # v2.3.4: deep-link features are registered-only — no anon
                 # messaging for people who skipped the signup.
+                # v2.4: the gate is pitched as a 30-second conversion step and
+                # the pending target is remembered — right after signup the
+                # user lands straight in the anon-message flow.
                 if needs_registration(u):
-                    u.state = {"step": "language"}
+                    u.state = _st_with_after(u.state, {"step": "language", "after_reg": {"anon": target.id}})
+                    await send(u, "anon_gate_teaser")
                     await send(u, "welcome", keyboard=kb(
                         [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
                          btn(LANG_NAMES["ru"], "lang_ru")]))
@@ -168,12 +277,12 @@ async def cmd_start(user: User, payload: str = "") -> None:
                 if blocked.scalar_one_or_none():
                     await main_menu(u)
                     return
-                u.state = {"step": "anon_msg", "target": target.id}
+                u.state = _st_with_after(u.state, {"step": "anon_msg", "target": target.id})
                 await send(u, "anon_msg_intro")
                 return
             # invalid/expired code or the owner themself -> normal entry
             if u.age == 0 or not u.accepted_rules_at:
-                u.state = {"step": "language"}
+                u.state = _st_with_after(u.state, {"step": "language"})
                 await send(u, "welcome", keyboard=kb(
                     [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
                      btn(LANG_NAMES["ru"], "lang_ru")]))
@@ -183,7 +292,7 @@ async def cmd_start(user: User, payload: str = "") -> None:
         if payload.startswith("lnk_"):
             # v2.3.4: link-confirm rewards are registered-only as well.
             if needs_registration(u):
-                u.state = {"step": "language"}
+                u.state = _st_with_after(u.state, {"step": "language"})
                 await send(u, "welcome", keyboard=kb(
                     [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
                      btn(LANG_NAMES["ru"], "lang_ru")]))
@@ -216,7 +325,7 @@ async def cmd_start(user: User, payload: str = "") -> None:
                     s.add(Referral(code=payload[4:], referrer_id=ref.id, referred_id=u.id))
                     u.referred_by_id = ref.id
         if u.age == 0 or not u.accepted_rules_at:
-            u.state = {"step": "language"}
+            u.state = _st_with_after(u.state, {"step": "language"})
             await send(u, "welcome", keyboard=kb(
                 [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
                  btn(LANG_NAMES["ru"], "lang_ru")]))
@@ -238,7 +347,7 @@ async def _notify_ban(user: User, ban) -> None:
 
 async def begin_registration(user: User) -> None:
     """Rules only (v3): read and accept — no privacy message."""
-    user.state = {"step": "rules"}
+    user.state = _st_with_after(user.state, {"step": "rules"})
     await send(user, "rules_title")
     await send(user, "rules_body")
     await send(user, "accept_rules", keyboard=kb([btn(tr(user.language, "accept"), "accept_rules")]))
@@ -247,6 +356,8 @@ async def begin_registration(user: User) -> None:
 # v2.3.4: hard registration gate — nothing outside the signup FSM may be used
 # until age is set and the rules are accepted.
 REG_CB_PREFIXES = ("lang_", "reg_", "bage_", "bcal_", "bmon_", "bday_", "byear_", "bypage_")
+# v2.4: the rescue-reminder CTA also belongs to the signup flow
+REG_CB_DATA = ("accept_rules", "back_name", "resume_signup")
 
 
 def needs_registration(u: User) -> bool:
@@ -254,23 +365,28 @@ def needs_registration(u: User) -> bool:
 
 
 def _reg_callback(data: str) -> bool:
-    return (data == "accept_rules" or data == "back_name"
-            or data.startswith(REG_CB_PREFIXES))
+    return (data in REG_CB_DATA or data.startswith(REG_CB_PREFIXES))
 
 
 async def resume_registration(user: User) -> None:
-    """Push an unfinished signup back onto the FSM at the right step."""
+    """Push an unfinished signup back onto the FSM at the right step.
+    v2.4: explains WHY the features are locked before re-entering the flow."""
+    after = (user.state or {}).get("after_reg")
     if not user.accepted_rules_at:
-        user.state = {"step": "language"}
+        user.state = _st_with_after(user.state, {"step": "language", **({"after_reg": after} if after else {})})
+        await send(user, "reg_resume_hint")
         await send(user, "welcome", keyboard=kb(
             [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
              btn(LANG_NAMES["ru"], "lang_ru")]))
         return
     if (user.state or {}).get("step") == "name":
+        await send(user, "reg_resume_hint")
         await send(user, "ask_name")
         return
     cal = (user.state or {}).get("calendar", "jalali")
-    user.state = {"step": "birth_year", "calendar": cal, "page": 0}
+    user.state = _st_with_after(user.state, {"step": "birth_year", "calendar": cal, "page": 0,
+                  **({"after_reg": after} if after else {})})
+    await send(user, "reg_resume_hint")
     await send_birth_year_page(user, 0)
 
 
@@ -295,7 +411,7 @@ async def handle_command(user: User, command: str, args: str) -> None:
     elif cmd == "/store" or cmd == "/buy":
         await show_store(user)
     elif cmd == "/language":
-        user.state = {"step": "language"}
+        user.state = _st_with_after(user.state, {"step": "language"})
         await send(user, "choose_lang", keyboard=kb(
             [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
              btn(LANG_NAMES["ru"], "lang_ru")], [btn(tr(lang, "btn_back"), "back_home")]))
@@ -311,7 +427,17 @@ async def handle_command(user: User, command: str, args: str) -> None:
             u = await s.get(User, user.id)
             got = await service.grant_daily_bonus(s, u)
             if got:
-                await send(u, "bonus_ok", coins=got, keyboard=back_kb(u.language))
+                streak = await daily_streak(s, u.id)
+                txt = tr(u.language, "bonus_ok", coins=got)
+                if streak > 1:
+                    txt += "\n\n" + tr(u.language, "streak_line", days=streak)
+                adp = adapter(u.platform)
+                if adp:
+                    try:
+                        await adp.send_message(u.platform_user_id, txt,
+                                               keyboard=back_kb(u.language))
+                    except PlatformError as exc:
+                        log.warning("bonus send failed: %s", exc)
             else:
                 await send(u, "bonus_already", keyboard=back_kb(u.language))
             user.coin_balance = u.coin_balance
@@ -320,7 +446,7 @@ async def handle_command(user: User, command: str, args: str) -> None:
     elif cmd == "/link":
         await show_anon_links(user)
     elif cmd == "/msg":
-        user.state = {"step": "direct_msg_target"}
+        user.state = _st_with_after(user.state, {"step": "direct_msg_target"})
         await send(user, "direct_msg_intro", keyboard=back_kb(lang))
     elif cmd == "/gift":
         await start_gift(user)
@@ -336,7 +462,7 @@ async def handle_command(user: User, command: str, args: str) -> None:
             if not b or b.type != "permanent":
                 await send(u, "no_active_ban")
             else:
-                u.state = {"step": "appeal", "ban_id": b.id}
+                u.state = _st_with_after(u.state, {"step": "appeal", "ban_id": b.id})
                 await send(u, "ask_appeal")
     elif cmd == "/support":
         async with session_scope() as s:
@@ -529,7 +655,7 @@ async def direct_message_flow(user: User, target_text: str) -> None:
             target = r.scalar_one_or_none()
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "direct_msg_text", "target": target.id if target else None}
+        u.state = _st_with_after(u.state, {"step": "direct_msg_text", "target": target.id if target else None})
     # deliberately identical prompt whether or not the target exists (mystery!)
     await send(user, "ask_msg_text", keyboard=back_kb(user.language))
 
@@ -674,7 +800,8 @@ async def _enqueue(user: User, gender_filter: str) -> None:
 
 
 async def invite_recently_active(seeker: User) -> None:
-    """If the queue is short, invite users active within the last 30 minutes (item 15)."""
+    """If the queue is short, invite users active within the last 30 minutes (item 15).
+    v2.4: age-group pre-filter removed — matching is open to all ages now."""
     try:
         async with session_scope() as s:
             in_queue = (await s.execute(select(func.count(QueueEntry.id)))).scalar() or 0
@@ -687,14 +814,12 @@ async def invite_recently_active(seeker: User) -> None:
                 select(Chat.user_b_id).where(Chat.status == "active"))).all()}
             candidates = (await s.execute(
                 select(User).where(
-                    User.status == "active", User.last_seen_at >= cutoff,
+                    User.status == "active", User.bot_blocked == False,  # noqa
+                    User.last_seen_at >= cutoff,
                     User.id != seeker.id,
                     (User.last_invite_at.is_(None)) | (User.last_invite_at < cutoff))
                 .limit(10))).scalars()
-            seeker_group = service.age_group(seeker.age)
             for cand in candidates:
-                if service.age_group(cand.age) != seeker_group:
-                    continue
                 if cand.id in busy:
                     continue
                 in_q = (await s.execute(select(QueueEntry).where(
@@ -825,6 +950,36 @@ async def do_block(user: User) -> None:
 
 
 # ------------------------------------------------------------- profile ----
+def level_key(total_chats: int) -> str:
+    """v2.4 light gamification: chat-count based level badge."""
+    if total_chats >= 30:
+        return "lvl_master"
+    if total_chats >= 15:
+        return "lvl_pro"
+    if total_chats >= 5:
+        return "lvl_chatter"
+    return "lvl_newbie"
+
+
+async def daily_streak(session, user_id: int) -> int:
+    """Consecutive Tehran days of daily-bonus claims ending today/yesterday."""
+    from .db import DailyClaim
+    rows = (await session.execute(select(DailyClaim.day).where(
+        DailyClaim.user_id == user_id).order_by(DailyClaim.day.desc()).limit(60))).all()
+    days = {r[0] for r in rows}
+    if not days:
+        return 0
+    import datetime as _dt
+    streak = 0
+    d = service.tehran_now().date()
+    if service.tehran_day() not in days:      # today not claimed yet — count yesterday's chain
+        d -= _dt.timedelta(days=1)
+    while service.tehran_day(_dt.datetime(d.year, d.month, d.day)) in days:
+        streak += 1
+        d -= _dt.timedelta(days=1)
+    return streak
+
+
 async def show_profile(user: User) -> None:
     lang = user.language
     # v3 FIX: safe gender lookup (gender may be unset during registration)
@@ -850,6 +1005,10 @@ async def show_profile(user: User) -> None:
     async with session_scope() as s:
         u = await s.get(User, user.id)
         coins = u.coin_balance
+    # v2.4 light gamification: stats + level badge inside the profile card
+    stats = tr(lang, "profile_stats", chats=user.total_chats,
+               messages=user.total_messages,
+               level=tr(lang, level_key(user.total_chats)))
     rows = [
         [btn(tr(lang, "btn_edit_name"), "edit_name"),
          btn(tr(lang, "btn_edit_age"), "edit_age")],
@@ -864,7 +1023,7 @@ async def show_profile(user: User) -> None:
     # the birthdate is collected once during registration.
     await send(user, "profile_card", name=user.display_name, age=user.age,
                gender=gender, bio=user.bio or "—", coins=coins,
-               birthday=bday, keyboard=back_kb(lang, rows))
+               birthday=bday, stats=stats, keyboard=back_kb(lang, rows))
     if user.photo_file_id:
         adp = adapter(user.platform)
         if adp:
@@ -902,9 +1061,9 @@ async def begin_birthdate(user: User, calendar: str = "") -> None:
         ("jalali" if user.language == "fa" else "gregorian")
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "birth_year", "calendar": cal, "page": 0}
+        u.state = _st_with_after(u.state, {"step": "birth_year", "calendar": cal, "page": 0})
     # keep the in-memory object in sync: send_birth_year_page reads user.state
-    user.state = {"step": "birth_year", "calendar": cal, "page": 0}
+    user.state = _st_with_after(user.state, {"step": "birth_year", "calendar": cal, "page": 0})
     await send_birth_year_page(user, 0)
 
 
@@ -943,7 +1102,7 @@ async def birth_year_chosen(user: User, year: int) -> None:
         return
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "birth_month", "calendar": calendar, "year": year}
+        u.state = _st_with_after(u.state, {"step": "birth_month", "calendar": calendar, "year": year})
     months = _months_for(user.language, calendar)
     rows = [[btn(months[i].strip(), f"bmon_{i + 1}"), btn(months[i + 6].strip(), f"bmon_{i + 7}")]
             for i in range(6)]
@@ -957,8 +1116,8 @@ async def birth_month_chosen(user: User, month: int) -> None:
     maxday = 31 if calendar == "gregorian" else service.JALALI_MONTH_DAYS[month - 1]
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "birth_day", "calendar": calendar,
-                   "year": state.get("year"), "month": month, "maxday": maxday}
+        u.state = _st_with_after(u.state, {"step": "birth_day", "calendar": calendar,
+                   "year": state.get("year"), "month": month, "maxday": maxday})
     months = _months_for(user.language, calendar)
     rows = []
     for i in range(0, maxday, 6):
@@ -986,8 +1145,8 @@ async def birth_day_chosen(user: User, day: int) -> None:
     age = service.compute_age_from_birthday(gy, gm, gd)
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "birth_confirm", "calendar": calendar,
-                   "year": year, "month": month, "day": day}
+        u.state = _st_with_after(u.state, {"step": "birth_confirm", "calendar": calendar,
+                   "year": year, "month": month, "day": day})
     if age < 13:
         # item 4: minimum age is 13 — send the notice and restart the picker
         await send(user, "under_13")
@@ -1017,11 +1176,11 @@ async def birth_confirm_ok(user: User) -> None:
                                  idempotency_key=f"bday:{u.id}")
         else:
             reward = 0
-        u.state = {"step": "gender"}
+        u.state = _st_with_after(u.state, {"step": "gender"})
         user.birth_year, user.birth_month, user.birth_day = \
             u.birth_year, u.birth_month, u.birth_day
         user.birth_calendar, user.age = u.birth_calendar, u.age
-        user.state = {"step": "gender"}
+        user.state = _st_with_after(user.state, {"step": "gender"})
     await send(user, "birthday_saved", coins=reward or eco.get("birthdayReward", 10))
     await send(user, "ask_gender", keyboard=kb(
         [btn(tr(user.language, "girl"), "reg_female"),
@@ -1033,9 +1192,9 @@ async def birth_redo(user: User) -> None:
     async with session_scope() as s:
         u = await s.get(User, user.id)
         state = u.state or {}
-        u.state = {"step": "birth_year", "calendar": state.get("calendar", "jalali"), "page": 0}
-    user.state = {"step": "birth_year", "calendar": (user.state or {}).get("calendar", "jalali"),
-                  "page": 0}
+        u.state = _st_with_after(u.state, {"step": "birth_year", "calendar": state.get("calendar", "jalali"), "page": 0})
+    user.state = _st_with_after(user.state, {"step": "birth_year", "calendar": (user.state or {}).get("calendar", "jalali"),
+                  "page": 0})
     await send_birth_year_page(user, 0)
 
 
@@ -1044,8 +1203,8 @@ async def resend_birth_intro(user: User) -> None:
     calendar = (user.state or {}).get("calendar", "jalali")
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "birth_calendar", "calendar": calendar}
-    user.state = {"step": "birth_calendar", "calendar": calendar}
+        u.state = _st_with_after(u.state, {"step": "birth_calendar", "calendar": calendar})
+    user.state = _st_with_after(user.state, {"step": "birth_calendar", "calendar": calendar})
     await send(user, "birth_intro", keyboard=kb(
         [btn(tr(user.language, "birth_jalali"), "bcal_jalali"),
          btn(tr(user.language, "birth_gregorian"), "bcal_gregorian")],
@@ -1059,8 +1218,8 @@ async def resend_birth_year_page(user: User) -> None:
     page = int(state.get("page") or 0)
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "birth_year", "calendar": calendar, "page": page}
-    user.state = {"step": "birth_year", "calendar": calendar, "page": page}
+        u.state = _st_with_after(u.state, {"step": "birth_year", "calendar": calendar, "page": page})
+    user.state = _st_with_after(user.state, {"step": "birth_year", "calendar": calendar, "page": page})
     await send_birth_year_page(user, page)
 
 
@@ -1070,10 +1229,10 @@ async def resend_birth_month_page(user: User) -> None:
     calendar = state.get("calendar", "jalali")
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "birth_month", "calendar": calendar,
-                   "year": state.get("year"), "page": state.get("page", 0)}
-    user.state = {"step": "birth_month", "calendar": calendar,
-                  "year": state.get("year"), "page": state.get("page", 0)}
+        u.state = _st_with_after(u.state, {"step": "birth_month", "calendar": calendar,
+                   "year": state.get("year"), "page": state.get("page", 0)})
+    user.state = _st_with_after(user.state, {"step": "birth_month", "calendar": calendar,
+                  "year": state.get("year"), "page": state.get("page", 0)})
     months = _months_for(user.language, calendar)
     rows = [[btn(months[i].strip(), f"bmon_{i + 1}"), btn(months[i + 6].strip(), f"bmon_{i + 7}")]
             for i in range(6)]
@@ -1089,10 +1248,10 @@ async def resend_birth_day_page(user: User) -> None:
     maxday = int(state.get("maxday") or (31 if calendar == "gregorian" else 31))
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "birth_day", "calendar": calendar, "year": state.get("year"),
-                   "month": month, "maxday": maxday, "page": state.get("page", 0)}
-    user.state = {"step": "birth_day", "calendar": calendar, "year": state.get("year"),
-                  "month": month, "maxday": maxday, "page": state.get("page", 0)}
+        u.state = _st_with_after(u.state, {"step": "birth_day", "calendar": calendar, "year": state.get("year"),
+                   "month": month, "maxday": maxday, "page": state.get("page", 0)})
+    user.state = _st_with_after(user.state, {"step": "birth_day", "calendar": calendar, "year": state.get("year"),
+                  "month": month, "maxday": maxday, "page": state.get("page", 0)})
     months = _months_for(user.language, calendar)
     rows = []
     for i in range(0, maxday, 6):
@@ -1107,7 +1266,7 @@ async def start_edit_name(user: User) -> None:
     async with session_scope() as s:
         eco = await service.get_setting(s, "economy")
         u = await s.get(User, user.id)
-        u.state = {"step": "edit_name"}
+        u.state = _st_with_after(u.state, {"step": "edit_name"})
         cost = eco.get("nameChangeCost", NAME_AGE_CHANGE_COST)
     await send(user, "ask_new_name", cost=cost, keyboard=back_kb(user.language))
 
@@ -1116,7 +1275,7 @@ async def start_edit_age(user: User) -> None:
     async with session_scope() as s:
         eco = await service.get_setting(s, "economy")
         u = await s.get(User, user.id)
-        u.state = {"step": "edit_age"}
+        u.state = _st_with_after(u.state, {"step": "edit_age"})
         cost = eco.get("ageChangeCost", NAME_AGE_CHANGE_COST)
     await send(user, "ask_new_age", cost=cost, keyboard=back_kb(user.language))
 
@@ -1159,22 +1318,37 @@ async def apply_edit_age(user: User, age: int) -> None:
             await send(u, "no_coins", keyboard=back_kb(u.language))
             return
         u.age = age
-        if service.age_group(age) != service.age_group(old):
-            await s.execute(delete(QueueEntry).where(QueueEntry.user_id == u.id))
         u.state = None
+        # v2.4: no queue re-join needed — matching no longer separates age groups
     await send(user, "name_age_changed", cost=cost)
     await show_profile(user)
 
 
 async def show_referral(user: User) -> None:
-    """v2.2 (item 6): BOTH the Telegram and Bale invite links are shown, with
-    the note that joining via either one rewards both people."""
+    """v2.2 (item 6): BOTH invite links are shown. v2.4: bigger reward (50),
+    top-inviter leaderboard and a one-tap share button."""
+    lang = user.language
     async with session_scope() as s:
         eco = await service.get_setting(s, "economy")
+        top_rows = (await s.execute(
+            select(User).where(User.referral_count > 0, User.status == "active")
+            .order_by(User.referral_count.desc()).limit(5))).scalars()
+        top = list(top_rows)
     code = user.referral_code
-    await send(user, "referral_info", tg_link=tg_link(f"ref_{code}"),
-               bale_link=bale_link(f"ref_{code}"),
-               coins=eco["referralRewardPerParty"], keyboard=back_kb(user.language))
+    tg_l, bale_l = tg_link(f"ref_{code}"), bale_link(f"ref_{code}")
+    if top:
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        lines = [f"{medals[i]} {u.display_name} — {u.referral_count}"
+                 for i, u in enumerate(top)]
+        top_txt = tr(lang, "referral_top", list="\n".join(lines))
+    else:
+        top_txt = tr(lang, "referral_top_empty")
+    share_url = (f"https://t.me/share/url?url={tg_l}&text=" if user.platform == "telegram"
+                 else f"https://ble.ir/{RUNTIME.get('bale_username', 'kchatbot')}?start=ref_{code}")
+    kb_rows = [[{"text": tr(lang, "btn_share_ref"), "url": share_url}]]
+    kb_rows.append([btn(tr(lang, "btn_back"), "back_home")])
+    await send(user, "referral_info", tg_link=tg_l, bale_link=bale_l,
+               coins=eco["referralRewardPerParty"], top=top_txt, keyboard=kb(*kb_rows))
     await send(user, "referral_count", count=user.referral_count)
 
 
@@ -1225,7 +1399,7 @@ async def start_custom_coins(user: User) -> None:
     async with session_scope() as s:
         store_cfg = await service.get_setting(s, "store")
         u = await s.get(User, user.id)
-        u.state = {"step": "custom_coins"}
+        u.state = _st_with_after(u.state, {"step": "custom_coins"})
     await send(user, "store_custom_ask",
                min=store_cfg.get("customMinCoins", 10),
                max=store_cfg.get("customMaxCoins", 5000),
@@ -1406,6 +1580,10 @@ async def handle_message(platform: str, msg: dict) -> None:
         user.last_seen_at = utcnow()
         if from_u.get("username") and from_u["username"] != user.username:
             user.username = from_u["username"]
+        # v2.4: a blocked-bot user who messages again returns to the active population
+        if user.bot_blocked:
+            await growth.restore_from_blocklist(user.id)
+            user.bot_blocked = False
 
         # --- registration FSM ---
         state = user.state or {}
@@ -1464,7 +1642,7 @@ async def handle_message(platform: str, msg: dict) -> None:
                 return
             user.display_name = name
             # v2.2 (item 4): birthdate replaces the free-text age question
-            user.state = {"step": "birth_calendar"}
+            user.state = _st_with_after(user.state, {"step": "birth_calendar"})
             await send(user, "birth_intro", keyboard=kb(
                 [btn(tr(user.language, "birth_jalali"), "bcal_jalali"),
                  btn(tr(user.language, "birth_gregorian"), "bcal_gregorian")],
@@ -1570,6 +1748,17 @@ async def handle_message(platform: str, msg: dict) -> None:
                 return
             await s.commit()
             await deliver_direct_message(user, state.get("target"), text)
+            return
+        if step == "friend_msg":
+            # v2.4: anonymous DM to a saved friend — same moderation rules
+            ok, reason = await service.check_message(s, text)
+            if not ok:
+                await send(user, "msg_rejected_profanity" if reason == "profanity"
+                           else "msg_rejected_contact")
+                await service.apply_violation(s, user, reason, text[:60])
+                return
+            await s.commit()
+            await deliver_friend_message(user, state.get("target"), text)
             return
         if step == "appeal":
             from .db import Appeal, Ban
@@ -1753,10 +1942,19 @@ async def handle_callback(platform: str, query: dict) -> None:
         if user is None:
             return
         user.last_seen_at = utcnow()
+        # v2.4: blocked-bot user pressing any button returns to the active population
+        if user.bot_blocked:
+            await growth.restore_from_blocklist(user.id)
+            user.bot_blocked = False
         # v2.3.4: global registration gate — an unfinished signup may only press
         # registration-related buttons; everything else (search, wallet, chat
         # actions…) pushes the user back into the signup instead of executing.
         if needs_registration(user) and not _reg_callback(data):
+            await resume_registration(user)
+            return
+        if data == "resume_signup":
+            # rescue-reminder CTA: continue the unfinished signup
+            await s.commit()
             await resume_registration(user)
             return
         if data.startswith("lang_"):
@@ -1784,7 +1982,7 @@ async def handle_callback(platform: str, query: dict) -> None:
             return
         if data == "accept_rules":
             user.accepted_rules_at = utcnow()
-            user.state = {"step": "name"}
+            user.state = _st_with_after(user.state, {"step": "name"})
             await send(user, "ask_name")
             return
         if data in ("reg_female", "reg_male"):
@@ -1794,6 +1992,7 @@ async def handle_callback(platform: str, query: dict) -> None:
                 await resume_registration(user)
                 return
             user.gender = data[4:]
+            after = (user.state or {}).get("after_reg")
             user.state = None
             eco = await service.get_setting(s, "economy")
             if not user.registration_rewarded:
@@ -1802,6 +2001,17 @@ async def handle_callback(platform: str, query: dict) -> None:
                                      "جایزه ثبت‌نام",
                                      idempotency_key=f"reg:{user.platform}:{user.platform_user_id}")
             await send(user, "reg_done", coins=eco["initialReward"])
+            if after and isinstance(after, dict) and after.get("anon"):
+                # v2.4: user came through an anonymous link — finish their
+                # original mission immediately (message the link owner).
+                target = await s.get(User, int(after["anon"]))
+                if target and target.status == "active" and target.id != user.id:
+                    blocked = await s.execute(select(Block).where(
+                        Block.blocker_id == target.id, Block.blocked_id == user.id))
+                    if not blocked.scalar_one_or_none():
+                        user.state = _st_with_after(user.state, {"step": "anon_msg", "target": target.id})
+                        await send(user, "anon_msg_intro")
+                        return
             await main_menu(user)
             return
         # --- v2.2 birthdate registration callbacks (item 4) ---
@@ -1826,7 +2036,7 @@ async def handle_callback(platform: str, query: dict) -> None:
             await resend_birth_day_page(user)
             return
         if data == "back_name":       # calendar choice -> re-enter display name
-            user.state = {"step": "name"}
+            user.state = _st_with_after(user.state, {"step": "name"})
             await send(user, "ask_name")
             return
         if data.startswith("byear_"):
@@ -1837,8 +2047,8 @@ async def handle_callback(platform: str, query: dict) -> None:
             await s.commit()
             page = max(0, int(data[7:]))
             state = user.state or {}
-            user.state = {"step": "birth_year", "calendar": state.get("calendar", "jalali"),
-                          "page": page}
+            user.state = _st_with_after(user.state, {"step": "birth_year", "calendar": state.get("calendar", "jalali"),
+                          "page": page})
             s.add(user)
             await s.commit()
             await send_birth_year_page(user, page)
@@ -1877,7 +2087,7 @@ async def handle_callback(platform: str, query: dict) -> None:
             await show_anon_links(user)
             return
         if data == "direct_msg":
-            user.state = {"step": "direct_msg_target"}
+            user.state = _st_with_after(user.state, {"step": "direct_msg_target"})
             await send(user, "direct_msg_intro", keyboard=back_kb(user.language))
             return
         if data == "wallet":
@@ -1909,8 +2119,8 @@ async def handle_callback(platform: str, query: dict) -> None:
             return
         if data.startswith("anonr"):
             marker = data[len("anonr_"):]
-            user.state = {"step": "anon_reply",
-                          "thread": int(marker) if marker.isdigit() else None}
+            user.state = _st_with_after(user.state, {"step": "anon_reply",
+                          "thread": int(marker) if marker.isdigit() else None})
             await send(user, "anon_reply_prompt")
             return
         # --- v2.2 (item 2): chat report with reason selection ---
@@ -1982,7 +2192,17 @@ async def handle_callback(platform: str, query: dict) -> None:
         if data == "bonus":
             got = await service.grant_daily_bonus(s, user)
             if got:
-                await send(user, "bonus_ok", coins=got, keyboard=back_kb(user.language))
+                streak = await daily_streak(s, user.id)
+                txt = tr(user.language, "bonus_ok", coins=got)
+                if streak > 1:
+                    txt += "\n\n" + tr(user.language, "streak_line", days=streak)
+                adp = adapter(user.platform)
+                if adp:
+                    try:
+                        await adp.send_message(user.platform_user_id, txt,
+                                               keyboard=back_kb(user.language))
+                    except PlatformError as exc:
+                        log.warning("bonus send failed: %s", exc)
             else:
                 await send(user, "bonus_already", keyboard=back_kb(user.language))
             return
@@ -1991,7 +2211,7 @@ async def handle_callback(platform: str, query: dict) -> None:
             await show_referral(user)
             return
         if data == "language":
-            user.state = {"step": "language"}
+            user.state = _st_with_after(user.state, {"step": "language"})
             await send(user, "choose_lang", keyboard=kb(
                 [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
                  btn(LANG_NAMES["ru"], "lang_ru")], [btn(tr(user.language, "btn_back"), "back_home")]))
@@ -2005,11 +2225,11 @@ async def handle_callback(platform: str, query: dict) -> None:
             await admin_entry(user)
             return
         if data == "edit_bio":
-            user.state = {"step": "bio"}
+            user.state = _st_with_after(user.state, {"step": "bio"})
             await send(user, "ask_bio")
             return
         if data == "edit_photo":
-            user.state = {"step": "photo"}
+            user.state = _st_with_after(user.state, {"step": "photo"})
             await send(user, "ask_photo")
             return
         if data.startswith("buy_"):
@@ -2028,8 +2248,44 @@ async def handle_callback(platform: str, query: dict) -> None:
             await s.commit()
             await do_block(user)
             return
+        # --- v2.4: friends ---
+        if data == "chat_addfriend":
+            await s.commit()
+            await add_friend_flow(user)
+            return
+        if data == "friends_list":
+            await s.commit()
+            await show_friends(user)
+            return
+        if data.startswith("frpg_"):
+            await s.commit()
+            await show_friends(user, max(0, int(data[5:])))
+            return
+        if data.startswith("frdm_"):
+            await s.commit()
+            await friend_message_flow(user, int(data[5:]))
+            return
+        if data.startswith("frdel_"):
+            fid = int(data[6:])
+            f = (await s.execute(select(Friend).where(
+                Friend.user_id == user.id, Friend.friend_id == fid))).scalar_one_or_none()
+            if f:
+                await s.delete(f)
+            p = await s.get(User, fid)
+            name = p.display_name if p else "?"
+            await s.commit()
+            await send(user, "friend_removed", name=name)
+            await show_friends(user)
+            return
         # admin callbacks
-        from .bot_admin import admin_callback
+        from .bot_admin import admin_callback, admin_inline_action
+        # v2.4 BUGFIX: the ban/coin action buttons (admub_/admuc_) were never
+        # wired — clicking them silently re-rendered the admin menu. They are
+        # handled first; each action now also notifies the target user's PV.
+        if data.startswith(("admub_", "admuc_")):
+            await s.commit()
+            await admin_inline_action(user, data)
+            return
         await s.commit()
         await admin_callback(user, data, chat_id)
 

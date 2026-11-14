@@ -77,6 +77,10 @@ class User(Base):
     link_rewarded: Mapped[bool] = mapped_column(Boolean, default=False)
     # --- online invitations (v2) ---
     last_invite_at: Mapped[Optional[datetime]] = mapped_column(DateTime(), default=None)
+    # --- v2.4 growth: bot-blocked isolation list + signup-rescue cadence ---
+    bot_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    reminder_stage: Mapped[int] = mapped_column(Integer, default=0)
+    last_reminder_at: Mapped[Optional[datetime]] = mapped_column(DateTime(), default=None)
     __table_args__ = (UniqueConstraint("platform", "platform_user_id", name="uq_user_platform"),)
 
 
@@ -88,6 +92,8 @@ class QueueEntry(Base):
     gender: Mapped[str] = mapped_column(String(8))
     gender_filter: Mapped[str] = mapped_column(String(12), default="everyone")
     created_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow)
+    # v2.4 (first-match UX): set when the 60-second "still waiting" nudge fired
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(), default=None)
 
 
 class Chat(Base):
@@ -138,6 +144,17 @@ class RecentPair(Base):
     user_b_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     ended_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow)
     __table_args__ = (Index("ix_recent_pair", "user_a_id", "user_b_id", "ended_at"),)
+
+
+class Friend(Base):
+    """v2.4: one-sided friends list — user_id saved friend_id from a chat (or
+    an anonymous thread) and can send them an anonymous direct message later."""
+    __tablename__ = "friends"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    friend_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "friend_id", name="uq_friend_pair"),)
 
 
 class Report(Base):
@@ -544,3 +561,43 @@ async def create_all(engine) -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_chat_a ON chats (user_a_id) WHERE status='active'"))
             await conn.execute(text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_active_chat_b ON chats (user_b_id) WHERE status='active'"))
+
+
+# ---- v2.4 additive column migration ----------------------------------------
+# create_all only creates MISSING TABLES; columns added to existing tables are
+# handled here (idempotent, additive, safe on both Postgres and SQLite).
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "users": {
+        "bot_blocked": {"postgresql": "BOOLEAN NOT NULL DEFAULT FALSE",
+                        "sqlite": "INTEGER NOT NULL DEFAULT 0"},
+        "reminder_stage": {"postgresql": "INTEGER NOT NULL DEFAULT 0",
+                           "sqlite": "INTEGER NOT NULL DEFAULT 0"},
+        "last_reminder_at": {"postgresql": "TIMESTAMP", "sqlite": "DATETIME"},
+    },
+    "queue_entries": {
+        "notified_at": {"postgresql": "TIMESTAMP", "sqlite": "DATETIME"},
+    },
+}
+
+
+async def ensure_added_columns(engine) -> list[str]:
+    """Add columns introduced after the first deployment (v2.4). Idempotent."""
+    from sqlalchemy import text
+    added: list[str] = []
+    dialect = engine.dialect.name
+    async with engine.begin() as conn:
+        for table, cols in _ADDED_COLUMNS.items():
+            existing = await conn.run_sync(_sync_columns, table)
+            for col, ddl in cols.items():
+                if col in existing:
+                    continue
+                stmt = ddl.get(dialect) or ddl["sqlite"]
+                await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {stmt}"))
+                added.append(f"{table}.{col}")
+    return added
+
+
+def _sync_columns(sync_conn, table: str) -> set:
+    from sqlalchemy import inspect as _inspect
+    insp = _inspect(sync_conn)
+    return {c["name"] for c in insp.get_columns(table)}

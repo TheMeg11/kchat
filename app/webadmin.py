@@ -65,7 +65,7 @@ def app_user(u: User) -> dict:
         "totalMessages": u.total_messages, "reportsReceived": u.reports_received,
         "reportsSent": u.reports_sent, "referralCount": u.referral_count,
         "registeredAt": iso(u.registered_at), "lastSeenAt": iso(u.last_seen_at),
-        "banCount": u.ban_count}
+        "banCount": u.ban_count, "botBlocked": bool(u.bot_blocked)}
 
 
 def _ban_status(u: User) -> str:
@@ -192,8 +192,10 @@ async def _new_session(admin_id: int, request: Request) -> str:
 
 
 def _set_session_cookie(response: Response, sid: str):
+    # v2.4: 30-day trusted-device cookie — the admin's device/browser survives
+    # deploys (sessions live in Postgres; the CSRF token is now stateless too).
     response.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="lax",
-                        secure=bool(os.getenv("RAILWAY_ENVIRONMENT")), max_age=8 * 3600,
+                        secure=bool(os.getenv("RAILWAY_ENVIRONMENT")), max_age=30 * 24 * 3600,
                         path="/")
 
 
@@ -209,8 +211,8 @@ async def _authed_response(admin: WebAdmin, request: Request,
                             ip_address=_ip(request),
                             user_agent=request.headers.get("user-agent", "")[:250],
                             message="ورود موفق مدیر به پنل وب"))
-    csrf = secrets.token_urlsafe(24)
-    RUNTIME.setdefault("csrf", {})[sid] = csrf
+    # v2.4: stateless CSRF derived from the session id — valid across restarts
+    csrf = security.csrf_token(sid, settings.webhook_secret)
     body = {"status": "authenticated", "admin": admin_out(admin, perms)}
     if extra:
         body.update(extra)
@@ -224,8 +226,8 @@ def _check_csrf(request: Request, sess: WebSession):
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return
     token = request.headers.get(CSRF_HEADER)
-    expected = RUNTIME.get("csrf", {}).get(sess.id)
-    if not expected or token != expected:
+    expected = security.csrf_token(sess.id, settings.webhook_secret)
+    if not token or token != expected:
         raise ApiErr(403, "توکن CSRF نامعتبر است. صفحه را رفرش کنید.", "CSRF")
 
 
@@ -444,8 +446,28 @@ async def dashboard_metrics(request: Request, period: str = Query("24h", alias="
                 ViolationLog.rule == "contact"))).scalar()},
             {"category": "رسانه غیرمجاز", "count": 0},
             {"category": "گزارش کاربران", "count": (await s.execute(select(func.count(Report.id)))).scalar()}]
+        # v2.4: signup funnel — where do the 66% abandoned signups leak?
+        all_users = base
+        started = (await s.execute(all_users)).scalar()
+        rules_base = select(func.count(User.id)).where(User.accepted_rules_at.isnot(None),
+                                                       User.status != "deleted")
+        birth_base = select(func.count(User.id)).where(User.birth_year.isnot(None),
+                                                       User.status != "deleted")
+        comp_base = select(func.count(User.id)).where(User.registration_rewarded == True,  # noqa
+                                                      User.status != "deleted")
+        if platform != "all":
+            rules_base = rules_base.where(User.platform == platform)
+            birth_base = birth_base.where(User.platform == platform)
+            comp_base = comp_base.where(User.platform == platform)
+        accepted_rules = (await s.execute(rules_base)).scalar()
+        birthdate_set = (await s.execute(birth_base)).scalar()
+        completed = (await s.execute(comp_base)).scalar()
+        funnel = {"started": started, "acceptedRules": accepted_rules,
+                  "birthdateSet": birthdate_set, "completed": completed,
+                  "completedPct": round(completed * 100 / started, 1) if started else 0.0}
     return {"totalUsers": total, "dau": dau, "wau": wau, "mau": mau, "onlineUsers": online,
             "incompleteSignups": incomplete,
+            "signupFunnel": funnel,
             "searchingUsers": searching, "activeChats": active_chats, "chatsPerHour": chats_hr,
             "messagesPerHour": msgs_hr, "newRegistrations24h": new_reg, "telegramUsers": tg,
             "baleUsers": bal, "revenueToman30d": toman, "revenueStars30d": stars,
@@ -490,22 +512,43 @@ async def list_users(request: Request, platform: str = "", status: str = "", q: 
         # v2.3.3: the declared-but-never-wired status filter now works; the
         # special value "incomplete" selects users with age 0 (registration
         # never completed — see app_user ageGroup).
+        # v2.4: "blocked_bot" selects the isolated bot-blocked list.
         if status == "incomplete":
             query = query.where(User.age == 0)
+        elif status == "blocked_bot":
+            query = query.where(User.bot_blocked == True)  # noqa
         elif status:
             query = query.where(User.status == status)
         if q:
             query = query.where((User.public_id == q.upper()) | (User.display_name.ilike(f"%{q}%")) |
                                 (User.platform_user_id == q))
-        rows = (await s.execute(query)).scalars()
+        rows = list((await s.execute(query)).scalars())
+        # v2.4 PERF: the old loop ran TWO extra queries per user (active ban +
+        # queue entry) — up to 1000 round-trips for 500 users. Both are now
+        # fetched in one bulk query each and mapped in memory.
+        ids = [u.id for u in rows]
+        searching_ids: set[int] = set()
+        ban_map: dict[int, str] = {}
+        if ids:
+            q_ids = [u.id for u in rows]
+            q_rows = (await s.execute(select(QueueEntry.user_id).where(
+                QueueEntry.user_id.in_(q_ids)))).all()
+            searching_ids = {r[0] for r in q_rows}
+            bans = (await s.execute(select(Ban).where(
+                Ban.user_id.in_(q_ids), Ban.status == "active"))).scalars()
+            now = utcnow()
+            for b in bans:
+                if b.type == "permanent":
+                    ban_map[b.user_id] = "perm_banned"
+                elif b.expires_at and b.expires_at > now:
+                    ban_map[b.user_id] = "temp_banned"
         out = []
         for u in rows:
             au = app_user(u)
+            au["botBlocked"] = bool(u.bot_blocked)
             if u.status == "banned":
-                ban = await service.active_ban(s, u)
-                au["status"] = "perm_banned" if (ban and ban.type == "permanent") else "temp_banned"
-            au["searching"] = (await s.execute(select(QueueEntry).where(
-                QueueEntry.user_id == u.id))).scalar_one_or_none() is not None
+                au["status"] = ban_map.get(u.id, "temp_banned")
+            au["searching"] = u.id in searching_ids
             out.append(au)
         return out
 
@@ -563,7 +606,26 @@ async def adjust_coins(user_id: str, body: CoinsBody, request: Request):
                             else "user.coins_deducted", module="economy",
                             target_type="user", target_id=u.public_id, ip=_ip(request),
                             details=f"{body.amount:+d} — {body.reason}")
+        # v2.4: the result of the admin action also lands in the user's PV
+        await _notify_user_action(u, "admin_coins_grant" if body.amount >= 0
+                                  else "admin_coins_deduct",
+                                  amount=abs(body.amount), reason=body.reason,
+                                  balance=u.coin_balance)
         return {"user": app_user(u), "transaction": coin_txn(t, u)}
+
+
+async def _notify_user_action(u: User, key: str, **kw) -> None:
+    """v2.4: deliver an admin-action notice to the user's PV (best effort)."""
+    from . import bot as bot_mod, growth
+    from .i18n import tr
+    from .platform import PlatformError
+    adp = bot_mod.adapter(u.platform)
+    if not adp:
+        return
+    try:
+        await adp.send_message(u.platform_user_id, tr(u.language, key, **kw))
+    except PlatformError as exc:
+        await growth.mark_bot_blocked(u.id, u.platform, str(exc))
 
 
 class BanBody(BaseModel):
@@ -587,6 +649,8 @@ async def toggle_ban(user_id: str, body: BanBody, request: Request):
                                 admin_role=admin.role, action="user.unbanned", module="bans",
                                 target_type="user", target_id=u.public_id, ip=_ip(request),
                                 details=body.reason)
+            # v2.4: the user learns about it in their own PV
+            await _notify_user_action(u, "admin_unban_notice")
         else:
             type_ = body.type or "temporary"
             await service.ban_user(s, u, type_, "manual_admin", body.reason,
@@ -596,6 +660,8 @@ async def toggle_ban(user_id: str, body: BanBody, request: Request):
                                 action="user.perm_banned" if type_ == "permanent" else "user.temp_banned",
                                 module="bans", target_type="user", target_id=u.public_id,
                                 ip=_ip(request), details=body.reason)
+            # v2.4: the user learns about it in their own PV
+            await _notify_user_action(u, "admin_ban_notice", reason=body.reason)
         return app_user(u)
 
 
@@ -1290,7 +1356,9 @@ async def matching_get(request: Request):
                 "repeatMatchCooldownMin": cfg["repeatMatchCooldownMin"],
                 "genderFilterEnabled": cfg["genderFilterEnabled"],
                 "genderFilterCostCoins": eco["genderFilterMatchCost"],
-                "strictAgeGroupMinorLocked": True, "strictAgeGroupAdultLocked": True,
+                # v2.4: age-group separation removed by product decision —
+                # matching is open to all ages (chats are fully moderated).
+                "strictAgeGroupMinorLocked": False, "strictAgeGroupAdultLocked": False,
                 "crossPlatformAlwaysEnabled": True}
 
 

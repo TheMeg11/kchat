@@ -57,6 +57,9 @@ async def init_app() -> None:
     db.init_engine(settings.database_url)
     engine = db.get_engine()
     await db.create_all(engine)
+    added = await db.ensure_added_columns(engine)
+    if added:
+        log.info("v2.4 column migration applied: %s", ", ".join(added))
     async with session_scope() as s:
         await service.seed(s)
     # STABLE webhook path secret: derived from WEBHOOK_SECRET so redeploys never
@@ -209,8 +212,10 @@ async def ensure_webadmin() -> None:
 async def scheduler_loop() -> None:
     last_purge = 0.0
     last_daily = ""
+    tick = 0
     while True:
         try:
+            tick += 1
             now = utcnow().timestamp()
             if now - last_purge > 3600:
                 last_purge = now
@@ -224,6 +229,13 @@ async def scheduler_loop() -> None:
             await run_match_tick()
             await process_broadcasts()
             await maybe_daily_backup()
+            # v2.4 growth engine: queue-wait nudge every tick (cheap), signup
+            # rescue + reliability alerts once a minute (every 3rd tick).
+            from . import growth
+            await growth.notify_stale_queue_waiters()
+            if tick % 3 == 0:
+                await growth.rescue_incomplete_signups()
+                await growth.check_alerts()
             # daily jobs: dynamic ages + birthday greetings (Tehran day)
             today = service.tehran_day()
             if last_daily != today:
@@ -231,8 +243,13 @@ async def scheduler_loop() -> None:
                 await daily_maintenance_jobs()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             log.exception("scheduler tick failed")
+            try:
+                from . import growth
+                await growth.report_scheduler_crash(exc)
+            except Exception:
+                pass
         await asyncio.sleep(20)
 
 
@@ -360,6 +377,11 @@ async def _run_broadcast(bid: int, active: set) -> None:
                 delivered += 1
             except PE as exc:
                 failed += 1
+                # v2.4: users who blocked the bot are isolated automatically so
+                # future broadcasts skip them (excluded from broadcast_targets).
+                if exc.error_code in (400, 403):
+                    from . import growth
+                    await growth.mark_bot_blocked(u.id, u.platform, str(exc))
                 key = str(exc)[:60]
                 failures[key] = failures.get(key, 0) + 1
             await asyncio.sleep(1.0 / rate)
@@ -398,6 +420,13 @@ async def maybe_daily_backup() -> None:
     log.info("starting scheduled daily backup")
     rec = await backup_mod.run_backup_job(bot, "scheduled_daily")
     log.info("scheduled backup finished: %s", rec.id if rec else "skipped (locked)")
+    # v2.4: the owner gets a PV alert when the nightly backup failed
+    if rec is not None and rec.status == "failed":
+        from . import growth
+        await growth.report_backup_failure(rec.error_message or "نامشخص")
+    elif rec is not None and rec.delivery_status != "delivered":
+        from . import growth
+        await growth.report_backup_failure(f"ارسال پشتیبان {rec.id} ناموفق بود")
 
 
 async def polling_task(platform: str) -> None:
@@ -444,7 +473,9 @@ async def csrf_middleware(request: Request, call_next):
                                "/auth/logout"))):
         sid = request.cookies.get(SESSION_COOKIE)
         token = request.headers.get("X-CSRF-Token")
-        expected = RUNTIME.get("csrf", {}).get(sid or "")
+        # v2.4: stateless CSRF derived from the session id — admin sessions now
+        # survive deploys/restarts (the old in-memory map died on every boot).
+        expected = security.csrf_token(sid or "", settings.webhook_secret) if sid else ""
         if not sid or not expected or token != expected:
             return JSONResponse({"detail": "توکن CSRF نامعتبر است. دوباره وارد شوید.",
                                  "code": "CSRF"}, status_code=403)

@@ -125,10 +125,14 @@ S = {
     "bonus_already": {"fa": "😊✅ پاداش امروزت رو قبلاً دریافت کردی.\n⏰ پاداش فردا به وقت تهران فعال می‌شه 🕐\n💪 فعلاً می‌تونی با جستجوی هم‌چت یا دعوت دوستان سکه کسب کنی!",
                       "en": "😊✅ You already claimed today's bonus.\n⏰ Tomorrow's bonus unlocks at midnight (Tehran time) 🕐\n💪 Meanwhile, earn coins by chatting or inviting friends!",
                       "ru": "😊✅ Вы уже получили сегодняшний бонус.\n⏰ Завтрашний откроется в полночь по Тегерану 🕐"},
-    "referral_info": {"fa": "👥🔥 دعوت دوستان، سکه بی‌نهایت!\n\n🔵✨ لینک اختصاصی تلگرام:\n{tg_link}\n\n🟢✨ لینک اختصاصی بله:\n{bale_link}\n\n📋 نحوه کار:\n1️⃣ هر کدوم از لینک‌های بالا رو برای دوستات بفرست 📤\n2️⃣ دوستت با هر کدوم از این دو لینک (تلگرام یا بله) وارد ربات بشه و ثبت‌نامش رو کامل کنه ✅\n3️⃣ بعد از اولین گفتگوی موفقش، {coins} سکه جایزه به حساب هر دوتون اضافه می‌شه 🎉\n\n💡 ورود از هر کدوم از لینک‌ها (تلگرام یا بله) پاداش هر دو نفر رو فعال می‌کنه!",
-                      "en": "👥🔥 Invite friends, earn endless coins!\n\n🔵✨ Your Telegram link:\n{tg_link}\n\n🟢✨ Your Bale link:\n{bale_link}\n\n📋 How it works:\n1️⃣ Share either of the two links with your friends 📤\n2️⃣ Your friend joins via the Telegram OR the Bale link and completes registration ✅\n3️⃣ After their first successful chat, you BOTH get {coins} coins 🎉\n\n💡 Entering via either link (Telegram or Bale) activates the reward for both of you!",
-                      "ru": "👥🔥 Приглашайте друзей!\n\n🔵✨ Ссылка Telegram:\n{tg_link}\n\n🟢✨ Ссылка Bale:\n{bale_link}\n\n📋 Как это работает:\n1️⃣ Отправьте другу любую из двух ссылок 📤\n2️⃣ Друг регистрируется по ссылке Telegram или Bale ✅\n3️⃣ После его первого чата вы ОБА получите {coins} монет 🎉\n\n💡 Вход по любой из ссылок активирует награду для обоих!"},
-    "referral_count": {"fa": "🏆👥 تعداد دعوت‌های موفقت: {count} نفر", "en": "🏆👥 Successful referrals: {count}", "ru": "🏆👥 Успешных приглашений: {count}"},
+    # v2.4: stronger referral copy — bigger reward (50), social proof, share CTA
+    "referral_info": {"fa": "👥🔥 دعوت دوستان = سکه بی‌نهایت!\n\n💰 به ازای هر دوست که با لینک تو بیاد و ثبت‌نامش رو کامل کنه، بعد از اولین گفتگوش {coins} سکه به کیف «هر دوتون» اضافه می‌شه! 🎉\n\n🔵✨ لینک اختصاصی تلگرام:\n{tg_link}\n\n🟢✨ لینک اختصاصی بله:\n{bale_link}\n\n📋 نحوه کار:\n1️⃣ لینک‌هات رو برای دوستات بفرست یا بذار توی استوری 📤\n2️⃣ دوستت با هر کدوم از لینک‌ها وارد ربات بشه و ثبت‌نام کنه ✅\n3️⃣ بعد از اولین گفتگوی موفقش، {coins} سکه جایزه به حساب هر دوتون واریز می‌شه 🤑\n\n{top}\n\n🚀 هرچی بیشتر دعوت کنی، بیشتر می‌گیری — بی‌نهایت!",
+                      "en": "👥🔥 Invite friends = endless coins!\n\n💰 For every friend who joins via your link and completes signup, {coins} coins go to BOTH wallets after their first chat! 🎉\n\n🔵✨ Your Telegram link:\n{tg_link}\n\n🟢✨ Your Bale link:\n{bale_link}\n\n📋 How it works:\n1️⃣ Share your links with friends or post them in your story 📤\n2️⃣ Your friend joins via either link and registers ✅\n3️⃣ After their first successful chat, {coins} coins are credited to BOTH of you 🤑\n\n{top}\n\n🚀 The more you invite, the more you earn — endless!",
+                      "ru": "👥🔥 Приглашайте друзей = бесконечные монеты!\n\n💰 За каждого друга, пришедшего по вашей ссылке и завершившего регистрацию, после его первого чата {coins} монет получат ОБА! 🎉\n\n🔵✨ Ссылка Telegram:\n{tg_link}\n\n🟢✨ Ссылка Bale:\n{bale_link}\n\n📋 Как это работает:\n1️⃣ Отправьте друзьям ссылку или разместите в сторис 📤\n2️⃣ Друг регистрируется по любой из ссылок ✅\n3️⃣ После его первого чата вы ОБА получите {coins} монет 🤑\n\n{top}\n\n🚀 Чем больше приглашаешь — тем больше получаешь!"},
+    "referral_count": {"fa": "🏆👥 دعوت‌های موفق تو تا الان: {count} نفر", "en": "🏆👥 Your successful referrals so far: {count}", "ru": "🏆👥 Успешных приглашений: {count}"},
+    "referral_top": {"fa": "🏅 برترین دعوت‌کنندگان این ماه:\n{list}", "en": "🏅 Top inviters this month:\n{list}", "ru": "🏅 Лучшие приглашающие:\n{list}"},
+    "referral_top_empty": {"fa": "🏅 هنوز کسی لیست برترین‌ها رو پر نکرده — تو اولین باش!", "en": "🏅 Nobody is on the top list yet — be the first!", "ru": "🏅 Список пуст — станьте первым!"},
+    "btn_share_ref": {"fa": "📤 اشتراک‌گذاری لینک دعوت", "en": "📤 Share invite link", "ru": "📤 Поделиться ссылкой"},
     "store_title": {"fa": "🛒💎 خرید سکه\n\n✨ سکه‌ها برای فیلتر جنسیت، هدیه دادن به هم‌چت‌ها و... استفاده می‌شن.\n🎯 بسته مورد نظرت رو انتخاب کن 👇", "en": "🛒💎 Buy coins\n\n✨ Coins are used for gender filters, gifting partners and more.\n🎯 Choose a package 👇", "ru": "🛒💎 Купить монеты\n\n�️ Монеты нужны для фильтров и подарков.\n🎯 Выберите пакет 👇"},
     "wallet_title": {"fa": "👛💰 کیف پول هم‌چت\n\n🪙 موجودی: {coins} سکه\n\n✨ با سکه‌ها می‌تونی:\n🎯 در جستجو فیلتر جنسیت فعال کنی\n🎁 به هم‌چتت هدیه بدی", "en": "👛💰 HamChat wallet\n\n🪙 Balance: {coins} coins\n\n✨ With coins you can:\n🎯 Use gender filters\n🎁 Gift your partner", "ru": "👛💰 Кошелёк HamChat\n\n🪙 Баланс: {coins} монет\n\n✨ За монеты можно:\n🎯 Фильтры пола\n🎁 Подарки"},
     "pay_stars": {"fa": "⭐ {stars} ستاره = {coins} سکه", "en": "⭐ {stars} Stars = {coins} coins", "ru": "⭐ {stars} звёзд = {coins} монет"},
@@ -150,9 +154,9 @@ S = {
     "pay_support_btn": {"fa": "📩 ساخت تیکت پشتیبانی پرداخت", "en": "📩 Create payment support ticket", "ru": "📩 Создать тикет"},
 
     # --------------------------------------------------------- profile ----
-    "profile_card": {"fa": "👤✨ پروفایل تو\n\n📛 نام: {name}\n🎂 سن: {age}\n🚻 جنسیت: {gender}\n📝 بیوگرافی: {bio}\n🪙 موجودی: {coins} سکه\n{birthday}",
-                     "en": "👤✨ Your profile\n\n📛 Name: {name}\n🎂 Age: {age}\n🚻 Gender: {gender}\n📝 Bio: {bio}\n🪙 Balance: {coins} coins\n{birthday}",
-                     "ru": "👤✨ Ваш профиль\n\n📛 Имя: {name}\n🎂 Возраст: {age}\n🚻 Пол: {gender}\n📝 Био: {bio}\n🪙 Баланс: {coins} монет\n{birthday}"},
+    "profile_card": {"fa": "👤✨ پروفایل تو\n\n📛 نام: {name}\n🎂 سن: {age}\n🚻 جنسیت: {gender}\n📝 بیوگرافی: {bio}\n🪙 موجودی: {coins} سکه\n{birthday}\n{stats}",
+                     "en": "👤✨ Your profile\n\n📛 Name: {name}\n🎂 Age: {age}\n🚻 Gender: {gender}\n📝 Bio: {bio}\n🪙 Balance: {coins} coins\n{birthday}\n{stats}",
+                     "ru": "👤✨ Ваш профиль\n\n📛 Имя: {name}\n🎂 Возраст: {age}\n🚻 Пол: {gender}\n📝 Био: {bio}\n🪙 Баланс: {coins} монет\n{birthday}\n{stats}"},
     "birthday_set": {"fa": "🎂✅ تولد: {date}", "en": "🎂✅ Birthday: {date}", "ru": "🎂✅ День рождения: {date}"},
     "birthday_not_set": {"fa": "🎂❓ تولد: ثبت نشده", "en": "🎂❓ Birthday: not set", "ru": "🎂❓ День рождения: не указан"},
     "profile_menu_title": {"fa": "⚙️🔧 مدیریت پروفایل\n🎯 از دکمه‌های زیر انتخاب کن 👇", "en": "⚙️🔧 Profile management\n🎯 Choose an option 👇", "ru": "⚙️🔧 Управление профилем 👇"},
@@ -194,12 +198,18 @@ S = {
     "birthday_greet": {"fa": "🎂🎉🎊 {name} عزیز، تولدت مبارک!\n🌟 آرزومندیم سالی پر از شادی و سکه داشته باشی! 🎁", "en": "🎂🎉🎊 Happy birthday, {name}!\n🌟 Wishing you a year full of joy and coins! 🎁", "ru": "🎂🎉🎊 С днём рождения, {name}!\n🌟 Желаем года радости и монет! 🎁"},
 
     # ----------------------------------------------------- anon link (4) ----
-    "anon_link_info": {"fa": "🔗🎭 لینک‌های ناشناس تو آماده‌ست!\n\n🔵 تلگرام:\n{tg_link}\n\n🟢 بله:\n{bale_link}\n\n✨ این لینک‌ها چطور کار می‌کنن؟\n📤 لینک‌ها رو در استوری، بیوگرافی یا گروه‌ها به اشتراک بذار. هر کسی با این لینک‌ها وارد ربات بشه، می‌تونه برات پیام ناشناس بفرسته 💌\n\n🎭 تو هیچ‌وقت نمی‌فهمی پیام از کی اومده، اما فرستنده می‌دونه پیامش به تو رسیده — همین رمز و رازشه! 🤫\n\n💡 هر وقت بخوای می‌تونی از منوی اصلی، لینک‌ها رو دوباره بگیری 🔄",
-                       "en": "🔗🎭 Your anonymous links are ready!\n\n🔵 Telegram:\n{tg_link}\n\n🟢 Bale:\n{bale_link}\n\n✨ How do they work?\n📤 Share these links in your story, bio or groups. Anyone who opens the bot with them can send you an anonymous message 💌\n\n🎭 You'll never know who sent it, but the sender knows it reached you — that's the mystery! 🤫\n\n💡 You can retrieve the links from the main menu anytime 🔄",
-                       "ru": "🔗🎭 Ваши анонимные ссылки готовы!\n\n🔵 Telegram:\n{tg_link}\n\n🟢 Bale:\n{bale_link}\n\n✨ Как это работает?\n📤 Поделитесь ссылками в сторис, био или группах. Любой, кто откроет бота по ним, сможет отправить вам анонимное сообщение 💌\n\n🎭 Вы никогда не узнаете отправителя, но он знает, что сообщение дошло — в этом интрига! 🤫\n\n💡 Ссылки можно получить в главном меню в любой момент 🔄"},
-    "anon_msg_intro": {"fa": "💌🎭 تو از طریق لینک ناشناس وارد شدی.\n\n✍️ پیامت رو بنویس تا کاملاً ناشناس برای صاحب این لینک ارسال بشه 🚀\n🕶 صاحب لینک هیچ‌وقت متوجه هویتت نمی‌شه!",
-                       "en": "💌🎭 You entered via an anonymous link.\n\n✍️ Write your message and it will be delivered completely anonymously to the link owner 🚀\n🕶 The owner will never know your identity!",
-                       "ru": "💌🎭 Вы вошли по анонимной ссылке.\n\n✍️ Напишите сообщение — оно будет доставлено владельцу ссылки полностью анонимно 🚀\n🕶 Владелец никогда не узнает, кто вы!"},
+    # v2.4: stronger, story-driven copy — the anon link is the viral engine.
+    "anon_link_info": {"fa": "🔗🎭 لینک‌های ناشناس تو آماده‌ست!\n\n🔵 تلگرام:\n{tg_link}\n\n🟢 بله:\n{bale_link}\n\n✨ چطور بیشترِ بیشتر پیام بگیری؟\n📤 این لینک‌ها رو در بیوگرافی اینستاگرامت بذار، بفرست توی استوری، یا توی گروه‌ها به اشتراک بذار. هر کسی که لینک رو باز کنه می‌تونه یه پیام ناشناس برات بنویسه 💌\n\n🔥 چرا جذابه؟ چون فرستنده می‌تونه هر چیزی رو بگه بدون اینکه اسمش فاش بشه — اعتراف، احساس، سؤال یا پیام قشنگی که شاید حضوری نگی!\n🎭 تو هیچ‌وقت نمی‌فهمی از کی اومده؛ فقط صندوق اسرارت پر می‌شه 🤫\n\n💡 هر وقت بخوای از منوی اصلی می‌تونی لینک‌ها رو دوباره بگیری 🔄",
+                       "en": "🔗🎭 Your anonymous links are ready!\n\n🔵 Telegram:\n{tg_link}\n\n🟢 Bale:\n{bale_link}\n\n✨ How to get MORE messages:\n📤 Put these links in your Instagram bio, post them in your story, or share them in groups. Anyone who opens the link can write you an anonymous message 💌\n\n🔥 Why is it exciting? The sender can say ANYTHING without revealing who they are — a confession, a feeling, a question, or a compliment they'd never say in person!\n🎭 You'll never know who sent it — your mystery inbox just keeps filling up 🤫\n\n💡 You can retrieve the links from the main menu anytime 🔄",
+                       "ru": "🔗🎭 Ваши анонимные ссылки готовы!\n\n🔵 Telegram:\n{tg_link}\n\n🟢 Bale:\n{bale_link}\n\n✨ Как получать БОЛЬШЕ сообщений:\n📤 Разместите ссылки в био Instagram, в сторис или в группах. Любой, кто откроет ссылку, сможет написать вам анонимно 💌\n\n🔥 Почему это интересно? Отправитель может сказать ЧТО УГОДНО, не раскрывая себя — признание, чувства, вопрос или комплимент!\n🎭 Вы никогда не узнаете отправителя — почта тайн наполняется 🤫\n\n💡 Ссылки можно получить в главном меню в любой момент 🔄"},
+    # v2.4: warm gate message for visitors who arrive via an anon link but must
+    # register first (v2.3.4 gate) — turns the gate into a conversion pitch.
+    "anon_gate_teaser": {"fa": "💌🎭 اومدی اینجا برای فرستادن یه پیام ناشناس به صاحب این لینک!\n\n✍️ فقط یک ثبت‌نام کوتاه (کمتر از ۳۰ ثانیه) مونده؛ بعدش خودکار می‌تونی پیامت رو بفرستی 🚀\n🎁 همین الان ثبت‌نامت رو کامل کن و سکه خوش‌آمدگویی هم بگیر!",
+                         "en": "💌🎭 You're here to send an anonymous message to the owner of this link!\n\n✍️ Just one short signup (under 30 seconds) — then you can send your message right away 🚀\n🎁 Complete your signup now and grab the welcome coins too!",
+                         "ru": "💌🎭 Вы здесь, чтобы отправить анонимное сообщение владельцу ссылки!\n\n✍️ Осталась короткая регистрация (меньше 30 секунд) — после неё сразу отправите сообщение 🚀\n🎁 Завершите регистрацию и получите приветственные монеты!"},
+    "anon_msg_intro": {"fa": "💌🎭 تو از طریق لینک ناشناس وارد شدی.\n\n✍️ پیامت رو بنویس تا کاملاً ناشناس برای صاحب این لینک ارسال بشه 🚀\n🕶 صاحب لینک هیچ‌وقت متوجه هویتت نمی‌شه!\n💡 می‌تونی هرچی دلت می‌خواد بگی — اعتراف، سؤال، تیکه یا یه پیام قشنگ 😍",
+                       "en": "💌🎭 You entered via an anonymous link.\n\n✍️ Write your message and it will be delivered completely anonymously to the link owner 🚀\n🕶 The owner will never know your identity!\n💡 Say anything — a confession, a question, a joke or something kind 😍",
+                       "ru": "💌🎭 Вы вошли по анонимной ссылке.\n\n✍️ Напишите сообщение — оно будет доставлено владельцу ссылки полностью анонимно 🚀\n🕶 Владелец никогда не узнает, кто вы!\n💡 Пишите что угодно — признание, вопрос, шутку или что-то доброе 😍"},
     "anon_msg_sent": {"fa": "✅🚀 پیام ناشناسات با موفقیت ارسال شد!\n🎭 صاحب لینک دریافتش کرد، اما هیچ‌وقت نمی‌فهمه از کی اومده 🤫",
                       "en": "✅🚀 Your anonymous message was delivered!\n🎭 The owner received it, but will never know who sent it 🤫",
                       "ru": "✅🚀 Ваше сообщение доставлено!\n🎭 Владелец получил его, но не узнает отправителя 🤫"},
@@ -310,9 +320,90 @@ S = {
                            "ru": "⬇️💬 Кнопки управления чатом (всегда доступны):"},
 
     # ------------------------------------------------------------ help ----
-    "help_body": {"fa": "❓📖 راهنمای کامل ربات چت ناشناس هم‌چت\n\n🎯 چطور کار می‌کنه؟\nروی «جستجوی هم‌چت» بزن تا رباتت رو با یک کاربر تصادفی — از تلگرام یا بله — کاملاً ناشناس وصل کنه 🎭\n🛡 هویتت محفوظ می‌مونه؛ فقط نام، سن، جنسیت و بیوگرافی‌ای که خودت وارد کردی نمایش داده می‌شه ✨\n\n🪙 سکه‌ها به چه دردی می‌خورن؟\n• 💬 ارسال هر پیام ۱ سکه هزینه داره (دستورات و دکمه‌ها رایگان‌ان)\n• 🎯 فیلتر جنسیت در جستجو ۵ سکه (فقط در صورت اتصال موفق)\n• 🪙 سکه رایگان: پاداش روزانه و دعوت دوستان! 🔥\n\n💌 امکانات ویژه:\n• 🔗 لینک ناشناس: لینک‌هات رو به اشتراک بذار تا دیگران برات پیام ناشناس بفرستن (/link)\n• 🎯 پیام ناشناس به کاربر: با یوزرنیم یا آیدی برای هر عضوی پیام بفرست (/msg)\n• 🎁 هدیه: در حین گفتگو به هم‌چتت سکه هدیه بده (/gift)!\n• 🔗 اتصال حساب: حساب تلگرام و بله‌ت رو متصل کن و ۵۰ سکه بگیر 💎\n\n📋 دستورات سریع:\n🔍 /search — جستجوی هم‌چت\n⏭ /next — کاربر بعدی\n🛑 /stop — توقف جستجو یا گفتگو\n👤 /profile — پروفایل و تنظیمات\n🪙 /coins — موجودی سکه\n👛 /wallet — کیف پول و خرید سکه\n🎁 /bonus — پاداش روزانه\n👥 /referral — دعوت دوستان\n🔗 /link — لینک ناشناس\n💌 /msg — پیام ناشناس به کاربر\n🎁 /gift — هدیه به هم‌چت\n🌐 /language — تغییر زبان\n📜 /rules — قوانین\n💳 /paysupport — پشتیبانی پرداخت\n🚩 /report — گزارش تخلف\n⛔ /block — مسدودسازی\n✍️ /appeal — اعتراض به مسدودی دائمی\n🛡 /admin — پنل مدیریت (مدیران)\n\n💡✨ همه این کارها با دکمه‌های شیشه‌ای داخل منوها هم قابل انجام‌ان. شروع کن! 🚀",
-                  "en": "❓📖 Complete guide to HamChat — Anonymous Chat\n\n🎯 How does it work?\nTap \"Find partner\" and the bot connects you with a random user — from Telegram or Bale — completely anonymously 🎭\n🛡 Only the name, age, gender and bio you provided are shown ✨\n\n🪙 What are coins for?\n• 💬 Each message costs 1 coin (commands and buttons are free)\n• 🎯 Gender filter costs 5 coins (only on successful match)\n• 🎁 Free coins: daily bonus and inviting friends! 🔥\n\n💌 Special features:\n• 🔗 Anonymous link: share your links to receive anonymous messages (/link)\n• 🎯 Direct anonymous message: message any member by @username or ID (/msg)\n• 🎁 Gifts: send coins to your partner during a chat (/gift)!\n• 🔗 Account linking: connect Telegram & Bale and get 50 coins 💎\n\n📋 Commands:\n🔍 /search ⏭ /next 🛑 /stop 👤 /profile 🪙 /coins 🛒 /store 🎁 /bonus 👥 /referral 🔗 /link 💌 /msg 🎁 /gift 🌐 /language 📜 /rules 💳 /paysupport 🚩 /report ⛔ /block ✍️ /appeal 🛡 /admin\n\n💡✨ Everything is also doable via the inline buttons. Enjoy! 🚀",
-                  "ru": "❓📖 Полное руководство\n\n🎯 Нажмите «Поиск» — бот соединит вас со случайным пользователем из Telegram или Bale анонимно 🎭\n🛡 Видны только имя, возраст, пол и био ✨\n\n🪙 Монеты:\n• 💬 Сообщение — 1 монета (команды бесплатны)\n• 🎯 Фильтр пола — 5 монет (при успехе)\n• 🎁 Бесплатные: бонус и приглашения! 🔥\n\n💌 Возможности:\n🔗 Анонимная ссылка (/link), 🎯 прямое сообщение (/msg), 🎁 подарки (/gift), 🔗 связка аккаунтов — 50 монет 💎\n\n📋 Команды: 🔍 /search ⏭ /next 🛑 /stop 👤 /profile 🪙 /coins 🛒 /store 🎁 /bonus 👥 /referral 🔗 /link 💌 /msg 🎁 /gift 🌐 /language 📜 /rules 💳 /paysupport 🚩 /report ⛔ /block ✍️ /appeal 🛡 /admin\n\n💡✨ Всё доступно через кнопки. Приятного общения! 🚀"},
+    "help_body": {"fa": "❓📖 راهنمای کامل ربات چت ناشناس هم‌چت\n\n🎯 چطور کار می‌کنه؟\nروی «جستجوی هم‌چت» بزن تا رباتت رو با یک کاربر تصادفی — از تلگرام یا بله — کاملاً ناشناس وصل کنه 🎭\n🛡 هویتت محفوظ می‌مونه؛ فقط نام، سن، جنسیت و بیوگرافی‌ای که خودت وارد کردی نمایش داده می‌شه ✨\n\n🪙 سکه‌ها به چه دردی می‌خورن؟\n• 💬 ارسال هر پیام ۱ سکه هزینه داره (دستورات و دکمه‌ها رایگان‌ان)\n• 🎯 فیلتر جنسیت در جستجو ۵ سکه (فقط در صورت اتصال موفق)\n• 🪙 سکه رایگان: پاداش روزانه و دعوت دوستان! 🔥\n\n💌 امکانات ویژه:\n• 🔗 لینک ناشناس: لینک‌هات رو به اشتراک بذار تا دیگران برات پیام ناشناس بفرستن (/link)\n• 🎯 پیام ناشناس به کاربر: با یوزرنیم یا آیدی برای هر عضوی پیام بفرست (/msg)\n• 👥 لیست دوستان: هم‌چت‌های خوبت رو به لیست دوستانت اضافه کن و هر وقت خواستی بهشون پیام ناشناس بده\n• 🎁 هدیه: در حین گفتگو به هم‌چتت سکه هدیه بده (/gift)!\n\n📋 دستورات سریع:\n🔍 /search — جستجوی هم‌چت\n⏭ /next — کاربر بعدی\n🛑 /stop — توقف جستجو یا گفتگو\n👤 /profile — پروفایل و تنظیمات\n🪙 /coins — موجودی سکه\n👛 /wallet — کیف پول و خرید سکه\n🎁 /bonus — پاداش روزانه\n👥 /referral — دعوت دوستان\n🔗 /link — لینک ناشناس\n💌 /msg — پیام ناشناس به کاربر\n🎁 /gift — هدیه به هم‌چت\n🌐 /language — تغییر زبان\n📜 /rules — قوانین\n💳 /paysupport — پشتیبانی پرداخت\n🚩 /report — گزارش تخلف\n⛔ /block — مسدودسازی\n✍️ /appeal — اعتراض به مسدودی دائمی\n🛡 /admin — پنل مدیریت (مدیران)\n\n💡✨ همه این کارها با دکمه‌های شیشه‌ای داخل منوها هم قابل انجام‌ان. شروع کن! 🚀",
+                  "en": "❓📖 Complete guide to HamChat — Anonymous Chat\n\n🎯 How does it work?\nTap \"Find partner\" and the bot connects you with a random user — from Telegram or Bale — completely anonymously 🎭\n🛡 Only the name, age, gender and bio you provided are shown ✨\n\n🪙 What are coins for?\n• 💬 Each message costs 1 coin (commands and buttons are free)\n• 🎯 Gender filter costs 5 coins (only on successful match)\n• 🎁 Free coins: daily bonus and inviting friends! 🔥\n\n💌 Special features:\n• 🔗 Anonymous link: share your links to receive anonymous messages (/link)\n• 🎯 Direct anonymous message: message any member by @username or ID (/msg)\n• 👥 Friends list: save great partners and message them anonymously anytime\n• 🎁 Gifts: send coins to your partner during a chat (/gift)!\n\n📋 Commands:\n🔍 /search ⏭ /next 🛑 /stop 👤 /profile 🪙 /coins 🛒 /store 🎁 /bonus 👥 /referral 🔗 /link 💌 /msg 🎁 /gift 🌐 /language 📜 /rules 💳 /paysupport 🚩 /report ⛔ /block ✍️ /appeal 🛡 /admin\n\n💡✨ Everything is also doable via the inline buttons. Enjoy! 🚀",
+                  "ru": "❓📖 Полное руководство\n\n🎯 Нажмите «Поиск» — бот соединит вас со случайным пользователем из Telegram или Bale анонимно 🎭\n🛡 Видны только имя, возраст, пол и био ✨\n\n🪙 Монеты:\n• 💬 Сообщение — 1 монета (команды бесплатны)\n• 🎯 Фильтр пола — 5 монет (при успехе)\n• 🎁 Бесплатные: бонус и приглашения! 🔥\n\n💌 Возможности:\n🔗 Анонимная ссылка (/link), 🎯 прямое сообщение (/msg), 👥 список друзей, 🎁 подарки (/gift)\n\n📋 Команды: 🔍 /search ⏭ /next 🛑 /stop 👤 /profile 🪙 /coins 🛒 /store 🎁 /bonus 👥 /referral 🔗 /link 💌 /msg 🎁 /gift 🌐 /language 📜 /rules 💳 /paysupport 🚩 /report ⛔ /block ✍️ /appeal 🛡 /admin\n\n💡✨ Всё доступно через кнопки. Приятного общения! 🚀"},
+
+    # ============================== v2.4 ==============================
+    # --- return-to-registration explanation (item 9) ---
+    "reg_resume_hint": {"fa": "👋🧩 ثبت‌نامت نیمه‌کاره مونده بود!\n\n🔒 تا وقتی ثبت‌نام تموم نشه، امکانات ربات (جستجوی هم‌چت، کیف پول و...) غیرفعاله.\n✨ بیا از همون جا که مونده بودی ادامه بدیم — کمتر از یه دقیقه زمان می‌بره 👇",
+                        "en": "👋🧩 Your signup was left unfinished!\n\n🔒 Bot features (searching, wallet, ...) stay locked until registration completes.\n✨ Let's continue where you left off — takes less than a minute 👇",
+                        "ru": "👋🧩 Регистрация была не завершена!\n\n🔒 Функции бота (поиск, кошелёк и т.д.) закрыты до окончания регистрации.\n✨ Продолжим с того же места — меньше минуты 👇"},
+
+    # --- D2: first-match waiting nudge (sent after 60s in queue; user stays queued) ---
+    "search_still_waiting": {"fa": "🔍⏳ هنوز داری تو صف جستجویی!\n\n🌍 الان تعداد کاربران آنلاین کمه و ممکنه چند دقیقه‌ای طول بکشه — نگران نباش، به‌محض اتصال یک کاربر جدید، هم‌چتت خودکار وصل می‌شه ⚡\n\n💡 دو تا راه برای وصل شدن سریع‌تر:\n👥 ربات رو به دوستات معرفی کن (هم سریع‌تر وصل می‌شی، هم {coins} سکه جایزه دعوت می‌گیری!)\n⏳ یا چند دقیقه دیگه صبر کن تا کاربران آنلاین بیشتر بشن",
+                             "en": "🔍⏳ You're still in the search queue!\n\n🌍 Fewer users are online right now, so it may take a few minutes — the moment a new user joins the queue, you'll be connected automatically ⚡\n\n💡 Two ways to connect faster:\n👥 Invite your friends (you'll connect sooner AND earn {coins} referral coins!)\n⏳ Or wait a few minutes for more users to come online",
+                             "ru": "🔍⏳ Вы всё ещё в очереди поиска!\n\n🌍 Сейчас меньше пользователей онлайн — как только кто-то придёт, вы соединитесь автоматически ⚡\n\n💡 Как ускорить:\n👥 Приглашайте друзей (и быстрее соединитесь, и получите {coins} монет!)\n⏳ Или подождите пару минут"},
+
+    # --- D1: signup rescue reminders (stage 1..3, rate-limited, isolated blocked users) ---
+    "rescue_reminder_1": {"fa": "👋🤗 سلام! دیدیم ثبت‌نامت نیمه‌کاره مونده.\n\n🎭 همه‌چی از همون قدمی که موندی آماده‌ست: انتخاب نام و تاریخ تولد و تمام!\n🎁 با کامل کردن ثبت‌نام، سکه خوش‌آمدگویی منتظرته — و می‌تونی فوراً اولین هم‌چت ناشناست رو شروع کنی 🚀",
+                          "en": "👋🤗 Hi! We noticed your signup is unfinished.\n\n🎭 Everything is ready to continue from the step you left: just a name and a birth date!\n🎁 Complete your signup to claim the welcome coins and start your first anonymous chat 🚀",
+                          "ru": "👋🤗 Привет! Мы заметили, что регистрация не завершена.\n\n🎭 Всё готово для продолжения: имя и дата рождения — и готово!\n🎁 Завершите регистрацию, получите приветственные монеты и начните первый чат 🚀"},
+    "rescue_reminder_2": {"fa": "⏰🔔 فقط چند قدم تا ورود به هم‌چت مونده!\n\n💬 اگه ثبت‌نامت رو کامل کنی، همین الان می‌تونی با آدم‌های جدید چت کنی.\n🎁 سکه خوش‌آمدگویی + پاداش روزانه منتظرت هستن 😍",
+                          "en": "ⰰ🔔 Only a few steps left to join HamChat!\n\n💬 Complete your signup and start chatting with new people right away.\n🎁 Welcome coins + daily bonus are waiting for you 😍",
+                          "ru": "⏰🔔 Осталось несколько шагов до входа в HamChat!\n\n💬 Завершите регистрацию и начните общаться прямо сейчас.\n🎁 Монеты и бонус ждут вас 😍"},
+    "rescue_reminder_3": {"fa": "🌅 آخرین یادآوری!\n\nاگه می‌خوای هم‌چت ناشناس تجربه کنی، ثبت‌نامت فقط یه قدم فاصله داره. اگه نه، دیگر مزاحمت نمی‌شیم 🙏\nبهمون بگو: با پاسخ دادن به همین پیام (هر متنی) می‌تونی هر وقت خواستی دوباره شروع کنی.",
+                          "en": "🌅 Last reminder!\n\nIf you'd like to try anonymous chatting, your signup is one step away. Otherwise we won't bother you again 🙏\nYou can always restart by replying to this message with anything.",
+                          "ru": "🌅 Последнее напоминание!\n\nЕсли хотите попробовать анонимный чат — регистрация в одном шаге. Иначе больше не побеспокоим 🙏\nОтветьте на это сообщение, чтобы начать заново."},
+
+    # --- A: admin action PV notifications ---
+    "admin_coins_grant": {"fa": "🪙🎉 مدیریت {amount} سکه به کیف پولت اضافه کرد!\n\n📝 دلیل: {reason}\n💰 موجودی فعلی: {balance} سکه",
+                          "en": "🪙🎉 The administration added {amount} coins to your wallet!\n\n📝 Reason: {reason}\n💰 Current balance: {balance} coins",
+                          "ru": "🪙🎉 Администрация добавила {amount} монет!\n\n📝 Причина: {reason}\n💰 Баланс: {balance}"},
+    "admin_coins_deduct": {"fa": "🪙⚠️ مدیریت {amount} سکه از کیف پولت کم کرد.\n\n📝 دلیل: {reason}\n💰 موجودی فعلی: {balance} سکه",
+                           "en": "🪙⚠️ The administration deducted {amount} coins from your wallet.\n\n📝 Reason: {reason}\n💰 Current balance: {balance} coins",
+                           "ru": "🪙⚠️ Администрация списала {amount} монет.\n\n📝 Причина: {reason}\n💰 Баланс: {balance}"},
+    "admin_ban_notice": {"fa": "⛔ دسترسی حسابت توسط مدیریت به دلیل «{reason}» محدود شد.",
+                         "en": "⛔ Your account was restricted by the administration: \"{reason}\".",
+                         "ru": "⛔ Аккаунт ограничен администрацией: «{reason}»."},
+    "admin_unban_notice": {"fa": "✅😊 محدودیت حسابت با تصمیم مدیریت برداشته شد!\n🌟 خوش برگشتی — می‌تونی دوباره هم‌چت پیدا کنی.",
+                           "en": "✅😊 The restriction on your account was lifted by the administration!\n🌟 Welcome back — you can find chat partners again.",
+                           "ru": "✅😊 Ограничение снято администрацией!\n🌟 С возвращением!"},
+
+    # --- E: friends feature ---
+    "btn_friends": {"fa": "👥 لیست دوستان", "en": "👥 Friends list", "ru": "👥 Список друзей"},
+    "btn_add_friend": {"fa": "➕ افزودن به لیست دوستان", "en": "➕ Add to friends", "ru": "➕ В друзья"},
+    "friends_title": {"fa": "👥✨ لیست دوستان تو\n\n🔮 با هر دوست می‌تونی هر وقت خواستی پیام ناشناس بفرستی — حتی اگه هفته‌ها از گفتگوت گذشته باشه!\n\n👥 تعداد دوستان: {count}",
+                      "en": "👥✨ Your friends list\n\n🔮 You can send an anonymous message to any friend anytime — even weeks later!\n\n👥 Friends: {count}",
+                      "ru": "👥✨ Список друзей\n\n🔮 Любому другу можно отправить анонимное сообщение в любой момент!\n\n👥 Друзей: {count}"},
+    "friends_empty": {"fa": "📭 هنوز دوستی توی لیستت نیست!\n\n💡 در حین گفتگو، دکمه «➕ افزودن به لیست دوستان» رو بزن تا هم‌چت‌های خوبت ذخیره بشن.",
+                      "en": "📭 No friends in your list yet!\n\n💡 While chatting, tap \"➕ Add to friends\" to save good partners.",
+                      "ru": "📭 Пока никого нет!\n\n💡 Во время чата нажмите «➕ В друзья», чтобы сохранить собеседника."},
+    "friend_added": {"fa": "✅👥 «{name}» به لیست دوستانت اضافه شد!\n💌 از لیست دوستان می‌تونی هر وقت خواستی بهش پیام ناشناس بدی.",
+                     "en": "✅👥 \"{name}\" was added to your friends list!\n💌 Message them anonymously anytime from the friends list.",
+                     "ru": "✅👥 «{name}» добавлен в друзья!\n💌 Отправляйте анонимные сообщения в любой момент."},
+    "friend_exists": {"fa": "😊👤 این کاربر از قبل توی لیست دوستانته!", "en": "😊👤 This user is already in your friends list!", "ru": "😊👤 Этот пользователь уже в друзьях!"},
+    "friend_removed": {"fa": "🗑✅ «{name}» از لیست دوستانت حذف شد.", "en": "🗑✅ \"{name}\" was removed from your friends list.", "ru": "🗑✅ «{name}» удалён из друзей."},
+    "btn_friend_msg": {"fa": "💌 پیام ناشناس", "en": "💌 Anonymous msg", "ru": "💌 Сообщение"},
+    "btn_friend_del": {"fa": "🗑 حذف", "en": "🗑 Remove", "ru": "🗑 Удалить"},
+    "friend_msg_intro": {"fa": "💌 پیام ناشناس برای «{name}»\n\n✍️ متن پیامت رو بنویس تا کاملاً ناشناس بهش برسه 🕶",
+                         "en": "💌 Anonymous message to \"{name}\"\n\n✍️ Write your text — it will be delivered anonymously 🕶",
+                         "ru": "💌 Анонимное сообщение для «{name}»\n\n✍️ Напишите текст — он будет доставлен анонимно 🕶"},
+    "friend_gone": {"fa": "⚠️ این کاربر دیگه در ربات عضو نیست؛ از لیست دوستان حذفش کن.", "en": "⚠️ This user is no longer a member; remove them from your list.", "ru": "⚠️ Пользователя больше нет; удалите его из списка."},
+
+    # --- D6: light gamification ---
+    "profile_stats": {"fa": "📊 آمار: {chats} گفتگو | {messages} پیام | {level}",
+                      "en": "📊 Stats: {chats} chats | {messages} messages | {level}",
+                      "ru": "📊 Статистика: {chats} чатов | {messages} сообщений | {level}"},
+    "lvl_newbie": {"fa": "🌱 تازه‌وارد", "en": "🌱 Newcomer", "ru": "🌱 Новичок"},
+    "lvl_chatter": {"fa": "💬 چت‌بان", "en": "💬 Chatter", "ru": "💬 Собеседник"},
+    "lvl_pro": {"fa": "🔥 هم‌چت‌بان حرفه‌ای", "en": "🔥 Pro chatter", "ru": "🔥 Профи"},
+    "lvl_master": {"fa": "👑 استاد ناشناس", "en": "👑 Anonymous master", "ru": "👑 Мастер анонимности"},
+    "streak_line": {"fa": "🔥 استریک پاداش روزانه: {days} روز پیاپی!", "en": "🔥 Daily-bonus streak: {days} days in a row!", "ru": "🔥 Серия бонусов: {days} дней!"},
+
+    # --- C7: owner alerts (sent by the bot to the owner's PV) ---
+    "alert_poll_down": {"fa": "🚨 هشدار پایداری: دریافت آپدیت‌های {platform} بیش از {minutes} دقیقه است ناموفق بوده.\nآخرین خطا: {error}\nربات ممکنه پیام‌های کاربران را از دست بدهد — لاگ Railway را بررسی کن.",
+                        "en": "🚨 Stability alert: {platform} updates have failed for over {minutes} minutes.\nLast error: {error}\nThe bot may be losing user messages — check the Railway logs.",
+                        "ru": "🚨 Алерт: обновления {platform} не приходят {minutes} минут.\nОшибка: {error}"},
+    "alert_webhook": {"fa": "🚨 هشدار وب‌هوک {platform}: {detail}\nمانده در صف: {pending}",
+                      "en": "🚨 {platform} webhook alert: {detail}\nPending updates: {pending}",
+                      "ru": "🚨 Алерт вебхука {platform}: {detail}\nВ очереди: {pending}"},
+    "alert_scheduler": {"fa": "🚨 خطای زمان‌بند ربات: {error}",
+                        "en": "🚨 Bot scheduler error: {error}",
+                        "ru": "🚨 Ошибка планировщика: {error}"},
+    "alert_backup_fail": {"fa": "🚨 پشتیبان‌گیری شبانه کامل نشد: {detail}\n⚠️ داده‌ها بدون نسخه پشتیبان ماندند — از پنل، پشتیبان دستی بگیر.",
+                          "en": "🚨 Nightly backup failed: {detail}\n⚠️ Data left without a backup — take one manually from the panel.",
+                          "ru": "🚨 Ночной бэкап не удался: {detail}\n⚠️ Сделайте бэкап вручную."},
 }
 
 

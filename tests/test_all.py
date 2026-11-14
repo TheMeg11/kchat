@@ -24,7 +24,7 @@ from sqlalchemy import delete, select, text
 from app import db, security, service
 from app.config import RUNTIME, settings
 from app.db import (Ban, Block, Chat, ChatMessage, CoinTransaction, DailyClaim,
-                    MediaType, Payment, QueueEntry, Referral, Report, StorePackage,
+                    Friend, MediaType, Payment, QueueEntry, Referral, Report, StorePackage,
                     User, WebAdmin, WebSession, utcnow)
 from app.platform import BaleAdapter, TelegramAdapter, UnsupportedMethod
 
@@ -194,24 +194,23 @@ async def test_registration_validation(adapters):
 
 
 @pytest.mark.asyncio
-async def test_age_pool_separation(adapters):
-    """13-17 never matches 18-60 (locked invariant)."""
+async def test_age_group_separation_removed(adapters):
+    """v2.4: the 13-17 / 18-60 separation is REMOVED by product decision —
+    a minor and an adult CAN now match; FIFO order decides the pair."""
     await register_via_bot(adapters, "telegram", "601", "MinorA", 15, "male")
     await register_via_bot(adapters, "telegram", "602", "AdultB", 30, "male")
-    await register_via_bot(adapters, "telegram", "603", "MinorC", 14, "male")
     from app import bot as bot_mod
-    for pid in ("601", "602", "603"):
+    for pid in ("601", "602"):
         await bot_mod.process_update("telegram", {"update_id": 900 + int(pid), "callback_query": {
             "id": f"c{pid}", "from": {"id": int(pid)},
             "message": {"chat": {"id": int(pid)}}, "data": "gf_everyone"}})
     async with db.session_scope() as s:
-        chats = (await s.execute(select(Chat))).scalars()
-        chats = list(chats)
+        chats = list((await s.execute(select(Chat))).scalars())
         assert len(chats) == 1
         c = chats[0]
-        assert c.age_group == "13-17"
         ua, ub = await s.get(User, c.user_a_id), await s.get(User, c.user_b_id)
-        assert {ua.platform_user_id, ub.platform_user_id} == {"601", "603"}
+        # the first two queuers were paired regardless of age group
+        assert {ua.platform_user_id, ub.platform_user_id} == {"601", "602"}
 
 
 @pytest.mark.asyncio
@@ -508,13 +507,14 @@ async def test_referral_reward_after_first_chat(adapters):
             User.platform_user_id == "891"))).scalar_one()
         referred = (await s.execute(select(User).where(
             User.platform_user_id == "892"))).scalar_one()
-        assert inviter.coin_balance == 50  # 30 reg + 20 referral
-        assert referred.coin_balance == 30 + 20 - 1  # reg + referral reward - message cost
+        # v2.4: referral reward raised to 50 per party (was 20)
+        assert inviter.coin_balance == 80  # 30 reg + 50 referral
+        assert referred.coin_balance == 30 + 50 - 1  # reg + referral reward - message cost
         ref = (await s.execute(select(Referral))).scalar_one()
         assert ref.status == "rewarded"
         # second completion must not double-reward
         await service.on_first_chat_completed(s, referred)
-        assert inviter.coin_balance == 50
+        assert inviter.coin_balance == 80
 
 
 @pytest.mark.asyncio
@@ -1223,8 +1223,10 @@ async def test_web_matching_locked_invariants():
                             headers={"X-CSRF-Token": csrf})
         assert r.status_code == 200
         cfg = r.json()
-        assert cfg["strictAgeGroupMinorLocked"] is True
-        assert cfg["strictAgeGroupAdultLocked"] is True
+        # v2.4: age separation REMOVED by product decision (chats are fully
+        # moderated) — the flags now report False and matching allows all ages.
+        assert cfg["strictAgeGroupMinorLocked"] is False
+        assert cfg["strictAgeGroupAdultLocked"] is False
         assert cfg["crossPlatformAlwaysEnabled"] is True
         assert cfg["searchTimeoutSec"] == 240
         # retention cannot change from 30 days
@@ -1803,8 +1805,8 @@ async def test_send_throttle_and_429_cooldown():
 
 @pytest.mark.asyncio
 async def test_referral_shows_both_links(adapters):
-    """v2.2 (item 6): both the Telegram and Bale invite links are shown, with
-    the note that joining via either one rewards both people."""
+    """v2.2 (item 6): both the Telegram and Bale invite links are shown.
+    v2.4: stronger copy with the reward amount + top-inviter list + share button."""
     from app import bot as bot_mod
     tg, _ = adapters
     await register_via_bot(adapters, "telegram", "771", "Inviter2", 25, "male")
@@ -1813,7 +1815,14 @@ async def test_referral_shows_both_links(adapters):
         "id": "rf1", "from": {"id": 771}, "message": {"chat": {"id": 771}}, "data": "referral"}})
     joined = "".join(str(t[1]) for t in tg.sent)
     assert "t.me" in joined and "ble.ir" in joined
-    assert "پاداش هر دو نفر" in joined
+    # v2.4 copy: names the 50-coin reward for BOTH parties
+    assert "به حساب هر دوتون" in joined
+    assert "50" in joined
+    # v2.4: one-tap share URL button attached to the referral screen
+    kb = tg.sent[-2][2] if len(tg.sent) >= 2 else tg.sent[0][2]
+    has_url_btn = any(isinstance(b, dict) and "url" in b
+                      for row in (kb or []) for b in row)
+    assert has_url_btn
     async with db.session_scope() as s:
         u = (await s.execute(select(User).where(User.platform_user_id == "771"))).scalar_one()
         assert f"start=ref_{u.referral_code}" in joined
@@ -2310,3 +2319,282 @@ def test_bundle_no_username_leak():
     """Login page must not ship the admin username in defaults/placeholder."""
     bundle = (Path(__file__).resolve().parents[1] / "webadmin" / "index.html").read_text("utf-8")
     assert "hamchat.admin" not in bundle
+
+
+# ============================================================ v2.4 tests ====
+@pytest.mark.asyncio
+async def test_anon_gate_conversion(adapters):
+    """v2.4: a visitor arriving via an anon link gets the conversion teaser,
+    keeps the pending target across the whole signup, and lands straight in
+    the anon-message flow right after registration."""
+    from app import bot as bot_mod
+    await register_via_bot(adapters, "telegram", "970", "OwnerV", 25, "male")
+    tg0, _ = adapters
+    tg0.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 3099, "message": {
+        "message_id": 1, "chat": {"id": 970}, "from": {"id": 970}, "text": "/link"}})
+    async with db.session_scope() as s:
+        owner = (await s.execute(select(User).where(
+            User.platform_user_id == "970"))).scalar_one()
+        code = owner.anon_link_code
+    assert code
+    # unregistered visitor opens the link
+    await bot_mod.process_update("telegram", {"update_id": 3100, "message": {
+        "message_id": 1, "chat": {"id": 971}, "from": {"id": 971, "first_name": "Vis"},
+        "text": f"/start m{code}"}})
+    async with db.session_scope() as s:
+        vis = (await s.execute(select(User).where(
+            User.platform_user_id == "971"))).scalar_one()
+        assert vis.state["step"] == "language"
+        assert (vis.state.get("after_reg") or {}).get("anon") == owner.id
+    # the teaser was sent (before the welcome)
+    tg, _ = adapters
+    joined = "".join(str(t[1]) for t in tg.sent if t[0] == "971")
+    assert "پیام ناشناس" in joined
+    # full registration straight through the link entry
+    await bot_mod.process_update("telegram", {"update_id": 3101, "callback_query": {
+        "id": "v1", "from": {"id": 971}, "message": {"chat": {"id": 971}}, "data": "lang_fa"}})
+    await bot_mod.process_update("telegram", {"update_id": 3102, "callback_query": {
+        "id": "v2", "from": {"id": 971}, "message": {"chat": {"id": 971}}, "data": "accept_rules"}})
+    await bot_mod.process_update("telegram", {"update_id": 3103, "message": {
+        "message_id": 2, "chat": {"id": 971}, "from": {"id": 971}, "text": "Visitor V"}})
+    import datetime as _dt
+    _today = _dt.date.today()
+    for i, data in enumerate(("bcal_gregorian", f"byear_{_today.year - 22}",
+                              f"bmon_{_today.month}", f"bday_{_today.day}", "bage_ok")):
+        await bot_mod.process_update("telegram", {"update_id": 3104 + i, "callback_query": {
+            "id": f"v3{i}", "from": {"id": 971}, "message": {"chat": {"id": 971}}, "data": data}})
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 3120, "callback_query": {
+        "id": "v9", "from": {"id": 971}, "message": {"chat": {"id": 971}}, "data": "reg_male"}})
+    async with db.session_scope() as s:
+        vis = await s.get(User, vis.id)
+        assert vis.age > 0
+        assert vis.state and vis.state["step"] == "anon_msg"
+        assert vis.state["target"] == owner.id
+    # their first message is delivered anonymously to the link owner
+    await bot_mod.process_update("telegram", {"update_id": 3121, "message": {
+        "message_id": 9, "chat": {"id": 971}, "from": {"id": 971}, "text": "سلام از لینک!"}})
+    assert any(t[0] == "970" and "سلام از لینک!" in str(t[1]) for t in tg.sent)
+
+
+@pytest.mark.asyncio
+async def test_resume_registration_hint(adapters):
+    """v2.4 (item 9): pushing an unfinished signup back into the FSM first
+    explains WHY the features are locked."""
+    from app import bot as bot_mod
+    await bot_mod.process_update("telegram", {"update_id": 3200, "message": {
+        "message_id": 1, "chat": {"id": 975}, "from": {"id": 975, "first_name": "Half"},
+        "text": "/start"}})
+    await bot_mod.process_update("telegram", {"update_id": 3201, "callback_query": {
+        "id": "h1", "from": {"id": 975}, "message": {"chat": {"id": 975}}, "data": "lang_fa"}})
+    tg, _ = adapters
+    tg.sent.clear()
+    # a gated command / button must explain, then resume
+    await bot_mod.process_update("telegram", {"update_id": 3202, "callback_query": {
+        "id": "h2", "from": {"id": 975}, "message": {"chat": {"id": 975}}, "data": "profile"}})
+    joined = "".join(str(t[1]) for t in tg.sent if t[0] == "975")
+    assert "نیمه‌کاره" in joined          # reg_resume_hint
+    assert "زبان مورد نظرت رو انتخاب کن" in joined  # resumed welcome flow
+
+
+@pytest.mark.asyncio
+async def test_friends_flow(adapters):
+    """v2.4: chat-options add-friend button, friends menu, anonymous DM to a
+    friend, remove."""
+    from app import bot as bot_mod
+    await register_via_bot(adapters, "telegram", "980", "FriendA", 25, "male")
+    await register_via_bot(adapters, "telegram", "981", "FriendB", 24, "female")
+    for pid in ("980", "981"):
+        await bot_mod.process_update("telegram", {"update_id": 3300 + int(pid), "callback_query": {
+            "id": f"f{pid}", "from": {"id": int(pid)},
+            "message": {"chat": {"id": int(pid)}}, "data": "gf_everyone"}})
+    # A adds B via the chat-options button
+    await bot_mod.process_update("telegram", {"update_id": 3310, "callback_query": {
+        "id": "fa1", "from": {"id": 980}, "message": {"chat": {"id": 980}}, "data": "chat_addfriend"}})
+    async with db.session_scope() as s:
+        a = (await s.execute(select(User).where(User.platform_user_id == "980"))).scalar_one()
+        b = (await s.execute(select(User).where(User.platform_user_id == "981"))).scalar_one()
+        fr = (await s.execute(select(Friend).where(Friend.user_id == a.id))).scalar_one()
+        assert fr.friend_id == b.id
+    # duplicate add is rejected politely
+    await bot_mod.process_update("telegram", {"update_id": 3311, "callback_query": {
+        "id": "fa2", "from": {"id": 980}, "message": {"chat": {"id": 980}}, "data": "chat_addfriend"}})
+    tg, _ = adapters
+    joined = "".join(str(t[1]) for t in tg.sent if t[0] == "980")
+    assert "از قبل توی لیست دوستانته" in joined
+    tg.sent.clear()
+    # friends menu lists the friend; DM flow sets the anon-message state
+    await bot_mod.process_update("telegram", {"update_id": 3312, "callback_query": {
+        "id": "fl1", "from": {"id": 980}, "message": {"chat": {"id": 980}}, "data": "friends_list"}})
+    joined = "".join(str(t[1]) + str(t[2]) for t in tg.sent if t[0] == "980")
+    assert "لیست دوستان" in joined and "FriendB" in joined
+    async with db.session_scope() as s:
+        b_id = (await s.execute(select(User.id).where(
+            User.platform_user_id == "981"))).scalar_one()
+    await bot_mod.process_update("telegram", {"update_id": 3313, "callback_query": {
+        "id": "fl2", "from": {"id": 980}, "message": {"chat": {"id": 980}}, "data": f"frdm_{b_id}"}})
+    async with db.session_scope() as s:
+        a = (await s.execute(select(User).where(User.platform_user_id == "980"))).scalar_one()
+        assert a.state["step"] == "friend_msg" and a.state["target"] == b_id
+    # the message is delivered anonymously to the friend
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 3314, "message": {
+        "message_id": 40, "chat": {"id": 980}, "from": {"id": 980}, "text": "سلام دوست ناشناس!"}})
+    assert any(t[0] == "981" and "سلام دوست ناشناس!" in str(t[1]) for t in tg.sent)
+    # remove
+    await bot_mod.process_update("telegram", {"update_id": 3315, "callback_query": {
+        "id": "fl3", "from": {"id": 980}, "message": {"chat": {"id": 980}}, "data": f"frdel_{b_id}"}})
+    async with db.session_scope() as s:
+        left = (await s.execute(select(Friend).where(Friend.user_id == a.id))).scalar_one_or_none()
+        assert left is None
+
+
+@pytest.mark.asyncio
+async def test_admin_coin_grant_notifies_user_pv(adapters):
+    """v2.4: the admin's inline coin action (admuc_) — which was previously
+    DEAD (never wired) — credits the wallet AND notifies the user's PV."""
+    from app import bot as bot_mod
+    admin = await mk_user(platform="telegram", pid="860835914", name="OwnerBot", coins=0)
+    target = await mk_user(platform="bale", pid="982", name="CoinTarget", coins=5)
+    tg, bale = adapters
+    bale.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 3400, "callback_query": {
+        "id": "ad1", "from": {"id": 860835914}, "message": {"chat": {"id": 860835914}},
+        "data": f"admuc_{target.id}_100"}})
+    async with db.session_scope() as s:
+        t = await s.get(User, target.id)
+        assert t.coin_balance == 105
+    pv = [x for x in bale.sent if x[0] == "982"]
+    assert pv and "100" in str(pv[0][1]) and "مدیریت" in str(pv[0][1])
+
+
+@pytest.mark.asyncio
+async def test_rescue_and_bot_blocked_isolation(adapters):
+    """v2.4: incomplete signups get staged reminders; 403 send failures put the
+    user in the bot-blocked isolation list; broadcasts skip them; messaging
+    again restores them."""
+    from app import growth
+    from app.db import utcnow as _now
+    # incomplete signup created 7h ago
+    async with db.session_scope() as s:
+        u = User(platform="telegram", platform_user_id="983", display_name="Half2", age=0,
+                 gender="male", coin_balance=0, language="fa")
+        s.add(u)
+        await s.flush()
+        u.registered_at = _now() - timedelta(hours=7)
+        uid = u.id
+    tg, _ = adapters
+    tg.sent.clear()
+    res = await growth.rescue_incomplete_signups()
+    assert res["sent"] >= 1
+    assert any(t[0] == "983" for t in tg.sent)
+    async with db.session_scope() as s:
+        u = await s.get(User, uid)
+        assert u.reminder_stage == 1 and u.last_reminder_at is not None
+    # blocked-bot isolation
+    await growth.mark_bot_blocked(uid, "telegram", "403 Forbidden: bot was blocked by the user")
+    async with db.session_scope() as s:
+        u = await s.get(User, uid)
+        assert u.bot_blocked is True
+        tgts = await service.broadcast_targets(s, "all")
+        assert uid not in {x.id for x in tgts}
+        inc = await service.broadcast_targets(s, "incomplete")
+        assert uid not in {x.id for x in inc}
+    # messaging again restores them to the active population
+    await bot_message_from("telegram", "983")
+    async with db.session_scope() as s:
+        u = await s.get(User, uid)
+        assert u.bot_blocked is False
+
+
+async def bot_message_from(platform, pid, text="/help"):
+    from app import bot as bot_mod
+    await bot_mod.process_update(platform, {"update_id": int(pid) * 7 + 5, "message": {
+        "message_id": 1, "chat": {"id": int(pid)}, "from": {"id": int(pid)}, "text": text}})
+
+
+@pytest.mark.asyncio
+async def test_queue_wait_nudge(adapters):
+    """v2.4 (D2): after 60s in the queue with no match, the user gets the
+    waiting nudge and STAYS queued."""
+    from app import bot as bot_mod, growth
+    from app.db import utcnow as _now
+    await register_via_bot(adapters, "telegram", "985", "Waiter", 25, "male")
+    await bot_mod.process_update("telegram", {"update_id": 3500, "callback_query": {
+        "id": "q1", "from": {"id": 985}, "message": {"chat": {"id": 985}}, "data": "gf_everyone"}})
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "985"))).scalar_one()
+        e = (await s.execute(select(QueueEntry).where(QueueEntry.user_id == u.id))).scalar_one()
+        e.created_at = _now() - timedelta(seconds=120)
+        eid = e.id
+    tg, _ = adapters
+    tg.sent.clear()
+    n = await growth.notify_stale_queue_waiters()
+    assert n == 1
+    assert any(t[0] == "985" and "صف" in str(t[1]) for t in tg.sent)
+    async with db.session_scope() as s:
+        e = await s.get(QueueEntry, eid)
+        assert e is not None            # still in the queue
+        assert e.notified_at is not None
+    # a second run does not re-nudge
+    tg.sent.clear()
+    assert await growth.notify_stale_queue_waiters() == 0
+
+
+@pytest.mark.asyncio
+async def test_broadcast_segments(adapters):
+    """v2.4 (D5): segmented broadcast audiences incl. incomplete & inactive_7d;
+    bot-blocked users are always excluded."""
+    async with db.session_scope() as s:
+        for pid, age, seen_h, blocked in (
+                ("990", 25, 1, False), ("991", 30, 200, False),
+                ("992", 0, 5, False), ("993", 22, 1, True)):
+            u = User(platform="telegram", platform_user_id=pid, display_name=f"U{pid}",
+                     age=age, gender="male", coin_balance=0, language="fa",
+                     accepted_rules_at=utcnow(), registration_rewarded=age > 0)
+            s.add(u)
+            await s.flush()
+            if seen_h > 24 * 7:
+                u.last_seen_at = utcnow() - timedelta(hours=seen_h)
+            if blocked:
+                u.bot_blocked = True
+        tgts_all = await service.broadcast_targets(s, "all")
+        inc = await service.broadcast_targets(s, "incomplete")
+        inact = await service.broadcast_targets(s, "inactive_7d")
+    assert "993" not in {u.platform_user_id for u in tgts_all}      # isolated
+    assert {u.platform_user_id for u in inc} == {"992"}
+    assert {u.platform_user_id for u in inact} == {"991"}
+
+
+@pytest.mark.asyncio
+async def test_signup_funnel_and_stateless_csrf():
+    """v2.4: dashboard exposes the signup funnel; the CSRF token is derived
+    from the session id (admin sessions survive deploys/restarts)."""
+    import httpx
+    from app.main import app
+    import app.webadmin as wa
+    async with db.session_scope() as s:
+        s.add(WebAdmin(username="owner3", password_hash=security.hash_password("OwnerPass123!"),
+                       role="owner", must_change_password=False))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+        r = await cli.post("/api/admin/v1/auth/login",
+                           json={"username": "owner3", "password": "OwnerPass123!"})
+        csrf = r.headers.get("x-csrf-token")
+        sid = r.cookies.get("kanar_admin_session")
+        # stateless CSRF: same value recomputed offline — survives restarts
+        assert csrf == security.csrf_token(sid, settings.webhook_secret)
+        r = await cli.get("/api/admin/v1/dashboard/metrics")
+        assert r.status_code == 200
+        f = r.json()["signupFunnel"]
+        for k in ("started", "acceptedRules", "birthdateSet", "completed", "completedPct"):
+            assert k in f
+        assert f["started"] >= f["completed"]
+        # users endpoint exposes the isolation flag
+        async with db.session_scope() as s:
+            s.add(User(platform="telegram", platform_user_id="funnel1", display_name="F1",
+                      age=20, gender="male", coin_balance=0, language="fa"))
+        r = await cli.get("/api/admin/v1/users")
+        assert r.status_code == 200 and "botBlocked" in r.json()[0]
+    wa._login_attempts.clear()

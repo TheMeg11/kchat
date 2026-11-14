@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections import deque
 from typing import Any, Optional
 
 import httpx
+
+from .config import RUNTIME
 
 log = logging.getLogger("kanar.platform")
 
@@ -248,31 +251,53 @@ class BaseAdapter:
 
     # --------------------------------------------------------- polling ----
     async def poll_updates(self, handler, stop: asyncio.Event):
-        """Long-polling fallback loop (backs off hard after repeated failures)."""
+        """Long-polling fallback loop (v2.4: hardened).
+
+        - network failures (dial/timeout) and API errors back off differently:
+          network problems retry sooner (they are often transient), hard API
+          failures back off exponentially but never longer than 120s so the bot
+          recovers within ~2 minutes instead of going dark for 10.
+        - jitter avoids thundering reconnections after a platform outage.
+        - every outcome is recorded in RUNTIME["poll_health"] for the auto
+          alerting engine (growth.check_alerts)."""
         offset = 0
         fails = 0
+        health = RUNTIME.setdefault("poll_health", {}).setdefault(self.platform, {
+            "last_ok": 0.0, "last_error": "", "fails": 0, "ok": 0,
+            "started_at": time.time()})
         while not stop.is_set():
             try:
-                if fails >= 10:
-                    # platform unreachable (e.g. geo-blocked); check rarely
-                    await asyncio.sleep(600)
                 params = {"timeout": 25, "offset": offset, "limit": 50}
                 result = await self.call("getUpdates", params)
                 fails = 0
+                health["ok"] += 1
+                health["fails"] = 0
+                health["last_ok"] = time.time()
+                health["last_error"] = ""
                 for upd in result or []:
                     offset = max(offset, int(upd.get("update_id", 0)) + 1)
                     try:
                         await handler(upd)
                     except Exception:
                         log.exception("update handler failed (polling %s)", self.platform)
-            except PlatformError as exc:
-                fails += 1
-                if fails <= 3:
-                    log.warning("poll error %s: %s", self.platform, exc)
-                await asyncio.sleep(min(3 * fails, 60))
             except asyncio.CancelledError:
                 raise
+            except PlatformError as exc:
+                fails += 1
+                health["fails"] = fails
+                health["last_error"] = str(exc)[:200]
+                if fails <= 3 or fails % 20 == 0:
+                    log.warning("poll error %s (fail #%d): %s", self.platform, fails, exc)
+                if exc.error_code == 0:
+                    # network-level failure (DNS/timeout/unreachable) — short waits
+                    await asyncio.sleep(min(2 * fails, 20) + random.uniform(0, 1.5))
+                else:
+                    # real API error — exponential backoff, capped at 120s
+                    await asyncio.sleep(min(3 * fails, 120) + random.uniform(0, 2))
             except Exception:
+                fails += 1
+                health["fails"] = fails
+                health["last_error"] = "poll loop crash"
                 log.exception("poll loop crash %s", self.platform)
                 await asyncio.sleep(5)
 

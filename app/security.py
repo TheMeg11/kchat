@@ -145,6 +145,18 @@ def mask_token(token: str) -> str:
     return token[:6] + "…" + token[-4:] if len(token) > 12 else "…"
 
 
+# --------------------------------------------------------------- CSRF ----
+def csrf_token(sid: str, secret: str) -> str:
+    """v2.4: stateless CSRF token derived from the session id.
+
+    The old in-process map died on every deploy/restart, instantly invalidating
+    every open admin session (forced re-login). Deriving the token with HMAC
+    from WEBHOOK_SECRET + sid keeps the same value across restarts, so the
+    admin's trusted device stays logged in after each deploy."""
+    return hmac.new(secret.encode(), ("csrf:" + sid).encode(),
+                    hashlib.sha256).hexdigest()[:32]
+
+
 def random_username() -> str:
     alphabet = "abcdefghijkmnpqrstuvwxyz"
     return "kanar-" + "".join(secrets.choice(alphabet) for _ in range(6))
