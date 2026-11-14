@@ -127,21 +127,35 @@ async def setup_commands() -> None:
 
 
 async def setup_webhooks() -> None:
+    # v2.4.2 (incident 2026-11-14): Bale webhook DELIVERY never reaches Railway.
+    # setWebhook answers 200 and getWebhookInfo confirms the URL, yet not a
+    # single update POST arrives from Bale's servers — while the very same bot
+    # answered instantly in long-polling mode (proven again during the incident
+    # recovery). Outbound Railway -> tapi.bale.ai is reliable, so Bale now
+    # ALWAYS runs on long polling; the stale webhook registration is deleted
+    # first (getUpdates returns 409 while a webhook is still active).
+    # Telegram keeps its webhook — delivery there is reliable.
+    import asyncio as _a
+    adp_t = RUNTIME.get("adapter_telegram")
     if not settings.public_url:
         log.info("PUBLIC_URL not set — bots will use long polling fallback")
-        return
-    for plat in ("telegram", "bale"):
-        adp = RUNTIME.get(f"adapter_{plat}")
-        if not adp:
-            continue
-        url = f"{settings.public_url.rstrip('/')}/webhook/{plat}/{RUNTIME['path_secret']}"
+    elif adp_t is not None:
+        url = f"{settings.public_url.rstrip('/')}/webhook/telegram/{RUNTIME['path_secret']}"
         try:
-            import asyncio as _a
-            await _a.wait_for(adp.set_webhook(url), timeout=20)
-            RUNTIME[f"webhook_set_{plat}"] = True
-            log.info("webhook registered for %s -> %s", plat, url)
+            await _a.wait_for(adp_t.set_webhook(url), timeout=20)
+            RUNTIME["webhook_set_telegram"] = True
+            log.info("webhook registered for telegram -> %s", url)
         except (PlatformError, _a.TimeoutError) as exc:
-            log.warning("setWebhook failed for %s: %s (falling back to polling)", plat, exc)
+            log.warning("setWebhook failed for telegram: %s (falling back to polling)", exc)
+    adp_b = RUNTIME.get("adapter_bale")
+    if adp_b is not None:
+        try:
+            await _a.wait_for(
+                adp_b.call("deleteWebhook", {"drop_pending_updates": False}), timeout=20)
+            log.info("bale webhook registration cleared — bale switches to long polling")
+        except (PlatformError, _a.TimeoutError) as exc:
+            log.warning("deleteWebhook failed on bale (continuing with polling): %s", exc)
+        RUNTIME["bale_polling"] = True
 
 
 async def ensure_webadmin() -> None:
@@ -496,6 +510,9 @@ async def health():
     return {"status": "ok" if db_ok else "degraded", "db": db_ok,
             "webhooks": {"telegram": bool(RUNTIME.get("webhook_set_telegram")),
                          "bale": bool(RUNTIME.get("webhook_set_bale"))},
+            "modes": {"telegram": "webhook" if RUNTIME.get("webhook_set_telegram")
+                      else "polling" if RUNTIME.get("adapter_telegram") else "off",
+                      "bale": "polling" if RUNTIME.get("adapter_bale") else "off"},
             "maintenance": False}
 
 

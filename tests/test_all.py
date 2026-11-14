@@ -86,6 +86,10 @@ class FakeAdapter:
     async def get_webhook_info(self):
         return {"url": ""}
 
+    async def set_webhook(self, url):
+        self.sent.append((None, "setWebhook", url))
+        return {"ok": True}
+
 
 @pytest.fixture
 def adapters():
@@ -2633,3 +2637,30 @@ async def test_bot_echo_updates_are_ignored(adapters):
             User.platform == "bale", User.platform_user_id == "55555"))).scalar_one_or_none()
     assert u is None                      # no ghost user for the bot itself
     assert not bale.sent                  # and not a single outgoing message
+
+
+@pytest.mark.asyncio
+async def test_bale_always_polls_telegram_keeps_webhook(adapters):
+    """v2.4.2 incident fix: Bale webhook DELIVERY from Bale's servers to Railway
+    never arrives (setWebhook 200 + getWebhookInfo OK, but zero update POSTs)
+    while long polling works reliably. setup_webhooks must therefore register a
+    webhook for TELEGRAM only, clear any stale Bale registration via
+    deleteWebhook, and mark bale as polling."""
+    from app.main import setup_webhooks
+    tg, bale = adapters
+    RUNTIME["path_secret"] = "testsecret123"
+    old_url = settings.public_url
+    settings.public_url = "https://hamchat-production.up.railway.app"
+    try:
+        await setup_webhooks()
+    finally:
+        settings.public_url = old_url
+    tg_methods = [m for _, m, _ in tg.sent]
+    bale_methods = [m for _, m, _ in bale.sent]
+    assert "setWebhook" in tg_methods
+    assert "setWebhook" not in bale_methods
+    assert "deleteWebhook" in bale_methods
+    assert RUNTIME.get("bale_polling") is True
+    assert not RUNTIME.get("webhook_set_bale")
+    RUNTIME.pop("bale_polling", None)
+    RUNTIME.pop("webhook_set_telegram", None)

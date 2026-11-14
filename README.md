@@ -66,6 +66,12 @@ ALLOW_SQLITE_ON_RAILWAY=
 | `BACKUP_PASSWORD` | Passphrase for the daily encrypted DB backup |
 | `WEBHOOK_SECRET` | Shared secret between the platform webhook and the app |
 | `PUBLIC_URL` | Public HTTPS URL (webhook mode; empty → long polling fallback) |
+
+> **v2.4.2 — Bale runs on long polling always.** Bale's servers accept `setWebhook`
+> (200 OK) but never actually deliver updates to Railway, while outbound
+> `tapi.bale.ai` calls are reliable — so the app registers webhooks for Telegram
+> only, clears the stale Bale registration via `deleteWebhook`, and consumes
+> Bale updates with a long-poll loop (`/health` → `modes.bale: "polling"`).
 | `ADMIN_TELEGRAM_IDS` / `ADMIN_BALE_IDS` | Owner user IDs per platform (comma separated) |
 | `BACKUP_OWNER_TELEGRAM_ID` | Telegram ID that receives the daily 03:00 (Asia/Tehran) backup |
 | `BACKUP_HOUR_TEHRAN` | Backup hour in Tehran time (default 3) |
