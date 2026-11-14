@@ -143,7 +143,10 @@ class RecentPair(Base):
 class Report(Base):
     __tablename__ = "reports"
     id: Mapped[int] = mapped_column(primary_key=True)
-    chat_id: Mapped[int] = mapped_column(ForeignKey("chats.id"), index=True)
+    # v2.1: anonymous-message reports have no chat — nullable FK (was chat_id=0, which
+    # violates the FK constraint on Postgres).
+    chat_id: Mapped[Optional[int]] = mapped_column(ForeignKey("chats.id"), index=True,
+                                                   default=None)
     reporter_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     reported_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     reason: Mapped[str] = mapped_column(String(24))

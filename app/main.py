@@ -164,7 +164,7 @@ async def scheduler_loop() -> None:
 
 
 async def daily_maintenance_jobs() -> None:
-    """Once per Tehran day: refresh ages from birthdays + send greetings."""
+    """Once per Tehran day: refresh ages from birthdays + greetings + 50-coin gift."""
     from . import bot as bot_mod
     from .i18n import tr
     try:
@@ -174,13 +174,19 @@ async def daily_maintenance_jobs() -> None:
                 log.info("dynamic age refresh: %d users", changed)
         async with session_scope() as s:
             for u in await service.today_birthdays(s):
+                gifted = 0
                 try:
-                    await bot_mod.adapter(u.platform) and None
+                    # v2.1: 50-coin birthday gift (idempotent per user per year)
+                    gifted = await service.grant_birthday_gift(s, u)
+                except Exception:
+                    log.exception("birthday gift failed for %s", u.public_id)
+                try:
                     adp = bot_mod.adapter(u.platform)
                     if adp:
-                        await adp.send_message(
-                            u.platform_user_id,
-                            tr(u.language, "birthday_greet", name=u.display_name))
+                        text = tr(u.language, "birthday_greet", name=u.display_name)
+                        if gifted:
+                            text += "\n\n" + tr(u.language, "birthday_gift_coins", coins=gifted)
+                        await adp.send_message(u.platform_user_id, text)
                 except Exception:
                     log.exception("birthday greet failed for %s", u.public_id)
     except Exception:

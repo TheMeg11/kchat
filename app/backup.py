@@ -281,12 +281,18 @@ async def execute_restore(blob: bytes, password: str) -> dict:
         # 3) post-restore verification query
         async with session_scope() as session:
             n_users = (await session.execute(select(func_count(db.User.id)))).scalar()
+        # 3.5) v2.1 FIX: turn maintenance back OFF on success — previously it stayed
+        # ON forever ("until owner confirms") which froze the bot for everyone.
+        async with session_scope() as session:
+            app_cfg = await service.get_setting(session, "app")
+            app_cfg["maintenanceMode"] = False
+            await service.set_setting(session, "app", app_cfg)
         result = {"status": "succeeded", "rollbackSnapshotId": emergency_id,
-                  "maintenanceEnabled": True,
+                  "maintenanceEnabled": False,
                   "durationSec": round(asyncio.get_event_loop().time() - t0, 1),
                   "message": (f"بازیابی کامل شد: {stats['tables']} جدول، {stats['rows']} ردیف، "
                               f"{n_users} کاربر. اسنپ‌شات بازگشت: {emergency_id}. "
-                              "حالت تعمیر فعال ماند تا تأیید مالک.")}
+                              "حالت تعمیر پس از بازیابی موفق، خودکار خاموش شد.")}
         return result
     except Exception as exc:
         log.exception("restore failed, rolling back")

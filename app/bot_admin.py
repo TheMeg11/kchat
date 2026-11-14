@@ -64,11 +64,11 @@ async def _say(user: User, text: str, keyboard=None):
 
 
 async def _menu(user: User, role: str) -> None:
-    """Inline admin panel menu (v2: glass buttons, full coverage, back button)."""
+    """Inline admin panel menu (v2.1: numeric stats, instant backup, dynamic maintenance)."""
     perms = await _perms(role)
     rows = []
     if "dashboard.view" in perms:
-        rows.append([btn("📊 آمار زنده", "adm_stats")])
+        rows.append([btn("📊 آمار کل", "adm_stats")])
     if "users.view" in perms:
         rows.append([btn("🔍 جستجوی کاربر", "adm_finduser"),
                      btn("📋 گزارش‌ها", "adm_reports")])
@@ -84,10 +84,18 @@ async def _menu(user: User, role: str) -> None:
         rows.append([btn("💬 تیکت‌های پشتیبانی", "adm_tickets")])
     if "backups.view" in perms:
         rows.append([btn("🔐 پشتیبان‌گیری", "adm_backup")])
+    if "backups.create" in perms:
+        # v2.1: instant backup directly on the main admin menu
+        rows.append([btn("⚡ بکاپ فوری", "adm_backup_now")])
     if role == "owner":
         rows.append([btn("♻️ بازیابی از فایل", "adm_restore")])
     if "settings.manage" in perms:
-        rows.append([btn("🔧 حالت تعمیر", "adm_maint")])
+        # v2.1: live maintenance state shown on the button itself
+        async with session_scope() as s:
+            cfg = await service.get_setting(s, "app")
+        on = cfg.get("maintenanceMode", False)
+        rows.append([btn(f"🔧 حالت تعمیر: {'🟢 روشن' if on else '🔴 خاموش'}",
+                         "adm_maint")])
     if "admins.manage" in perms and role == "owner":
         rows.append([btn("👥 مدیران", "adm_admins")])
     # back-to-home on every submenu
@@ -101,7 +109,18 @@ async def _menu(user: User, role: str) -> None:
 
 async def _perms(role: str) -> list:
     async with session_scope() as s:
-        return await service.role_permissions(s, role)
+        perms = await service.role_permissions(s, role)
+    # v2.1 FIX: "*" (owner) must expand to every known permission, otherwise the
+    # owner's bot panel rendered almost empty (only role-gated rows appeared).
+    if "*" in perms:
+        every = set()
+        for plist in service.ROLE_DEFAULT_PERMISSIONS.values():
+            every.update(plist)
+        every.update({"settings.manage", "admins.manage", "privacy.manage",
+                      "referrals.view", "daily_rewards.manage", "audit.view",
+                      "monitoring.view"})
+        perms = sorted(every)
+    return perms
 
 
 async def admin_callback(user: User, data: str, chat_id) -> None:
@@ -114,16 +133,26 @@ async def admin_callback(user: User, data: str, chat_id) -> None:
     lang = user.language
 
     if data == "adm_stats" and "dashboard.view" in perms:
+        # v2.1: numeric-only stats with update + back buttons
         async with session_scope() as s:
             users = (await s.execute(select(func.count(User.id)))).scalar()
             tg = (await s.execute(select(func.count(User.id)).where(User.platform == "telegram"))).scalar()
             bal = (await s.execute(select(func.count(User.id)).where(User.platform == "bale"))).scalar()
+            active_u = (await s.execute(select(func.count(User.id)).where(User.status == "active"))).scalar()
             chats = (await s.execute(select(func.count(db.Chat.id)).where(db.Chat.status == "active"))).scalar()
+            msgs = (await s.execute(select(func.count(db.ChatMessage.id)))).scalar()
             pend = (await s.execute(select(func.count(Report.id)).where(Report.status == "pending"))).scalar()
             coins = (await s.execute(select(func.sum(User.coin_balance)))).scalar() or 0
-        await _say(user, f"📊 آمار زنده:\nکاربران: {users} (تلگرام {tg} | بله {bal})\n"
-                        f"گفتگوهای فعال: {chats}\nگزارش‌های در انتظار: {pend}\n"
-                        f"مجموع سکه در گردش: {coins}")
+            bans_n = (await s.execute(select(func.count(db.Ban.id)).where(db.Ban.status == "active"))).scalar()
+        await _say(user, "📊 آمار کل:\n"
+                        f"👥 کاربران: {users} (🔵 تلگرام: {tg} | 🟢 بله: {bal} | ✅ فعال: {active_u})\n"
+                        f"💬 گفتگوهای فعال: {chats}\n"
+                        f"✉️ مجموع پیام‌ها: {msgs}\n"
+                        f"🪙 سکه در گردش: {coins}\n"
+                        f"🚩 گزارش‌های در انتظار: {pend}\n"
+                        f"⛔ مسدودی‌های فعال: {bans_n}",
+                   keyboard=kb([[btn("🔄 آپدیت", "adm_stats")],
+                                [btn("🏠 بازگشت به منوی اصلی", "back_home")]]))
         return
 
     if data == "adm_finduser" and "users.view" in perms:
@@ -273,7 +302,17 @@ async def admin_callback(user: User, data: str, chat_id) -> None:
                                 admin_name=user.display_name, admin_role=role,
                                 action="settings.maintenance_toggled", module="settings",
                                 details=f"maintenance={'ON' if on else 'OFF'}")
-        await _say(user, f"🔧 حالت تعمیر: {'روشن' if on else 'خاموش'}")
+        # v2.1: dynamic toggle with confirm + back-to-menu buttons
+        if on:
+            await _say(user, "🔧 حالت تعمیر: 🟢 روشن\n\n"
+                            "⚠️ ربات از این لحظه فقط برای مدیران کار می‌کند.\n"
+                            "کاربران عادی پیام «در حال تعمیر» می‌بینند.",
+                       keyboard=kb([[btn("🔧 خاموش کردن تعمیر", "adm_maint")],
+                                    [btn("🏠 بازگشت به منوی اصلی", "back_home")]]))
+        else:
+            await _say(user, "🔧 حالت تعمیر: 🔴 خاموش\n\n✅ ربات برای همه کاربران فعال است.",
+                       keyboard=kb([[btn("🔧 روشن کردن تعمیر", "adm_maint")],
+                                    [btn("🏠 بازگشت به منوی اصلی", "back_home")]]))
         return
 
     if data == "adm_admins" and role == "owner":

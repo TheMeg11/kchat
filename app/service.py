@@ -356,6 +356,34 @@ async def today_birthdays(session) -> list[User]:
     return list(res.scalars())
 
 
+async def grant_birthday_gift(session, user: User) -> int:
+    """v2.1: 50-coin gift on the user's actual birthday (once per year, idempotent)."""
+    import datetime as _dt
+    eco = await get_setting(session, "economy")
+    amount = eco.get("birthdayGiftCoins", 50)
+    year = _dt.date.today().year
+    key = f"bdaygift:{user.id}:{year}"
+    exists = await session.execute(
+        select(CoinTransaction).where(CoinTransaction.idempotency_key == key))
+    if exists.scalar_one_or_none():
+        return 0
+    await credit(session, user, amount, "birthday_gift",
+                 f"🎁 کادوی روز تولد {year}", idempotency_key=key)
+    return amount
+
+
+def save_birthday(user: User, calendar: str, y: int, m: int, d: int) -> int:
+    """v2.1: store year/month/day + derive the age. Returns the new age."""
+    if calendar == "jalali":
+        gy, gm, gd = jalali_to_gregorian(y, m, d)
+    else:
+        gy, gm, gd = y, m, d
+    age = compute_age_from_birthday(gy, gm, gd)
+    user.birth_year, user.birth_month, user.birth_day, user.birth_calendar = gy, gm, gd, calendar
+    user.age = max(13, min(60, age))
+    return user.age
+
+
 # --------------------------------------------- anonymous link & linking ----
 def new_anon_code() -> str:
     return "a" + secrets.token_hex(5)

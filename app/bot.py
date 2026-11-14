@@ -56,19 +56,30 @@ def search_cta(lang: str):
 
 
 async def main_menu(user: User) -> None:
+    """v2.1: DYNAMIC main menu — buttons reflect the user's live state."""
     lang = user.language
-    rows = [
-        [btn(tr(lang, "btn_search"), "search"),
-         btn(tr(lang, "btn_profile"), "profile")],
-        [btn(tr(lang, "btn_anon_link"), "anon_link"),
-         btn(tr(lang, "btn_direct_msg"), "direct_msg")],
-        [btn(tr(lang, "btn_coins"), "coins"),
-         btn(tr(lang, "btn_store"), "store")],
-        [btn(tr(lang, "btn_bonus"), "bonus"),
-         btn(tr(lang, "btn_myref"), "referral")],
-        [btn(tr(lang, "btn_language"), "language"),
-         btn(tr(lang, "btn_help"), "help")],
-    ]
+    rows = []
+    # row 1: chat state — "next partner" while chatting, search otherwise
+    async with session_scope() as s:
+        u = await s.get(User, user.id)
+        chatting = await service.active_chat_for(s, u.id)
+        queued = (await s.execute(select(QueueEntry).where(
+            QueueEntry.user_id == u.id))).scalar_one_or_none()
+    if chatting:
+        rows.append([btn("⏭ " + tr(lang, "btn_next"), "chat_next"),
+                     btn(tr(lang, "btn_end"), "chat_end")])
+    elif queued:
+        rows.append([btn(tr(lang, "btn_stop_search"), "stop_search")])
+    else:
+        rows.append([btn(tr(lang, "btn_search"), "search")])
+    rows.append([btn(tr(lang, "btn_profile"), "profile")])
+    rows.append([btn(tr(lang, "btn_anon_link"), "anon_link"),
+                 btn(tr(lang, "btn_direct_msg"), "direct_msg")])
+    rows.append([btn(tr(lang, "btn_coins"), "wallet"),
+                 btn(tr(lang, "btn_bonus"), "bonus")])
+    rows.append([btn(tr(lang, "btn_myref"), "referral"),
+                 btn(tr(lang, "btn_language"), "language")])
+    rows.append([btn(tr(lang, "btn_help"), "help")])
     if await _is_admin(user):
         rows.append([btn(tr(lang, "btn_admin"), "admin_open")])
     await send(user, "main_menu", keyboard=kb(*rows))
@@ -214,9 +225,9 @@ async def handle_command(user: User, command: str, args: str) -> None:
         await do_stop(user)
     elif cmd == "/profile":
         await show_profile(user)
-    elif cmd == "/coins":
-        await send(user, "coins_balance", coins=user.coin_balance, keyboard=back_kb(lang))
-    elif cmd == "/store":
+    elif cmd == "/coins" or cmd == "/wallet":
+        await show_wallet(user)
+    elif cmd == "/store" or cmd == "/buy":
         await show_store(user)
     elif cmd == "/language":
         user.state = {"step": "language"}
@@ -290,11 +301,15 @@ async def show_anon_links(user: User) -> None:
 
 
 # ------------------------------------------------------ anon threads (v3) ----
-def anon_thread_kb(lang: str):
-    """Reply / Report / Block buttons under every received anonymous message."""
-    return kb([btn(tr(lang, "btn_anon_reply"), "anonr_"),
-               btn(tr(lang, "btn_anon_report"), "anonrep_"),
-               btn(tr(lang, "btn_anon_block"), "anonblk_")])
+def anon_thread_kb(lang: str, thread_id: Optional[int] = None):
+    """Reply / Report / Block buttons under every received anonymous message.
+    v2.1 FIX: every button carries ITS thread id, so replies/report/block always
+    target the exact sender of that message (previously only the newest thread
+    was addressed, which broke reply for older messages)."""
+    suffix = str(thread_id) if thread_id else ""
+    return kb([btn(tr(lang, "btn_anon_reply"), f"anonr_{suffix}"),
+               btn(tr(lang, "btn_anon_report"), f"anonrep_{suffix}"),
+               btn(tr(lang, "btn_anon_block"), f"anonblk_{suffix}")])
 
 
 async def deliver_anon_message(session, sender: User, owner: User, text: str,
@@ -321,15 +336,16 @@ async def deliver_anon_message(session, sender: User, owner: User, text: str,
     try:
         key = "anon_reply_received" if is_reply else "anon_msg_received"
         await adp.send_message(owner.platform_user_id, tr(owner.language, key, text=text[:3000]),
-                               keyboard=anon_thread_kb(owner.language))
+                               keyboard=anon_thread_kb(owner.language, thread.id))
         return True
     except PlatformError as exc:
         log.info("anon delivery failed: %s", exc)
         return False
 
 
-async def anon_reply_flow(owner: User, text: str) -> None:
-    """Owner replies to the most recent anonymous thread."""
+async def anon_reply_flow(owner: User, text: str, thread_id: Optional[int] = None) -> None:
+    """Owner replies to a specific anonymous thread (v2.1: exact thread, and the
+    reply keeps the conversation flowing through BOTH directions' threads)."""
     async with session_scope() as s:
         u = await s.get(User, owner.id)
         u.state = None
@@ -339,14 +355,15 @@ async def anon_reply_flow(owner: User, text: str) -> None:
             await service.apply_violation(s, u, reason, text[:60])
             return
         q = select(AnonThread).where(AnonThread.owner_id == u.id)
-        state = owner.state or {}
-        if state.get("thread"):
-            q = q.where(AnonThread.id == int(state["thread"]))
+        if thread_id:
+            q = q.where(AnonThread.id == thread_id)
         thread = (await s.execute(q.order_by(AnonThread.updated_at.desc())
                                   .limit(1))).scalar_one_or_none()
         if not thread or thread.status != "open":
             await main_menu(u)
             return
+        thread.last_text = text[:2000]
+        thread.updated_at = utcnow()
         sender = await s.get(User, thread.sender_id)
         if sender and sender.status == "active":
             blocked = await s.execute(select(Block).where(
@@ -358,7 +375,7 @@ async def anon_reply_flow(owner: User, text: str) -> None:
                         await adp.send_message(
                             sender.platform_user_id,
                             tr(sender.language, "anon_reply_received", text=text[:3000]),
-                            keyboard=anon_thread_kb(sender.language))
+                            keyboard=anon_thread_kb(sender.language, thread.id))
                     except PlatformError as exc:
                         log.info("anon reply delivery failed: %s", exc)
         # never reveal whether the sender received it
@@ -385,9 +402,9 @@ async def anon_report(owner: User, thread_marker: str = "") -> None:
             Report.reason == "anon_message",
             Report.created_at >= utcnow() - timedelta(hours=24)))
         if dup.scalar_one_or_none():
-            await send(u, "report_dup", keyboard=anon_thread_kb(u.language))
+            await send(u, "report_dup", keyboard=anon_thread_kb(u.language, thread.id))
             return
-        s.add(Report(chat_id=0, reporter_id=u.id, reported_id=sender.id,
+        s.add(Report(chat_id=None, reporter_id=u.id, reported_id=sender.id,
                      reason="anon_message", details=(thread.last_text or "")[:500]))
         sender.reports_received += 1
         u.reports_sent += 1
@@ -478,35 +495,21 @@ async def deliver_direct_message(sender: User, target_id: Optional[int], text: s
                             await adp.send_message(
                                 target.platform_user_id,
                                 tr(target.language, "anon_msg_received", text=text[:3000]),
-                                keyboard=anon_thread_kb(target.language))
+                                keyboard=anon_thread_kb(target.language, thread.id))
                         except PlatformError as exc:
                             log.info("direct message delivery failed (hidden): %s", exc)
     # neutral response — no delivery status revealed
     await send(sender, "direct_msg_neutral")
 
 
-# ------------------------------------------------------ account linking ----
-async def start_link_flow(user: User) -> None:
-    async with session_scope() as s:
-        u = await s.get(User, user.id)
-        if u.linked_user_id:
-            await send(u, "link_already")
-            return
-        eco = await service.get_setting(s, "economy")
-        reward = eco.get("accountLinkReward", 50)
-        await send(u, "link_intro", coins=reward, total=reward * 2,
-                   keyboard=kb([btn(tr(u.language, "link_gen"), "link_gen")],
-                               [btn(tr(u.language, "btn_back"), "back_home")]))
+# ------------------------------------------- account linking: REMOVED in v2.1 ----
+# The "link Telegram/Bale accounts" feature was removed from the user UI.
+# Deep-links /start lnk_XXX are still answered politely for old links.
 
 
-async def generate_link(user: User) -> None:
-    async with session_scope() as s:
-        u = await s.get(User, user.id)
-        code = await service.start_account_link(s, u)
-        eco = await service.get_setting(s, "economy")
-        link = deep_link(u, f"lnk_{code}")
-        await send(u, "link_show", link=link, coins=eco.get("accountLinkReward", 50),
-                   keyboard=back_kb(u.language))
+async def legacy_link_expired(user: User) -> None:
+    await send(user, "link_expired")
+    await main_menu(user)
 
 
 # -------------------------------------------------------------- gifts (18) ----
@@ -737,35 +740,37 @@ async def show_profile(user: User) -> None:
     if user.birth_year:
         if user.birth_calendar == "jalali":
             month_name = JALALI_MONTHS[(user.birth_month or 1) - 1].strip()
-            cal = "شمسی 🌙"
+            year_label = user.birth_year  # shown in gregorian; convert for fa users
+            jy, _jm, _jd = service.gregorian_to_jalali(
+                user.birth_year, user.birth_month or 1, user.birth_day or 1)
+            year_label = jy
+            bday = tr(lang, "birthday_set",
+                      date=f"{jy} / {month_name} / {user.birth_day} (شمسی 🌙)")
         else:
             month_name = GREGORIAN_MONTHS["fa"][(user.birth_month or 1) - 1].strip()
-            cal = "میلادی 🌍"
-        bday = tr(lang, "birthday_set", date=f"{user.birth_day} {month_name} ({cal})")
+            bday = tr(lang, "birthday_set",
+                      date=f"{user.birth_year} / {month_name} / {user.birth_day} (میلادی 🌍)")
+        bday += "\n⚠️🔒 تاریخ تولد قابل تغییر نیست."
     else:
         bday = tr(lang, "birthday_not_set")
-    linked = ""
     coins = user.coin_balance
     async with session_scope() as s:
         u = await s.get(User, user.id)
         coins = u.coin_balance
-        if u.linked_user_id:
-            other = await s.get(User, u.linked_user_id)
-            if other:
-                linked = f"\n🔗✅ متصل به: حساب {PLATFORM_LABEL[other.platform][lang]}"
     rows = [
         [btn(tr(lang, "btn_edit_name"), "edit_name"),
          btn(tr(lang, "btn_edit_age"), "edit_age")],
         [btn(tr(lang, "btn_edit_bio"), "edit_bio"),
          btn(tr(lang, "btn_edit_photo"), "edit_photo")],
-        [btn(tr(lang, "btn_birthday"), "set_birthday")],
         [btn(tr(lang, "btn_anon_link"), "anon_link")],
         [btn(tr(lang, "btn_direct_msg"), "direct_msg")],
-        [btn(tr(lang, "btn_link_account"), "link_account")],
     ]
+    # v2.1: birthday button disappears once the birthday is registered
+    if not user.birth_year:
+        rows.insert(2, [btn(tr(lang, "btn_birthday"), "set_birthday")])
     await send(user, "profile_card", name=user.display_name, age=user.age,
                gender=gender, bio=user.bio or "—", coins=coins,
-               birthday=bday + linked, keyboard=back_kb(lang, rows))
+               birthday=bday, keyboard=back_kb(lang, rows))
     if user.photo_file_id:
         adp = adapter(user.platform)
         if adp:
@@ -783,16 +788,44 @@ def _months_for(lang: str, calendar: str):
 
 
 async def start_birthday(user: User) -> None:
+    """v2.1: birthday can be set ONCE — year -> month -> day, then reward."""
+    if user.birth_year:
+        # already set — the button is hidden in the profile, but guard anyway
+        await show_profile(user)
+        return
     calendar = "jalali" if user.language == "fa" else "gregorian"
     async with session_scope() as s:
         eco = await service.get_setting(s, "economy")
         u = await s.get(User, user.id)
-        u.state = {"step": "birthday_month", "calendar": calendar}
+        u.state = {"step": "birthday_year", "calendar": calendar}
         reward = eco.get("birthdayReward", 10)
+        gift = eco.get("birthdayGiftCoins", 50)
+    await send(user, "birthday_intro", coins=reward, gift=gift,
+               keyboard=back_kb(user.language))
+
+
+async def birthday_year_entered(user: User, year: int) -> None:
+    state = user.state or {}
+    calendar = state.get("calendar", "jalali")
+    import datetime as _dt
+    this_year = _dt.date.today().year
+    if calendar == "jalali":
+        jy, _jm, _jd = service.gregorian_to_jalali(this_year, _dt.date.today().month,
+                                                    _dt.date.today().day)
+        min_y, max_y = jy - 60, jy - 13
+    else:
+        min_y, max_y = this_year - 60, this_year - 13
+    if not (min_y <= year <= max_y):
+        await send(user, "invalid_input")
+        return
+    async with session_scope() as s:
+        u = await s.get(User, user.id)
+        u.state = {"step": "birthday_month", "calendar": calendar, "year": year}
     months = _months_for(user.language, calendar)
-    rows = [[btn(months[i].strip(), f"bmon_{i + 1}")] for i in range(12)]
+    rows = [[btn(months[i].strip(), f"bmon_{i + 1}"), btn(months[i + 6].strip(), f"bmon_{i + 7}")]
+            for i in range(6)]
     rows.append([btn(tr(user.language, "btn_back"), "back_home")])
-    await send(user, "birthday_intro", coins=reward, keyboard=rows)
+    await send(user, "birthday_ask_month", keyboard=rows)
 
 
 async def birthday_month_chosen(user: User, month: int) -> None:
@@ -801,7 +834,8 @@ async def birthday_month_chosen(user: User, month: int) -> None:
     maxday = 31 if calendar == "gregorian" else service.JALALI_MONTH_DAYS[month - 1]
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "birthday_day", "calendar": calendar, "month": month, "maxday": maxday}
+        u.state = {"step": "birthday_day", "calendar": calendar,
+                   "year": state.get("year"), "month": month, "maxday": maxday}
     months = _months_for(user.language, calendar)
     await send(user, "birthday_ask_day", month=months[month - 1].strip(), maxday=maxday,
                keyboard=back_kb(user.language))
@@ -810,30 +844,26 @@ async def birthday_month_chosen(user: User, month: int) -> None:
 async def birthday_day_entered(user: User, day: int) -> None:
     state = user.state or {}
     calendar = state.get("calendar", "jalali")
+    year = state.get("year")
     month = state.get("month", 1)
     maxday = state.get("maxday", 31)
     if not (1 <= day <= maxday):
         await send(user, "invalid_input")
         return
-    import datetime as _dt
-    today = _dt.date.today()
     if calendar == "jalali" and month == 12 and day == 30:
         day = 29  # esfand 30 only in leap years — clamp
-    age = user.age or 15
-    if calendar == "jalali":
-        jy, jm, jd = service.gregorian_to_jalali(today.year, today.month, today.day)
-        gy, gm, gd = service.jalali_to_gregorian(jy - age, month, day)
-    else:
-        gy, gm, gd = today.year - age, month, day
-    new_age = service.compute_age_from_birthday(gy, gm, gd)
-    if not (13 <= new_age <= 60):
-        new_age = max(13, min(60, new_age))
-        gy = today.year - new_age
+    if not year:
+        await start_birthday(user)
+        return
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.birth_year, u.birth_month, u.birth_day = gy, gm, gd
-        u.birth_calendar = calendar
-        u.age = new_age
+        if u.birth_year:      # already saved — never overwrite (2.1 rule)
+            u.state = None
+            await s.commit()
+            user.birth_year = u.birth_year  # sync detached object so the profile hides the button
+            await show_profile(u)
+            return
+        new_age = service.save_birthday(u, calendar, year, month, day)
         eco = await service.get_setting(s, "economy")
         reward = eco.get("birthdayReward", 10)
         if not u.birthday_rewarded:
@@ -842,6 +872,11 @@ async def birthday_day_entered(user: User, day: int) -> None:
                                  idempotency_key=f"bday:{u.id}")
         else:
             reward = 0
+        u.state = None
+        await s.commit()
+        # sync the detached user object so subsequent views see the new birthday
+        user.birth_year, user.birth_month, user.birth_day = u.birth_year, u.birth_month, u.birth_day
+        user.birth_calendar, user.age = u.birth_calendar, u.age
     await send(user, "birthday_saved", coins=reward or eco.get("birthdayReward", 10))
     await show_profile(user)
 
@@ -914,7 +949,21 @@ async def show_referral(user: User) -> None:
     await send(user, "referral_count", count=user.referral_count, keyboard=back_kb(user.language))
 
 
+async def show_wallet(user: User) -> None:
+    """v2.1: wallet menu — balance + buy-coins entry + paysupport."""
+    lang = user.language
+    async with session_scope() as s:
+        u = await s.get(User, user.id)
+        coins = u.coin_balance
+    rows = [
+        [btn(tr(lang, "btn_store"), "store")],
+        [btn(tr(lang, "pay_support_btn"), "paysupport_ticket")],
+    ]
+    await send(user, "wallet_title", coins=coins, keyboard=back_kb(lang, rows))
+
+
 async def show_store(user: User) -> None:
+    """v2.1: coin purchase packages (inside the wallet menu)."""
     rows = []
     async with session_scope() as s:
         pkgs = (await s.execute(select(StorePackage).where(StorePackage.active == True))).scalars()  # noqa
@@ -931,7 +980,9 @@ async def show_store(user: User) -> None:
     if not rows:
         await send(user, "pay_unavailable", keyboard=back_kb(user.language))
         return
-    rows.append([btn(tr(user.language, "btn_back"), "back_home")])
+    # back goes to the wallet (parent menu in 2.1)
+    rows.append([btn("👛 " + tr(user.language, "btn_coins"), "wallet"),
+                 btn(tr(user.language, "btn_back"), "back_home")])
     await send(user, "store_title", keyboard=rows)
 
 
@@ -1128,6 +1179,16 @@ async def handle_message(platform: str, msg: dict) -> None:
             await s.commit()
             await apply_edit_age(user, age)
             return
+        if step == "birthday_year":
+            # v2.1: full date flow — year first
+            try:
+                year = int(text.strip())
+            except ValueError:
+                await send(user, "invalid_input")
+                return
+            await s.commit()
+            await birthday_year_entered(user, year)
+            return
         if step == "birthday_day":
             try:
                 day = int(text.strip())
@@ -1157,7 +1218,7 @@ async def handle_message(platform: str, msg: dict) -> None:
             return
         if step == "anon_reply":
             await s.commit()
-            await anon_reply_flow(user, text)
+            await anon_reply_flow(user, text, state.get("thread"))
             return
         if step == "direct_msg_target":
             await s.commit()
@@ -1189,8 +1250,10 @@ async def handle_message(platform: str, msg: dict) -> None:
             return
         app_cfg = await service.get_setting(s, "app")
         if app_cfg.get("maintenanceMode"):
-            await send(user, "maintenance")
-            return
+            # v2.1: admins keep full access during maintenance
+            if not await _is_admin(user):
+                await send(user, "maintenance")
+                return
 
         # --- in-chat relay ---
         chat = await service.active_chat_for(s, user.id)
@@ -1361,6 +1424,11 @@ async def handle_callback(platform: str, query: dict) -> None:
             else:
                 await main_menu(user)
             return
+        # v2.1: during maintenance only admins may use buttons
+        app_cfg = await service.get_setting(s, "app")
+        if app_cfg.get("maintenanceMode") and not await _is_admin(user):
+            await send(user, "maintenance")
+            return
         if data == "back_home":
             user.state = None
             await main_menu(user)
@@ -1410,35 +1478,14 @@ async def handle_callback(platform: str, query: dict) -> None:
             user.state = {"step": "direct_msg_target"}
             await send(user, "direct_msg_intro", keyboard=back_kb(user.language))
             return
-        if data == "link_account":
+        if data == "wallet":
             await s.commit()
-            await start_link_flow(user)
+            await show_wallet(user)
             return
-        if data == "link_gen":
+        # v2.1: account linking removed — legacy buttons/links answer politely
+        if data in ("link_account", "link_gen"):
             await s.commit()
-            await generate_link(user)
-            return
-        if data.startswith("linkok_"):
-            code = data[7:]
-            r = await s.execute(select(User).where(User.link_code == code))
-            initiator = r.scalar_one_or_none()
-            if not initiator:
-                await send(user, "link_expired")
-                return
-            status = await service.confirm_account_link(s, initiator, user)
-            eco = await service.get_setting(s, "economy")
-            reward = eco.get("accountLinkReward", 50)
-            if status == "ok":
-                await send(initiator, "link_done", coins=reward,
-                           other_platform=PLATFORM_LABEL[user.platform][initiator.language])
-                await send(user, "link_done", coins=reward,
-                           other_platform=PLATFORM_LABEL[initiator.platform][user.language])
-            elif status == "same_platform":
-                await send(user, "link_same_platform")
-            elif status == "already":
-                await send(user, "link_already")
-            else:
-                await send(user, "link_expired")
+            await legacy_link_expired(user)
             return
         # --- anonymous thread actions (v3) ---
         if data.startswith("anonrep_"):
@@ -1497,7 +1544,8 @@ async def handle_callback(platform: str, query: dict) -> None:
             await show_profile(user)
             return
         if data == "coins":
-            await send(user, "coins_balance", coins=user.coin_balance, keyboard=back_kb(user.language))
+            await s.commit()
+            await show_wallet(user)
             return
         if data == "store":
             await s.commit()
