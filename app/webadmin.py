@@ -10,7 +10,7 @@ import uuid
 from datetime import timedelta
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, UploadFile, File
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select
@@ -283,6 +283,24 @@ async def me(request: Request):
     return admin_out(admin, perms)
 
 
+# v2.3.1: explicit stubs for the retired TOTP endpoints — the prebuilt panel
+# bundle still references them; returning a clean Persian error beats a 404.
+_TOTP_REMOVED = ("احراز دومرحله‌ای (TOTP) از نسخه ۲.۳ حذف شده است؛ "
+                 "ورود فقط با نام کاربری و رمز عبور انجام می‌شود.")
+
+
+@router.post("/auth/verify-totp")
+async def verify_totp_removed(request: Request):
+    await current_admin(request)
+    raise ApiErr(410, _TOTP_REMOVED, "TOTP_REMOVED")
+
+
+@router.post("/auth/totp/enroll/confirm")
+async def totp_enroll_removed(request: Request):
+    await current_admin(request)
+    raise ApiErr(410, _TOTP_REMOVED, "TOTP_REMOVED")
+
+
 @router.post("/auth/logout")
 async def logout(request: Request, response: Response):
     sid = request.cookies.get(SESSION_COOKIE)
@@ -324,9 +342,11 @@ async def revoke_session(session_id: str, request: Request):
 
 # ----------------------------------------------------------- dashboard ----
 @router.get("/dashboard/metrics")
-async def dashboard_metrics(request: Request, range: str = "24h", platform: str = "all"):
+async def dashboard_metrics(request: Request, period: str = Query("24h", alias="range"),
+                            platform: str = "all"):
+    # v2.3.1: `range` param shadowed the builtin and crashed the endpoint (500)
     await require(request, "dashboard.view")
-    day_from = {"24h": 1, "7d": 7, "30d": 30}.get(range, 1)
+    day_from = {"24h": 1, "7d": 7, "30d": 30}.get(period, 1)
     async with db.session_scope() as s:
         base = select(func.count(User.id)).where(User.status != "deleted")
         if platform != "all":
@@ -1897,19 +1917,48 @@ async def app_settings_patch(body: AppSettingsBody, request: Request):
     return await app_settings_get(request)
 
 
+DEFAULT_PRIVACY_POLICY_FA = (
+    "🔒 سیاست حفظ حریم خصوصی هم‌چت\n\n"
+    "۱) ناشناس بودن: هویت شما هرگز به هم‌چت شما نمایش داده نمی‌شود؛ فقط نام نمایشی، "
+    "سن، جنسیت و بیوگرافی‌ای که خودتان وارد می‌کنید دیده می‌شود.\n"
+    "۲) نگهداری گفتگوها: متن گفتگوها فقط برای کنترل کیفیت، رسیدگی به گزارش‌ها و "
+    "مسدودسازی متخلفین ذخیره می‌شود و پس از پایان دوره نگهداری (پیش‌فرض ۳۰ روز) "
+    "خودکار حذف می‌گردد.\n"
+    "۳) پشتیبان‌ها: نسخه‌های پشتیبان رمزنگاری‌شده ممکن است متن گفتگوهای قدیمی‌تر را "
+    "در تاریخچه خود حفظ کنند و طبق سیاست نگهداری حذف می‌شوند.\n"
+    "۴) داده حساب: با حذف حساب، اطلاعات پروفایل و گفتگوهای شما پس از پایان دوره "
+    "مهلت تعیین‌شده حذف می‌شود.\n"
+    "۵) اشتراک‌گذاری با اشخاص ثالث: داده‌ها به هیچ شخص ثالثی فروخته یا واگذار "
+    "نمی‌شود؛ تنها پردازش‌های فنی (ارسال پیام، پرداخت) انجام می‌شود.\n"
+    "۶) گزارش و مسدودی: گزارش‌های تخلف و سوابق مربوطه برای ایمنی جامعه نگهداری "
+    "می‌شود.\n\n"
+    "با ادامه استفاده از هم‌چت، این سیاست را می‌پذیرید.")
+
+DEFAULT_RULES_FA = (
+    "📜✨ قوانین هم‌چت\n\n"
+    "۱️⃣ احترام متقابل الزامی است؛ توهین، تهدید و آزار ممنوع است 🚫\n"
+    "۲️⃣ اشتراک‌گذاری اطلاعات تماس (شماره تلفن، لینک، آیدی شبکه‌های اجتماعی) ممنوع است 📵\n"
+    "۳️⃣ محتوای غیراخلاقی، خشونت‌آمیز یا غیرقانونی ممنوع است ⛔\n"
+    "۴️⃣ ارسال اسپم و تبلیغات ناخواسته و افشای اطلاعات شخصی دیگران بدون رضایت ممنوع است 🚷\n"
+    "۵️⃣ گزارش تخلف: از دکمه «گزارش» یا دستور /report استفاده کنید 🚩\n"
+    "۶️⃣ نقض قوانین به اخطار، محدودیت موقت و سپس مسدودی تدریجی منجر می‌شود ⚠️\n\n"
+    "✅ با ادامه استفاده از ربات، این قوانین را می‌پذیرید.")
+
+
 @router.get("/settings/privacy")
 async def privacy_get(request: Request):
     await require(request, "privacy.manage")
     async with db.session_scope() as s:
         cfg = await service.get_setting(s, "privacy")
-        from .i18n import S
-        return {"privacyPolicyFa": cfg.get("privacyPolicyFa") or S["privacy_body"]["fa"],
-                "rulesFa": cfg.get("rulesFa") or S["rules_body"]["fa"],
-                "chatRetentionDays": cfg["chatRetentionDays"],
+        # v2.3.1: S["privacy_body"] was removed from i18n and crashed this
+        # endpoint (500) — use HamChat-branded defaults instead.
+        return {"privacyPolicyFa": cfg.get("privacyPolicyFa") or DEFAULT_PRIVACY_POLICY_FA,
+                "rulesFa": cfg.get("rulesFa") or DEFAULT_RULES_FA,
+                "chatRetentionDays": cfg.get("chatRetentionDays", 30),
                 "autoPurgeSchedule": "ساعتی (خودکار)",
-                "accountDeletionGraceHours": cfg["accountDeletionGraceHours"],
-                "deleteChatsOnAccountDeletion": cfg["deleteChatsOnAccountDeletion"],
-                "backupRetentionDisclosureFa": cfg["backupRetentionDisclosureFa"],
+                "accountDeletionGraceHours": cfg.get("accountDeletionGraceHours", 0),
+                "deleteChatsOnAccountDeletion": cfg.get("deleteChatsOnAccountDeletion", True),
+                "backupRetentionDisclosureFa": cfg.get("backupRetentionDisclosureFa", ""),
                 "lastPublishedAt": cfg.get("lastPublishedAt", "")}
 
 

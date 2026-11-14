@@ -139,12 +139,47 @@ async def setup_webhooks() -> None:
 
 
 async def ensure_webadmin() -> None:
-    """Create the initial Owner web-admin once; deliver credentials via the
-    delivery bot (never stored in plaintext anywhere)."""
+    """Bootstrap the Owner web-admin.
+
+    v2.3.1: credentials can be pinned via the ADMIN_PANEL_USERNAME /
+    ADMIN_PANEL_PASSWORD variables (Railway) — every startup reconciles the
+    admin account to them (create / rename / password reset). Without them
+    the legacy flow runs once: random credentials delivered by the delivery
+    bot; the plaintext password is never stored or logged."""
+    from sqlalchemy import select as _sel
     async with session_scope() as s:
-        existing = (await s.execute(
-            __import__("sqlalchemy").select(WebAdmin).limit(1))).scalar_one_or_none()
-    if existing is not None:
+        admins = list((await s.execute(
+            _sel(WebAdmin).order_by(WebAdmin.id))).scalars())
+    env_user = (settings.admin_panel_username or "").strip().lower()
+    env_pass = (settings.admin_panel_password or "").strip()
+    if env_user:
+        if env_pass and len(env_pass) < 10:
+            log.error("ADMIN_PANEL_PASSWORD is shorter than 10 chars — ignored")
+            env_pass = ""
+        first_admin_id = admins[0].id if admins else None
+        async with session_scope() as s:
+            admin = (await s.execute(
+                _sel(WebAdmin).where(WebAdmin.username == env_user))).scalar_one_or_none()
+            if admin is None:
+                admin = await s.get(WebAdmin, first_admin_id) if first_admin_id else None
+                if admin is None:
+                    s.add(WebAdmin(username=env_user, full_name="مالک هم‌چت", email="",
+                                   password_hash=security.hash_password(env_pass or "!unset!"),
+                                   role="owner", must_change_password=False, status="active"))
+                    log.info("web admin created from ADMIN_PANEL_USERNAME: %s", env_user)
+                else:
+                    log.info("web admin renamed %s -> %s", admin.username, env_user)
+                    admin.username = env_user
+            if not admin:
+                return
+            if env_pass:
+                admin.password_hash = security.hash_password(env_pass)
+                admin.must_change_password = False
+                log.info("web admin password reconciled from ADMIN_PANEL_PASSWORD: %s", env_user)
+            else:
+                log.warning("ADMIN_PANEL_PASSWORD not set — password for %s unchanged", env_user)
+        return
+    if admins:
         return
     username = security.random_username()
     password = security.random_password()
@@ -158,9 +193,8 @@ async def ensure_webadmin() -> None:
         text = ("🔐 پنل مدیریت وب هم‌چت — اطلاعات ورود اولیه\n\n"
                 f"آدرس: {panel}\nنام کاربری: <code>{username}</code>\n"
                 f"رمز عبور: <code>{password}</code>\n\n"
-                "⚠️ این رمز فقط همین یک‌بار نمایش داده می‌شود؛ در اولین ورود باید آن را تغییر دهید "
-                "و TOTP (Google Authenticator) را فعال کنید.\n"
-                "کدهای بازیابی پس از فعال‌سازی TOTP نمایش داده خواهند شد.")
+                "⚠️ این رمز فقط همین یک‌بار نمایش داده می‌شود؛ در اولین ورود باید آن را "
+                "تغییر دهید.")
         try:
             async with httpx.AsyncClient(timeout=30) as cli:
                 await cli.post(
@@ -461,8 +495,20 @@ async def bale_webhook(secret: str, request: Request):
 
 
 # admin API router
-from .webadmin import router as admin_router  # noqa: E402
+from .webadmin import router as admin_router, ApiErr  # noqa: E402
 app.include_router(admin_router)
+
+
+@app.exception_handler(ApiErr)
+async def apierr_flat_handler(request: Request, exc: ApiErr):
+    """v2.3.1: emit the error contract the panel actually reads —
+    `detail` (Persian message) and `code` at the TOP level of the body.
+    The old nested shape made the panel show its generic connection-error
+    toast for every structured server error."""
+    d = exc.detail
+    msg, code = (d.get("detail"), d.get("code")) if isinstance(d, dict) else (d, "")
+    return JSONResponse(status_code=exc.status_code,
+                        content={"detail": msg, "code": code})
 
 
 @app.get("/")

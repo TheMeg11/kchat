@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     backup_owner_telegram_id: int = 860835914
     backup_hour_tehran: int = 3
 
+    # Web-panel admin bootstrap (set as Railway variables — v2.3.1):
+    # every startup reconciles the owner account to these credentials.
+    admin_panel_username: str = ""
+    admin_panel_password: str = ""
+
     # Media relay caps (verified official limits: getFile 20MB on both platforms)
     cross_media_max_bytes: int = 20 * 1024 * 1024
     # Telegram multipart upload cap is 50MB per file; stay safely below it

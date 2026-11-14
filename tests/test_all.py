@@ -1993,3 +1993,131 @@ async def test_restore_caption_password_variants():
     assert pwd2 == "MyPass-2026" and idx2 is None and total2 is None
     pwd3, _, _ = _parse_restore_caption("", "x.enc")
     assert pwd3 is None
+
+
+# ------------------------------------------------------- v2.3.1 fixes ----
+async def _mk_admin(username: str, password: str = "InitialPass123!") -> None:
+    """Create (or reset) a dedicated owner admin for a regression test."""
+    async with db.session_scope() as s:
+        old = (await s.execute(select(WebAdmin).where(
+            WebAdmin.username == username))).scalar_one_or_none()
+        if old is not None:
+            await s.delete(old)
+        s.add(WebAdmin(username=username, full_name="Owner", email="",
+                       password_hash=security.hash_password(password),
+                       role="owner", must_change_password=False, status="active"))
+
+
+@pytest.mark.asyncio
+async def test_dashboard_metrics_range_alias():
+    """/dashboard/metrics must accept ?range=... (FE contract) and not 500 —
+    v2.3 regression: the `range` param shadowed the builtin and crashed."""
+    import httpx
+    from app.main import app
+    await _mk_admin("probe.metrics")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+        r = await cli.post("/api/admin/v1/auth/login",
+                           json={"username": "probe.metrics", "password": "InitialPass123!"})
+        assert r.status_code == 200
+        cookies = dict(r.cookies)
+        for qs in ("", "?range=24h&platform=all", "?range=7d&platform=all",
+                   "?range=30d&platform=telegram"):
+            r = await cli.get("/api/admin/v1/dashboard/metrics" + qs, cookies=cookies)
+            assert r.status_code == 200, qs
+            body = r.json()
+            assert "totalUsers" in body and "hourlyActivity" in body and "dailyGrowth" in body
+    async with db.session_scope() as s:
+        await s.execute(delete(WebAdmin).where(WebAdmin.username == "probe.metrics"))
+
+
+@pytest.mark.asyncio
+async def test_settings_privacy_default_texts():
+    """/settings/privacy must return HamChat-branded defaults without 500 —
+    v2.3 regression: S['privacy_body'] was removed from i18n (KeyError)."""
+    import httpx
+    from app.main import app
+    await _mk_admin("probe.privacy")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+        r = await cli.post("/api/admin/v1/auth/login",
+                           json={"username": "probe.privacy", "password": "InitialPass123!"})
+        assert r.status_code == 200
+        r = await cli.get("/api/admin/v1/settings/privacy", cookies=dict(r.cookies))
+        assert r.status_code == 200
+        body = r.json()
+        assert "هم‌چت" in body["privacyPolicyFa"]
+        assert body["chatRetentionDays"] == 30
+    async with db.session_scope() as s:
+        await s.execute(delete(WebAdmin).where(WebAdmin.username == "probe.privacy"))
+
+
+@pytest.mark.asyncio
+async def test_flat_error_contract():
+    """ApiErr bodies must be flat (detail+code at top level) — the panel's
+    error extractor reads `detail`/`message` strings, never nested dicts."""
+    import httpx
+    from app.main import app
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+        r = await cli.post("/api/admin/v1/auth/login",
+                           json={"username": "owner.nope", "password": "WRONG"})
+        assert r.status_code == 401
+        body = r.json()
+        assert isinstance(body.get("detail"), str) and body["detail"]
+        assert body.get("code") == "INVALID_CREDENTIALS"
+
+
+@pytest.mark.asyncio
+async def test_totp_stubs_removed_cleanly():
+    """Retired TOTP endpoints answer 410 with a clean Persian message."""
+    import httpx
+    from app.main import app
+    await _mk_admin("probe.totp")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+        r = await cli.post("/api/admin/v1/auth/login",
+                           json={"username": "probe.totp", "password": "InitialPass123!"})
+        cookies, csrf = dict(r.cookies), r.headers.get("x-csrf-token")
+        hdr = {"X-CSRF-Token": csrf} if csrf else {}
+        for p in ("/auth/verify-totp", "/auth/totp/enroll/confirm"):
+            r = await cli.post("/api/admin/v1" + p, json={}, cookies=cookies, headers=hdr)
+            assert r.status_code == 410, p
+            assert r.json()["code"] == "TOTP_REMOVED"
+    async with db.session_scope() as s:
+        await s.execute(delete(WebAdmin).where(WebAdmin.username == "probe.totp"))
+
+
+@pytest.mark.asyncio
+async def test_env_admin_credentials_reconcile(monkeypatch):
+    """ADMIN_PANEL_USERNAME/PASSWORD rename+reset the owner admin at startup
+    (Railway variables); a too-short password is ignored."""
+    from app.main import ensure_webadmin
+    monkeypatch.setattr(settings, "admin_panel_username", "envowner")
+    monkeypatch.setattr(settings, "admin_panel_password", "EnvOwnerPass123!")
+    async with db.session_scope() as s:
+        await s.execute(delete(WebAdmin).where(WebAdmin.username == "envowner"))
+        s.add(WebAdmin(username="legacy.admin", full_name="Legacy", email="",
+                       password_hash=security.hash_password("LegacyPass123!x"),
+                       role="owner", must_change_password=True, status="active"))
+    await ensure_webadmin()
+    async with db.session_scope() as s:
+        a = (await s.execute(select(WebAdmin).where(
+            WebAdmin.username == "envowner"))).scalar_one()
+        assert security.verify_password(a.password_hash, "EnvOwnerPass123!")
+        assert a.must_change_password is False and a.role == "owner"
+        assert (await s.execute(select(WebAdmin).where(
+            WebAdmin.username == "legacy.admin"))).scalar_one_or_none() is None
+        await s.delete(a)
+    # short password ignored -> previous password still valid
+    async with db.session_scope() as s:
+        s.add(WebAdmin(username="envowner", full_name="Keep", email="",
+                       password_hash=security.hash_password("KeepPass123!x"),
+                       role="owner", must_change_password=True, status="active"))
+    monkeypatch.setattr(settings, "admin_panel_password", "short")
+    await ensure_webadmin()
+    async with db.session_scope() as s:
+        a = (await s.execute(select(WebAdmin).where(
+            WebAdmin.username == "envowner"))).scalar_one()
+        assert security.verify_password(a.password_hash, "KeepPass123!x")
+        await s.execute(delete(WebAdmin).where(WebAdmin.username == "envowner"))
