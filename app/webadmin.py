@@ -54,7 +54,10 @@ def app_user(u: User) -> dict:
         "id": str(u.id), "publicId": u.public_id, "displayName": u.display_name,
         "username": u.username or "", "platform": u.platform,
         "platformUserId": u.platform_user_id, "gender": u.gender, "age": u.age,
-        "ageGroup": "13-17" if u.age < 18 else "18-60", "city": u.city,
+        # v2.3.3: age 0 = registration never completed (row created on the very
+        # first message) — its own category instead of the bogus "13-17".
+        "ageGroup": "incomplete" if u.age == 0 else ("13-17" if u.age < 18 else "18-60"),
+        "city": u.city,
         "language": u.language,
         "status": {"banned": "temp_banned"}.get(u.status, u.status if u.status != "banned" else "temp_banned"),
         "online": (utcnow() - u.last_seen_at).total_seconds() < 300,
@@ -352,6 +355,15 @@ async def dashboard_metrics(request: Request, period: str = Query("24h", alias="
         if platform != "all":
             base = base.where(User.platform == platform)
         total = (await s.execute(base)).scalar()
+        # v2.3.3: incomplete signups — age 0 means the birthdate step was never
+        # reached (row is created on the user's very first message). These stay
+        # inside totalUsers; this is only an extra breakdown, not a separate
+        # exclusion.
+        inc_base = select(func.count(User.id)).where(User.age == 0,
+                                                     User.status != "deleted")
+        if platform != "all":
+            inc_base = inc_base.where(User.platform == platform)
+        incomplete = (await s.execute(inc_base)).scalar()
         tg = (await s.execute(select(func.count(User.id)).where(User.platform == "telegram"))).scalar()
         bal = (await s.execute(select(func.count(User.id)).where(User.platform == "bale"))).scalar()
         online = (await s.execute(select(func.count(User.id)).where(
@@ -433,6 +445,7 @@ async def dashboard_metrics(request: Request, period: str = Query("24h", alias="
             {"category": "رسانه غیرمجاز", "count": 0},
             {"category": "گزارش کاربران", "count": (await s.execute(select(func.count(Report.id)))).scalar()}]
     return {"totalUsers": total, "dau": dau, "wau": wau, "mau": mau, "onlineUsers": online,
+            "incompleteSignups": incomplete,
             "searchingUsers": searching, "activeChats": active_chats, "chatsPerHour": chats_hr,
             "messagesPerHour": msgs_hr, "newRegistrations24h": new_reg, "telegramUsers": tg,
             "baleUsers": bal, "revenueToman30d": toman, "revenueStars30d": stars,
@@ -474,6 +487,13 @@ async def list_users(request: Request, platform: str = "", status: str = "", q: 
         query = select(User).order_by(User.id.desc()).limit(500)
         if platform:
             query = query.where(User.platform == platform)
+        # v2.3.3: the declared-but-never-wired status filter now works; the
+        # special value "incomplete" selects users with age 0 (registration
+        # never completed — see app_user ageGroup).
+        if status == "incomplete":
+            query = query.where(User.age == 0)
+        elif status:
+            query = query.where(User.status == status)
         if q:
             query = query.where((User.public_id == q.upper()) | (User.display_name.ilike(f"%{q}%")) |
                                 (User.platform_user_id == q))

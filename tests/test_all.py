@@ -2121,3 +2121,41 @@ async def test_env_admin_credentials_reconcile(monkeypatch):
             WebAdmin.username == "envowner"))).scalar_one()
         assert security.verify_password(a.password_hash, "KeepPass123!x")
         await s.execute(delete(WebAdmin).where(WebAdmin.username == "envowner"))
+
+
+# ---------------------------------------------------- v2.3.3 incomplete ----
+@pytest.mark.asyncio
+async def test_incomplete_signup_category():
+    """Age 0 = registration never completed: users must appear in the new
+    'incomplete' category (ageGroup), the dashboard breakdown, and the
+    /users?status=incomplete filter — while totalUsers stays unchanged."""
+    import httpx
+    from app.main import app
+    await _mk_admin("probe.inc")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+        r = await cli.post("/api/admin/v1/auth/login",
+                           json={"username": "probe.inc", "password": "InitialPass123!"})
+        cookies = dict(r.cookies)
+        async with db.session_scope() as s:
+            s.add(User(platform="telegram", platform_user_id="inc-1",
+                       display_name="Abandoned", age=0, gender="male", status="active"))
+            s.add(User(platform="telegram", platform_user_id="inc-2",
+                       display_name="Registered", age=25, gender="male", status="active"))
+        r = await cli.get("/api/admin/v1/dashboard/metrics", cookies=cookies)
+        body = r.json()
+        assert r.status_code == 200 and "incompleteSignups" in body
+        before_total = body["totalUsers"]
+        assert body["incompleteSignups"] >= 1
+        r = await cli.get("/api/admin/v1/users?status=incomplete", cookies=cookies)
+        assert r.status_code == 200
+        users = r.json()
+        assert all(u["age"] == 0 and u["ageGroup"] == "incomplete" for u in users)
+        assert any(u["displayName"] == "Abandoned" for u in users)
+        r = await cli.get("/api/admin/v1/users?status=active", cookies=cookies)
+        assert all(u["age"] != 0 or u["ageGroup"] == "incomplete" for u in r.json())
+        r = await cli.get("/api/admin/v1/dashboard/metrics", cookies=cookies)
+        assert r.json()["totalUsers"] == before_total  # totals unchanged
+    async with db.session_scope() as s:
+        await s.execute(delete(User).where(User.platform_user_id.in_(["inc-1", "inc-2"])))
+        await s.execute(delete(WebAdmin).where(WebAdmin.username == "probe.inc"))
