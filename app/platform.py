@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from typing import Any, Optional
 
 import httpx
@@ -52,10 +53,20 @@ class BaseAdapter:
     api_base = ""
     file_base = ""
 
+    # v2.2 (item 5): outbound send throttling so the bot never trips the API
+    # rate limits (Telegram: ~30 msg/s global, Bale similar). Messages to the
+    # same chat are spaced out, and after a 429 EVERY send waits for retry_after.
+    rate_per_sec: float = 25.0        # conservative global sends/second cap
+    min_chat_interval: float = 0.5    # seconds between sends to the same chat
+
     def __init__(self, token: str):
         self.token = token
         self._client: Optional[httpx.AsyncClient] = None
         self._locks: dict[str, asyncio.Lock] = {}
+        self._throttle_lock = asyncio.Lock()
+        self._send_history: deque = deque()          # monotonic timestamps
+        self._last_per_chat: dict[str, float] = {}
+        self._cooldown_until = 0.0                   # global 429 cooldown
 
     async def client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -63,6 +74,28 @@ class BaseAdapter:
             # calls must fail fast so startup and schedulers never block.
             self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=8.0))
         return self._client
+
+    async def _throttle(self, chat_id) -> None:
+        """Reserve a send slot: global sliding window + per-chat spacing +
+        global 429 cooldown (item 5)."""
+        while True:
+            wait = 0.0
+            async with self._throttle_lock:
+                now = time.monotonic()
+                wait = self._cooldown_until - now
+                while self._send_history and now - self._send_history[0] > 1.0:
+                    self._send_history.popleft()
+                if len(self._send_history) >= self.rate_per_sec:
+                    wait = max(wait, 1.0 - (now - self._send_history[0]))
+                last = self._last_per_chat.get(str(chat_id))
+                if last is not None:
+                    wait = max(wait, self.min_chat_interval - (now - last))
+                if wait <= 0:
+                    # reserve the slot now so concurrent callers queue up fairly
+                    self._send_history.append(now)
+                    self._last_per_chat[str(chat_id)] = now
+                    return
+            await asyncio.sleep(min(max(wait, 0.01), 1.0))
 
     async def close(self):
         if self._client and not self._client.is_closed:
@@ -104,7 +137,11 @@ class BaseAdapter:
             if err_code == 429 and attempt < MAX_RETRIES:
                 params = body.get("parameters") or {}
                 retry = min(float(params.get("retry_after", 5)), 60.0)
-                log.warning("429 on %s.%s retry after %ss", self.platform, method, retry)
+                # v2.2: pause EVERY send on this adapter until retry_after passes
+                self._cooldown_until = max(self._cooldown_until,
+                                           time.monotonic() + retry)
+                log.warning("429 on %s.%s — global send cooldown %ss",
+                            self.platform, method, retry)
                 await asyncio.sleep(retry + 0.2)
                 continue
             if err_code in RETRYABLE and attempt < MAX_RETRIES:
@@ -117,6 +154,7 @@ class BaseAdapter:
     async def send_message(self, chat_id: int | str, text: str,
                            keyboard: Optional[list[list[dict]]] = None,
                            reply_to: Optional[int] = None) -> dict:
+        await self._throttle(chat_id)
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text[:4096]}
         if keyboard:
             payload["reply_markup"] = {"inline_keyboard": keyboard}
@@ -126,6 +164,7 @@ class BaseAdapter:
 
     async def edit_message(self, chat_id: int | str, message_id: int, text: str,
                            keyboard: Optional[list[list[dict]]] = None) -> Any:
+        await self._throttle(chat_id)
         payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text[:4096]}
         if keyboard:
             payload["reply_markup"] = {"inline_keyboard": keyboard}
@@ -146,6 +185,7 @@ class BaseAdapter:
                          reply_to: Optional[int] = None, extra: Optional[dict] = None) -> dict:
         if msg_type not in MEDIA_SEND:
             raise UnsupportedMethod(msg_type, "media type not supported by adapter")
+        await self._throttle(chat_id)
         method = MEDIA_SEND[msg_type]
         payload: dict[str, Any] = {"chat_id": chat_id}
         if caption:
@@ -200,6 +240,7 @@ class BaseAdapter:
     async def send_invoice(self, chat_id: int | str, title: str, description: str,
                            payload: str, prices: list[dict],
                            provider_token: str = "") -> dict:
+        await self._throttle(chat_id)
         raise NotImplementedError
 
     async def refund_payment(self, user_id: int, charge_id: str) -> Any:
@@ -247,6 +288,7 @@ class TelegramAdapter(BaseAdapter):
 
     async def send_message(self, chat_id, text, keyboard=None, reply_to=None):
         # Telegram supports HTML parse_mode.
+        await self._throttle(chat_id)
         import html as _h
         payload = {"chat_id": chat_id, "text": _h.escape(text)[:4096], "parse_mode": "HTML"}
         if keyboard:
@@ -267,6 +309,7 @@ class TelegramAdapter(BaseAdapter):
                                          reply_to=reply_to, extra=extra)
 
     async def send_sticker(self, chat_id: int | str, file_id: str) -> dict:
+        await self._throttle(chat_id)
         return await self.call("sendSticker", {"chat_id": chat_id, "sticker": file_id})
 
     async def set_webhook(self, url: str) -> Any:
