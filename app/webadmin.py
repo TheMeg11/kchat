@@ -397,9 +397,13 @@ async def dashboard_metrics(request: Request, period: str = Query("24h", alias="
                 Chat.started_at >= t0, Chat.started_at < t1))).scalar()
             ms = (await s.execute(select(func.count(ChatMessage.id)).where(
                 ChatMessage.created_at >= t0, ChatMessage.created_at < t1))).scalar()
+            # v2.3.2: join Chat explicitly — Postgres rejects the old ON clause
+            # that referenced chats without them in FROM (sqlite tolerated it).
             tg_m = (await s.execute(select(func.count(ChatMessage.id)).join(
-                User, (User.id == Chat.user_a_id)).where(
-                Chat.started_at >= t0, Chat.started_at < t1, User.platform == "telegram"))).scalar()
+                Chat, Chat.id == ChatMessage.chat_id).join(
+                User, User.id == Chat.user_a_id).where(
+                Chat.started_at >= t0, Chat.started_at < t1,
+                User.platform == "telegram"))).scalar()
             hourly.append({"hour": t0.strftime("%H:00"), "chats": ch, "messages": ms,
                            "telegram": tg_m, "bale": max(ch - tg_m, 0)})
         daily = []
