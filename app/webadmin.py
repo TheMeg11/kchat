@@ -753,9 +753,12 @@ async def list_reports(request: Request):
                              "platform": target.platform if target else "?",
                              "uniqueReports24h": uniq,
                              "previousViolations": target.ban_count if target else 0},
-                "reason": r.reason if r.reason in ("harassment", "spam", "inappropriate_media",
-                                                   "external_link", "underage_suspicion", "fraud")
-                          else "harassment",
+                # v2.2: user-chosen reasons (bad_name/abuse/spam/other) + legacy values
+                "reason": r.reason if r.reason in ("bad_name", "abuse", "spam", "other",
+                                                   "harassment", "inappropriate_media",
+                                                   "external_link", "underage_suspicion",
+                                                   "fraud", "anon_message")
+                          else "other",
                 "details": r.details, "status": r.status,
                 "autoBanTriggered": r.auto_ban_triggered, "createdAt": iso(r.created_at),
                 "resolvedBy": r.resolved_by or "", "resolvedAt": iso(r.resolved_at)})
@@ -1013,6 +1016,7 @@ async def economy_all(request: Request):
     await require(request, "economy.view")
     async with db.session_scope() as s:
         eco = await service.get_setting(s, "economy")
+        store = await service.get_setting(s, "store")
         txns = (await s.execute(select(CoinTransaction).order_by(
             CoinTransaction.id.desc()).limit(300))).scalars()
         users = (await s.execute(select(User).order_by(User.id.desc()).limit(300))).scalars()
@@ -1021,6 +1025,11 @@ async def economy_all(request: Request):
                            "dailyBonus": eco["dailyBonus"],
                            "genderFilterMatchCost": eco["genderFilterMatchCost"],
                            "referralRewardPerParty": eco["referralRewardPerParty"],
+                           # v2.2: coin-store conversion rates (changeable)
+                           "tomanPerCoin": store.get("tomanPerCoin", 500),
+                           "coinsPerStar": store.get("coinsPerStar", 20),
+                           "customMinCoins": store.get("customMinCoins", 10),
+                           "customMaxCoins": store.get("customMaxCoins", 5000),
                            "updatedAt": eco.get("updatedAt") or "",
                            "updatedBy": eco.get("updatedBy") or "system"},
                 "transactions": [coin_txn(t, umap.get(t.user_id)) for t in txns],
@@ -1033,6 +1042,10 @@ class EconomyBody(BaseModel):
     dailyBonus: int
     genderFilterMatchCost: int
     referralRewardPerParty: int
+    tomanPerCoin: int | None = None
+    coinsPerStar: int | None = None
+    customMinCoins: int | None = None
+    customMaxCoins: int | None = None
 
 
 @router.put("/economy/config")
@@ -1040,20 +1053,34 @@ async def economy_update(body: EconomyBody, request: Request):
     admin, _ = await require(request, "economy.configure")
     async with db.session_scope() as s:
         eco = await service.get_setting(s, "economy")
-        eco.update(body.model_dump())
+        store = await service.get_setting(s, "store")
+        eco.update(body.model_dump(exclude_none=True, include={
+            "initialReward", "messageCost", "dailyBonus",
+            "genderFilterMatchCost", "referralRewardPerParty"}))
+        for k in ("tomanPerCoin", "coinsPerStar", "customMinCoins", "customMaxCoins"):
+            v = getattr(body, k)
+            if v is not None and int(v) > 0:
+                store[k] = int(v)
         eco["updatedBy"] = admin.username
         eco["updatedAt"] = utcnow().isoformat()
         await service.set_setting(s, "economy", eco)
+        await service.set_setting(s, "store", store)
         await service.audit(s, actor_type="web", admin_id=admin.id, admin_name=admin.username,
                             admin_role=admin.role, action="economy.config_updated",
                             module="economy", target_type="economy_config", target_id="global",
                             ip=_ip(request),
                             details=f"ثبت‌نام:{body.initialReward} | پیام:{body.messageCost} | "
                                     f"روزانه:{body.dailyBonus} | فیلتر:{body.genderFilterMatchCost} | "
-                                    f"دعوت:{body.referralRewardPerParty}")
+                                    f"دعوت:{body.referralRewardPerParty} | "
+                                    f"تومان/سکه:{store.get('tomanPerCoin')} | "
+                                    f"سکه/استارز:{store.get('coinsPerStar')}")
         return {"initialReward": eco["initialReward"], "messageCost": eco["messageCost"],
                 "dailyBonus": eco["dailyBonus"], "genderFilterMatchCost": eco["genderFilterMatchCost"],
                 "referralRewardPerParty": eco["referralRewardPerParty"],
+                "tomanPerCoin": store.get("tomanPerCoin", 500),
+                "coinsPerStar": store.get("coinsPerStar", 20),
+                "customMinCoins": store.get("customMinCoins", 10),
+                "customMaxCoins": store.get("customMaxCoins", 5000),
                 "updatedAt": eco["updatedAt"], "updatedBy": eco["updatedBy"]}
 
 

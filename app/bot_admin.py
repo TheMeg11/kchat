@@ -195,9 +195,12 @@ async def admin_callback(user: User, data: str, chat_id) -> None:
             pkgs = (await s.execute(select(StorePackage).order_by(StorePackage.coins))).scalars()
             lines = [f"🪙 {p.coins} سکه → ⭐{p.telegram_stars_price} | {p.bale_toman_price:,} تومان "
                      f"({'فعال' if p.active else 'غیرفعال'})" for p in pkgs]
-        await _say(user, "🛒 قیمت‌های فروشگاه (قاعده: هر ۱۰۰ سکه = ۵۰٫۰۰۰ تومان = ۵ استارز):\n\n"
+            store = await service.get_setting(s, "store")
+        await _say(user, "🛒 قیمت‌های فروشگاه (نرخ جاری: هر سکه = "
+                        f"{store.get('tomanPerCoin', 500):,} تومان | هر ⭐ استارز = "
+                        f"{store.get('coinsPerStar', 20)} سکه):\n\n"
                         + "\n".join(lines) +
-                        "\n\n✏️ تغییر قیمت بسته‌ها از پنل وب انجام می‌شود.",
+                        "\n\n✏️ تغییر نرخ‌ها و قیمت بسته‌ها از پنل وب انجام می‌شود.",
                    keyboard=kb([[btn("🏠 بازگشت به منوی اصلی", "back_home")]]))
         return
 
