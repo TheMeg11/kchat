@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets as pysecrets
 from contextlib import asynccontextmanager
 
@@ -29,7 +30,30 @@ SESSION_COOKIE = "kanar_admin_session"
 
 
 # ------------------------------------------------------------- startup ----
+def ensure_persistent_database() -> None:
+    """v2.2 (item 8): protect production data across Railway deploys.
+
+    Railway recycles the container filesystem on every deploy, so a local
+    SQLite file would be silently WIPED each time. When a Railway environment
+    is detected and no Postgres DATABASE_URL is configured, boot must FAIL
+    LOUDLY instead of starting with a throwaway database.
+    """
+    on_railway = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"))
+    if on_railway and not settings.database_url.startswith("postgres"):
+        raise RuntimeError(
+            "DATA SAFETY: running on Railway without a PostgreSQL DATABASE_URL. "
+            "A local SQLite file would be erased on every deploy. Attach the "
+            "Railway Postgres service (DATABASE_URL is injected automatically) "
+            "and redeploy. Set ALLOW_SQLITE_ON_RAILWAY=1 only for throwaway "
+            "test deployments.")
+    if on_railway and os.getenv("ALLOW_SQLITE_ON_RAILWAY") == "1" \
+            and not settings.database_url.startswith("postgres"):
+        log.warning("ALLOW_SQLITE_ON_RAILWAY=1 — ephemeral SQLite in use; "
+                    "ALL DATA WILL BE LOST ON THE NEXT DEPLOY.")
+
+
 async def init_app() -> None:
+    ensure_persistent_database()
     db.init_engine(settings.database_url)
     engine = db.get_engine()
     await db.create_all(engine)
@@ -49,6 +73,21 @@ async def init_app() -> None:
     await ensure_webadmin()
     await setup_commands()
     await setup_webhooks()
+    await log_database_summary()
+
+
+async def log_database_summary() -> None:
+    """v2.2 (item 8): startup visibility — prove the persistent DB was kept."""
+    from sqlalchemy import func
+    try:
+        async with session_scope() as s:
+            users = (await s.execute(select(func.count(User.id)))).scalar() or 0
+            msgs = (await s.execute(select(func.count(Chat.id)))).scalar() or 0
+        log.info("database OK (%s) — users: %d, chat rows: %d — data persisted "
+                 "across deploys", "Postgres" if db.get_engine().dialect.name ==
+                 "postgresql" else db.get_engine().url.drivername, users, msgs)
+    except Exception:
+        log.exception("database summary failed")
 
 
 async def setup_commands() -> None:
