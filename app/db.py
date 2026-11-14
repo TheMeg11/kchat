@@ -67,7 +67,7 @@ class User(Base):
     birth_year: Mapped[Optional[int]] = mapped_column(Integer, default=None)      # gregorian year
     birth_month: Mapped[Optional[int]] = mapped_column(Integer, default=None)     # 1-12
     birth_day: Mapped[Optional[int]] = mapped_column(Integer, default=None)       # 1-31
-    birth_calendar: Mapped[Optional[str]] = mapped_column(String(8), default=None)  # jalali|gregorian
+    birth_calendar: Mapped[Optional[str]] = mapped_column(String(16), default=None)  # jalali|gregorian
     birthday_rewarded: Mapped[bool] = mapped_column(Boolean, default=False)
     # --- anonymous link & account linking (v2) ---
     anon_link_code: Mapped[Optional[str]] = mapped_column(String(16), default=None, unique=True)
@@ -601,3 +601,33 @@ def _sync_columns(sync_conn, table: str) -> set:
     from sqlalchemy import inspect as _inspect
     insp = _inspect(sync_conn)
     return {c["name"] for c in insp.get_columns(table)}
+
+
+# ---- v2.4.1 column widening (Postgres-only, idempotent) ---------------------
+# SQLite does not enforce VARCHAR lengths, so overflows only surface on
+# production Postgres: "gregorian" (9 chars) did not fit VARCHAR(8) and every
+# Gregorian-calendar registration crashed mid-transaction with
+# StringDataRightTruncationError, leaving the signup FSM stuck on the
+# birth-confirmation step (each retry re-prompted — the "message flood").
+_WIDEN_COLUMNS: list[tuple[str, str, int]] = [
+    ("users", "birth_calendar", 16),
+]
+
+
+async def ensure_widened_columns(engine) -> list[str]:
+    """Widen VARCHAR columns created too narrow by older versions (v2.4.1)."""
+    from sqlalchemy import text
+    widened: list[str] = []
+    if engine.dialect.name != "postgresql":
+        return widened
+    async with engine.begin() as conn:
+        for table, col, width in _WIDEN_COLUMNS:
+            row = (await conn.execute(text(
+                "SELECT character_maximum_length FROM information_schema.columns "
+                "WHERE table_name = :t AND column_name = :c"),
+                {"t": table, "c": col})).first()
+            if row and row[0] is not None and row[0] < width:
+                await conn.execute(text(
+                    f"ALTER TABLE {table} ALTER COLUMN {col} TYPE VARCHAR({width})"))
+                widened.append(f"{table}.{col}: varchar({row[0]}) -> varchar({width})")
+    return widened

@@ -2598,3 +2598,38 @@ async def test_signup_funnel_and_stateless_csrf():
         r = await cli.get("/api/admin/v1/users")
         assert r.status_code == 200 and "botBlocked" in r.json()[0]
     wa._login_attempts.clear()
+
+
+# ------------------------------------------------- v2.4.1 incident fixes ----
+@pytest.mark.asyncio
+async def test_birth_calendar_column_fits_gregorian():
+    """v2.4.1 hotfix: users.birth_calendar was VARCHAR(8) while the value
+    'gregorian' needs 9 chars — on production Postgres every Gregorian-calendar
+    registration crashed with StringDataRightTruncationError (SQLite ignores
+    VARCHAR lengths, so tests never caught it) and the signup FSM got stuck,
+    re-prompting forever (the observed message flood)."""
+    col = User.__table__.columns["birth_calendar"]
+    assert (col.type.length or 0) >= len("gregorian") + 7  # 16 with headroom
+    # the widening migration is a no-op on non-postgres engines
+    assert await db.ensure_widened_columns(db.get_engine()) == []
+
+
+@pytest.mark.asyncio
+async def test_bot_echo_updates_are_ignored(adapters):
+    """v2.4.1 hotfix: some Bot-API implementations (Bale included) can echo the
+    bot's own outgoing messages back as updates. The bot must never process
+    them, or it answers itself in an unbounded loop at the throttle ceiling."""
+    from app import bot as bot_mod
+    tg, bale = adapters
+    await bot_mod.process_update("bale", {"update_id": 990001, "message": {
+        "message_id": 1, "chat": {"id": 55555},
+        "from": {"id": 55555, "is_bot": True, "first_name": "EchoBot"},
+        "text": "/start"}})
+    await bot_mod.process_update("bale", {"update_id": 990002, "callback_query": {
+        "id": "echo1", "from": {"id": 55555, "is_bot": True},
+        "message": {"chat": {"id": 55555}}, "data": "bage_ok"}})
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(
+            User.platform == "bale", User.platform_user_id == "55555"))).scalar_one_or_none()
+    assert u is None                      # no ghost user for the bot itself
+    assert not bale.sent                  # and not a single outgoing message

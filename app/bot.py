@@ -2296,6 +2296,16 @@ async def process_update(platform: str, upd: dict) -> None:
     uid = upd.get("update_id")
     if uid is None:
         return
+    # Platform echo guard: some Bot-API implementations (notably Bale) can
+    # re-deliver the bot's own outgoing messages as updates. Without this the
+    # bot answers itself and every reply echoes into another update — an
+    # unbounded self-conversation at the send-throttle ceiling. No legitimate
+    # user update ever carries is_bot=True.
+    _frm = ((upd.get("message") or upd.get("edited_message") or {}).get("from")
+            or (upd.get("callback_query") or {}).get("from")
+            or (upd.get("pre_checkout_query") or {}).get("from") or {})
+    if _frm.get("is_bot"):
+        return
     async with session_scope() as s:
         from .db import ProcessedUpdate
         try:

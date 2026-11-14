@@ -60,6 +60,9 @@ async def init_app() -> None:
     added = await db.ensure_added_columns(engine)
     if added:
         log.info("v2.4 column migration applied: %s", ", ".join(added))
+    widened = await db.ensure_widened_columns(engine)
+    if widened:
+        log.info("v2.4.1 column widening applied: %s", ", ".join(widened))
     async with session_scope() as s:
         await service.seed(s)
     # STABLE webhook path secret: derived from WEBHOOK_SECRET so redeploys never
@@ -566,6 +569,26 @@ async def spa(full_path: str):
 def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx logs every request URL at INFO, and Bot-API request URLs carry the
+    # full bot token (/bot<token>/method) — redact it so tokens never reach the
+    # platform log storage (Railway keeps deployment logs indefinitely).
+    import re as _re
+
+    class _RedactBotTokens(logging.Filter):
+        _rx = _re.compile(r"/bot[^/\s]+/")
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                text = record.getMessage()
+            except Exception:
+                return True
+            if "/bot" in text:
+                record.msg = self._rx.sub("/bot***:REDACTED/", text)
+                record.args = ()
+            return True
+
+    for _name in ("httpx", "httpcore"):
+        logging.getLogger(_name).addFilter(_RedactBotTokens())
     uvicorn.run("app.main:app", host="0.0.0.0", port=settings.port,
                 log_level="info", access_log=False)
 
