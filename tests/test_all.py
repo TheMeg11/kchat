@@ -112,31 +112,39 @@ _UPD_SEQ = [100000]
 
 
 async def register_via_bot(adapters, platform, pid, name, age, gender):
+    """v2.2 registration: name -> birthdate (calendar -> year -> month -> day
+    inline buttons) -> age confirmation -> gender. The birthdate is chosen so
+    the computed age equals `age` exactly (gregorian, birthday = today)."""
     from app import bot as bot_mod
+    import datetime as _dt
     upd_id = _UPD_SEQ
 
     def upd(**kw):
         upd_id[0] += 1
         return {"update_id": upd_id[0], **kw}
 
+    today = _dt.date.today()
+    year = today.year - age
+
+    def cq(cq_id, data):
+        return bot_mod.process_update(platform, upd(callback_query={
+            "id": cq_id, "from": {"id": int(pid)},
+            "message": {"chat": {"id": int(pid)}}, "data": data}))
+
     await bot_mod.process_update(platform, upd(message={
         "message_id": 1, "chat": {"id": int(pid)},
         "from": {"id": int(pid), "first_name": name}, "text": "/start"}))
-    await bot_mod.process_update(platform, upd(callback_query={
-        "id": "cq1", "from": {"id": int(pid)},
-        "message": {"chat": {"id": int(pid)}}, "data": "lang_fa"}))
-    await bot_mod.process_update(platform, upd(callback_query={
-        "id": "cq2", "from": {"id": int(pid)},
-        "message": {"chat": {"id": int(pid)}}, "data": "accept_rules"}))
+    await cq("cq1", "lang_fa")
+    await cq("cq2", "accept_rules")
     await bot_mod.process_update(platform, upd(message={
         "message_id": 2, "chat": {"id": int(pid)},
         "from": {"id": int(pid)}, "text": name}))
-    await bot_mod.process_update(platform, upd(message={
-        "message_id": 3, "chat": {"id": int(pid)},
-        "from": {"id": int(pid)}, "text": str(age)}))
-    await bot_mod.process_update(platform, upd(callback_query={
-        "id": "cq3", "from": {"id": int(pid)},
-        "message": {"chat": {"id": int(pid)}}, "data": f"reg_{gender}"}))
+    await cq("cq3", "bcal_gregorian")
+    await cq("cq4", f"byear_{year}")
+    await cq("cq5", f"bmon_{today.month}")
+    await cq("cq6", f"bday_{today.day}")
+    await cq("cq7", "bage_ok")
+    await cq("cq8", f"reg_{gender}")
 
 
 # ================================================================ tests ====
@@ -147,10 +155,10 @@ async def test_registration_flow_and_reward(adapters):
     async with db.session_scope() as s:
         u = (await s.execute(select(User).where(User.platform_user_id == "501"))).scalar_one()
         assert u.display_name == "Ali" and u.age == 25 and u.language == "fa"
-        assert u.coin_balance == 20  # registration reward
+        assert u.coin_balance == 30  # 20 welcome + 10 birthdate reward
         txns = (await s.execute(select(CoinTransaction).where(
             CoinTransaction.user_id == u.id))).scalars()
-        assert len(list(txns)) == 1
+        assert len(list(txns)) == 2
     # idempotency: re-trigger cannot double-reward (flag + unique key)
     assert service.credit.__name__ == "credit"
 
@@ -170,24 +178,19 @@ async def test_registration_validation(adapters):
     async with db.session_scope() as s:
         u = (await s.execute(select(User).where(User.platform_user_id == "77"))).scalar_one()
         assert u.state["step"] == "name"  # still waiting
+    # offensive display name (item 1) — rejected, still waiting
     await bot_mod.process_update("telegram", {"update_id": 5, "message": {
-        "message_id": 3, "chat": {"id": 77}, "from": {"id": 77}, "text": "Good Name"}})
-    # bad age
+        "message_id": 3, "chat": {"id": 77}, "from": {"id": 77}, "text": "kos"}})
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "77"))).scalar_one()
+        assert u.state["step"] == "name" and u.display_name != "kos"
+    # good name -> birthdate calendar selection (v2.2 item 4)
     await bot_mod.process_update("telegram", {"update_id": 6, "message": {
-        "message_id": 4, "chat": {"id": 77}, "from": {"id": 77}, "text": "12"}})
+        "message_id": 4, "chat": {"id": 77}, "from": {"id": 77}, "text": "Good Name"}})
     async with db.session_scope() as s:
         u = (await s.execute(select(User).where(User.platform_user_id == "77"))).scalar_one()
-        assert u.state["step"] == "age"
-    await bot_mod.process_update("telegram", {"update_id": 7, "message": {
-        "message_id": 5, "chat": {"id": 77}, "from": {"id": 77}, "text": "61"}})
-    async with db.session_scope() as s:
-        u = (await s.execute(select(User).where(User.platform_user_id == "77"))).scalar_one()
-        assert u.state["step"] == "age"
-    await bot_mod.process_update("telegram", {"update_id": 8, "message": {
-        "message_id": 6, "chat": {"id": 77}, "from": {"id": 77}, "text": "17"}})
-    async with db.session_scope() as s:
-        u = (await s.execute(select(User).where(User.platform_user_id == "77"))).scalar_one()
-        assert u.state["step"] == "gender"
+        assert u.state["step"] == "birth_calendar"
+        assert u.display_name == "Good Name"
 
 
 @pytest.mark.asyncio
@@ -288,8 +291,8 @@ async def test_message_relay_and_coin_charge(adapters):
     assert any("salam dust aziz" in str(t[1]) for t in bale.sent)
     async with db.session_scope() as s:
         u = (await s.execute(select(User).where(User.platform_user_id == "821"))).scalar_one()
-        # sender had 20 (reg) -> charged 1 for the delivered message
-        assert u.coin_balance == 19
+        # sender had 30 (20 reg + 10 birthdate) -> charged 1 for the message
+        assert u.coin_balance == 29
         m = (await s.execute(select(ChatMessage))).scalar_one()
         assert m.text == "salam dust aziz" and m.msg_type == "text"
 
@@ -454,7 +457,7 @@ async def test_daily_bonus_once_per_tehran_day(adapters):
         assert got == 5
         got2 = await service.grant_daily_bonus(s, u)
         assert got2 == 0
-        assert u.coin_balance == 25
+        assert u.coin_balance == 35  # 30 + 5 daily bonus
         claims = (await s.execute(select(DailyClaim))).scalars()
         assert len(list(claims)) == 1
 
@@ -478,15 +481,20 @@ async def test_referral_reward_after_first_chat(adapters):
         "id": "cr", "from": {"id": 892}, "message": {"chat": {"id": 892}}, "data": "accept_rules"}})
     await bot_mod.process_update("telegram", {"update_id": 2003, "message": {
         "message_id": 2, "chat": {"id": 892}, "from": {"id": 892}, "text": "Referred One"}})
-    await bot_mod.process_update("telegram", {"update_id": 2004, "message": {
-        "message_id": 3, "chat": {"id": 892}, "from": {"id": 892}, "text": "20"}})
-    await bot_mod.process_update("telegram", {"update_id": 2005, "callback_query": {
+    # v2.2 registration: birthdate via inline buttons, then gender
+    import datetime as _dt
+    _today = _dt.date.today()
+    for i, data in enumerate(("bcal_gregorian", f"byear_{_today.year - 20}",
+                              f"bmon_{_today.month}", f"bday_{_today.day}", "bage_ok")):
+        await bot_mod.process_update("telegram", {"update_id": 2004 + i, "callback_query": {
+            "id": f"cb{i}", "from": {"id": 892}, "message": {"chat": {"id": 892}}, "data": data}})
+    await bot_mod.process_update("telegram", {"update_id": 2009, "callback_query": {
         "id": "cg", "from": {"id": 892}, "message": {"chat": {"id": 892}}, "data": "reg_female"}})
     # no rewards yet (no first chat)
     async with db.session_scope() as s:
         inviter = (await s.execute(select(User).where(
             User.platform_user_id == "891"))).scalar_one()
-        assert inviter.coin_balance == 20
+        assert inviter.coin_balance == 30
     # referred user completes a chat with someone
     await register_via_bot(adapters, "telegram", "893", "Stranger", 25, "male")
     for pid in ("892", "893"):
@@ -500,13 +508,13 @@ async def test_referral_reward_after_first_chat(adapters):
             User.platform_user_id == "891"))).scalar_one()
         referred = (await s.execute(select(User).where(
             User.platform_user_id == "892"))).scalar_one()
-        assert inviter.coin_balance == 40  # 20 reg + 20 referral
-        assert referred.coin_balance == 20 + 20 - 1  # reg + referral reward - message cost
+        assert inviter.coin_balance == 50  # 30 reg + 20 referral
+        assert referred.coin_balance == 30 + 20 - 1  # reg + referral reward - message cost
         ref = (await s.execute(select(Referral))).scalar_one()
         assert ref.status == "rewarded"
         # second completion must not double-reward
         await service.on_first_chat_completed(s, referred)
-        assert inviter.coin_balance == 40
+        assert inviter.coin_balance == 50
 
 
 @pytest.mark.asyncio
@@ -525,7 +533,7 @@ async def test_payments_idempotent_credit(adapters):
     await bot_mod.handle_successful_payment("telegram", sp_msg)  # duplicate must be ignored
     async with db.session_scope() as s:
         u = await s.get(User, uid)
-        assert u.coin_balance == 20 + 100
+        assert u.coin_balance == 30 + 100
         pays = list((await s.execute(select(Payment))).scalars())
         assert len(pays) == 1
         txns = list((await s.execute(select(CoinTransaction).where(
@@ -554,8 +562,8 @@ async def test_failed_delivery_refund(adapters):
         "message_id": 3, "chat": {"id": 911}, "from": {"id": 911}, "text": "will fail"}})
     async with db.session_scope() as s:
         u = (await s.execute(select(User).where(User.platform_user_id == "911"))).scalar_one()
-        # charged 1, delivery failed, refunded 1 => back to 20
-        assert u.coin_balance == 20
+        # charged 1, delivery failed, refunded 1 => back to 30
+        assert u.coin_balance == 30
         refund = (await s.execute(select(CoinTransaction).where(
             CoinTransaction.type == "refund"))).scalar_one()
         assert refund.amount == 1
@@ -624,28 +632,44 @@ async def test_account_deletion_via_service(adapters):
 # ---------------------------------------------------- v2 features tests ----
 @pytest.mark.asyncio
 async def test_anon_link_flow(adapters):
-    """/link: owner gets a link; a stranger can send an anonymous message via it."""
+    """/link: owner gets a link; a stranger can send an anonymous message via it.
+    v2.2 (item 7): the new payload contains no '/' or '_'; legacy payloads
+    ("msg_<code>") keep working."""
     from app import bot as bot_mod
     await register_via_bot(adapters, "telegram", "950", "OwnerU", 25, "male")
     tg, _ = adapters
     tg.sent.clear()
     await bot_mod.process_update("telegram", {"update_id": 3000, "message": {
         "message_id": 1, "chat": {"id": 950}, "from": {"id": 950}, "text": "/link"}})
-    # link text sent
-    assert any("msg_" in str(t[1]) for t in tg.sent)
+    # link text sent — v2.2 clean payload (no '/' or '_' in the start parameter)
+    payloads = []
+    for t in tg.sent:
+        txt = str(t[1])
+        if "start=" in txt:
+            payloads.append(txt.split("start=")[1].split()[0])
+    assert payloads, payloads
+    assert all("_" not in p and "/" not in p for p in payloads)
     async with db.session_scope() as s:
         owner = (await s.execute(select(User).where(User.platform_user_id == "950"))).scalar_one()
         code = owner.anon_link_code
-    # a NEW user starts with the anon link payload
+    # a NEW user starts with the NEW payload
     tg.sent.clear()
     await bot_mod.process_update("telegram", {"update_id": 3001, "message": {
         "message_id": 2, "chat": {"id": 951}, "from": {"id": 951, "first_name": "Stranger"},
-        "text": f"/start msg_{code}"}})
+        "text": f"/start m{code}"}})
     await bot_mod.process_update("telegram", {"update_id": 3002, "message": {
         "message_id": 3, "chat": {"id": 951}, "from": {"id": 951}, "text": "سلام ناشناس!"}})
     assert any("سلام ناشناس!" in str(t[1]) for t in tg.sent)  # delivered to owner (chat 950)
     delivered = [t for t in tg.sent if t[0] == "950" and "سلام ناشناس!" in str(t[1])]
     assert delivered
+    # LEGACY payload still works (old links shared before v2.2)
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 3003, "message": {
+        "message_id": 4, "chat": {"id": 952}, "from": {"id": 952, "first_name": "OldLink"},
+        "text": f"/start msg_{code}"}})
+    await bot_mod.process_update("telegram", {"update_id": 3004, "message": {
+        "message_id": 5, "chat": {"id": 952}, "from": {"id": 952}, "text": "پیام از لینک قدیمی"}})
+    assert any(t[0] == "950" and "پیام از لینک قدیمی" in str(t[1]) for t in tg.sent)
 
 
 @pytest.mark.asyncio
@@ -696,58 +720,124 @@ async def test_account_linking_removed(adapters):
         bale_user = (await s.execute(select(User).where(User.platform_user_id == "971"))).scalar_one()
         assert tg_user.linked_user_id is None      # never linked
         assert bale_user.linked_user_id is None
-        assert tg_user.coin_balance == 20           # no link reward
-        assert bale_user.coin_balance == 20
+        assert tg_user.coin_balance == 30           # no link reward
+        assert bale_user.coin_balance == 30
 
 
 @pytest.mark.asyncio
-async def test_birthday_year_month_day_flow(adapters):
-    """v2.1: birthday flow is year -> month -> day; one-time; reward paid;
-    button hidden afterwards; birthday gift grants 50 coins on the big day."""
+async def test_birthdate_registration_flow(adapters):
+    """v2.2 (item 4): registration collects year/month/day with inline buttons
+    (jalali AND gregorian), shows the computed age and asks for confirmation;
+    the profile no longer offers the birthday button; under-13 is refused."""
     from app import bot as bot_mod
     import datetime as _dt
     tg, _ = adapters
     await register_via_bot(adapters, "telegram", "980", "BdayUser", 20, "male")
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "980"))).scalar_one()
+        assert u.birth_calendar == "gregorian"
+        assert u.birth_year == _dt.date.today().year - 20
+        assert u.age == 20
+        assert u.birthday_rewarded is True
+        assert u.coin_balance == 20 + 10  # registration + birthdate reward
+    # jalali path: pick a jalali birthdate and confirm the computed age message
+    await register_via_bot(adapters, "telegram", "979", "JalaliUser", 25, "female")
+    # (register_via_bot uses gregorian; exercise the jalali branch directly)
+    await bot_mod.process_update("telegram", {"update_id": 3300, "message": {
+        "message_id": 1, "chat": {"id": 981}, "from": {"id": 981}, "text": "/start"}})
+    await bot_mod.process_update("telegram", {"update_id": 3301, "callback_query": {
+        "id": "cb1", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": "lang_fa"}})
+    await bot_mod.process_update("telegram", {"update_id": 3302, "callback_query": {
+        "id": "cb2", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": "accept_rules"}})
+    await bot_mod.process_update("telegram", {"update_id": 3303, "message": {
+        "message_id": 2, "chat": {"id": 981}, "from": {"id": 981}, "text": "JalaliGuy"}})
     tg.sent.clear()
-    # step 1: ask for the year
-    await bot_mod.process_update("telegram", {"update_id": 3300, "callback_query": {
-        "id": "cb", "from": {"id": 980}, "message": {"chat": {"id": 980}}, "data": "set_birthday"}})
-    assert any("سال تولد" in str(t_[1]) for t_ in tg.sent)
-    # invalid year rejected
-    await bot_mod.process_update("telegram", {"update_id": 3300.5, "message": {
-        "message_id": 1, "chat": {"id": 980}, "from": {"id": 980}, "text": "1850"}})
-    # step 2: valid jalali year -> month menu
+    await bot_mod.process_update("telegram", {"update_id": 3304, "callback_query": {
+        "id": "cb3", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": "bcal_jalali"}})
+    assert any("سال" in str(t_[1]) for t_ in tg.sent)  # year page shown
+    import datetime as _dt
     today = _dt.date.today()
     jy, _jm, _jd = service.gregorian_to_jalali(today.year, today.month, today.day)
-    await bot_mod.process_update("telegram", {"update_id": 3301, "message": {
-        "message_id": 2, "chat": {"id": 980}, "from": {"id": 980}, "text": str(jy - 20)}})
-    assert any("ماه" in str(t_[1]) for t_ in tg.sent)
-    # step 3: month 7 (مهر) -> day question
-    await bot_mod.process_update("telegram", {"update_id": 3302, "callback_query": {
-        "id": "cm", "from": {"id": 980}, "message": {"chat": {"id": 980}}, "data": "bmon_7"}})
-    # step 4: day 15 -> saved + reward + warning shown
-    tg.sent.clear()
-    await bot_mod.process_update("telegram", {"update_id": 3303, "message": {
-        "message_id": 3, "chat": {"id": 980}, "from": {"id": 980}, "text": "15"}})
-    async with db.session_scope() as s:
-        u = (await s.execute(select(User).where(User.platform_user_id == "980"))).scalar_one()
-        assert u.birth_calendar == "jalali"
-        assert u.birthday_rewarded is True
-        assert u.coin_balance == 20 + 10  # registration + birthday reward
-        expected_age = service.compute_age_from_birthday(u.birth_year, u.birth_month, u.birth_day)
-        assert 13 <= expected_age <= 60
-        saved_year = u.birth_year
+    await bot_mod.process_update("telegram", {"update_id": 3305, "callback_query": {
+        "id": "cb4", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": f"byear_{jy - 25}"}})
+    await bot_mod.process_update("telegram", {"update_id": 3306, "callback_query": {
+        "id": "cb5", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": "bmon_7"}})
+    await bot_mod.process_update("telegram", {"update_id": 3307, "callback_query": {
+        "id": "cb6", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": "bday_15"}})
+    # confirmation asks about the computed age
     joined = "".join(str(t_[1]) for t_ in tg.sent)
-    assert "قابل تغییر نیست" in joined            # explicit warning
-    # profile no longer shows the birthday button
-    assert not any(t_[2] and any(b.get("callback_data") == "set_birthday" for b in row)
-                   for t_ in tg.sent if len(t_) > 2 for row in (t_[2] or []))
-    # second attempt via callback is a no-op (guarded)
-    await bot_mod.process_update("telegram", {"update_id": 3304, "callback_query": {
-        "id": "cx", "from": {"id": 980}, "message": {"chat": {"id": 980}}, "data": "set_birthday"}})
+    assert "سن شما" in joined and "صحیح است؟" in joined
     async with db.session_scope() as s:
-        u = (await s.execute(select(User).where(User.platform_user_id == "980"))).scalar_one()
-        assert u.birth_year == saved_year        # unchanged
+        u = (await s.execute(select(User).where(User.platform_user_id == "981"))).scalar_one()
+        assert u.state["step"] == "birth_confirm"
+    # redo -> back to the year picker; then complete via confirm
+    await bot_mod.process_update("telegram", {"update_id": 3308, "callback_query": {
+        "id": "cb7", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": "bage_redo"}})
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "981"))).scalar_one()
+        assert u.state["step"] == "birth_year" and u.birth_year is None
+    await bot_mod.process_update("telegram", {"update_id": 3309, "callback_query": {
+        "id": "cb8", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": f"byear_{jy - 25}"}})
+    await bot_mod.process_update("telegram", {"update_id": 3310, "callback_query": {
+        "id": "cb9", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": "bmon_3"}})
+    await bot_mod.process_update("telegram", {"update_id": 3311, "callback_query": {
+        "id": "cb10", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": "bday_10"}})
+    await bot_mod.process_update("telegram", {"update_id": 3312, "callback_query": {
+        "id": "cb11", "from": {"id": 981}, "message": {"chat": {"id": 981}}, "data": "bage_ok"}})
+    gy2, gm2, gd2 = service.jalali_to_gregorian(jy - 25, 3, 10)
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "981"))).scalar_one()
+        assert u.birth_calendar == "jalali"
+        assert (u.birth_year, u.birth_month, u.birth_day) == (gy2, gm2, gd2)
+        assert u.age == max(13, min(60, service.compute_age_from_birthday(
+            u.birth_year, u.birth_month, u.birth_day)))
+        assert u.state["step"] == "gender"
+    # under-13 refusal (item 4): drive the confirm step with an under-13 birthdate
+    await bot_mod.process_update("telegram", {"update_id": 3313, "message": {
+        "message_id": 3, "chat": {"id": 982}, "from": {"id": 982}, "text": "/start"}})
+    await bot_mod.process_update("telegram", {"update_id": 3314, "callback_query": {
+        "id": "cc1", "from": {"id": 982}, "message": {"chat": {"id": 982}}, "data": "lang_fa"}})
+    await bot_mod.process_update("telegram", {"update_id": 3315, "callback_query": {
+        "id": "cc2", "from": {"id": 982}, "message": {"chat": {"id": 982}}, "data": "accept_rules"}})
+    await bot_mod.process_update("telegram", {"update_id": 3316, "message": {
+        "message_id": 4, "chat": {"id": 982}, "from": {"id": 982}, "text": "KidAttempt"}})
+    await bot_mod.process_update("telegram", {"update_id": 3317, "callback_query": {
+        "id": "cc3", "from": {"id": 982}, "message": {"chat": {"id": 982}}, "data": "bcal_gregorian"}})
+    tg.sent.clear()
+    # simulate the day picker state with a birth year that yields age 12
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "982"))).scalar_one()
+        u.state = {"step": "birth_day", "calendar": "gregorian",
+                   "year": _dt.date.today().year - 12, "month": 11, "maxday": 30}
+    from app import bot as bot_mod2
+    await bot_mod2.birth_day_chosen(u, 15)
+    assert any("حداقل سن مجاز" in str(t_[1]) for t_ in tg.sent), tg.sent
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "982"))).scalar_one()
+        assert u.birth_year is None  # nothing saved
+        assert u.state["step"] == "birth_year"  # picker restarted
+
+
+@pytest.mark.asyncio
+async def test_profile_has_no_birthday_button(adapters):
+    """v2.2 (item 4): "ثبت تاریخ تولد و دریافت پاداش" is removed from the
+    profile menu; the language switch lives there instead (item 7)."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "983", "ProfB", 25, "male")
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 500400, "callback_query": {
+        "id": "pp", "from": {"id": 983}, "message": {"chat": {"id": 983}}, "data": "profile"}})
+    kb_all = [t_[2] for t_ in tg.sent if t_[2]]
+    datas = {b.get("callback_data") for k in kb_all for r in k for b in r}
+    assert "set_birthday" not in datas
+    assert "language" in datas          # language moved into the profile
+    # legacy old keyboards pressing set_birthday are answered with the profile
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 500401, "callback_query": {
+        "id": "pp2", "from": {"id": 983}, "message": {"chat": {"id": 983}}, "data": "set_birthday"}})
+    joined = "".join(str(t_[1]) for t_ in tg.sent)
+    assert "پروفایل" in joined
 
 
 @pytest.mark.asyncio
@@ -786,7 +876,7 @@ async def test_name_change_costs_coins(adapters):
     async with db.session_scope() as s:
         u = (await s.execute(select(User).where(User.platform_user_id == "985"))).scalar_one()
         assert u.display_name == "NewName"
-        assert u.coin_balance == 20 - 10
+        assert u.coin_balance == 30 - 10
 
 
 @pytest.mark.asyncio
@@ -1298,12 +1388,20 @@ async def test_anon_reply_report_block(adapters):
         "message_id": 5, "chat": {"id": 990}, "from": {"id": 990}, "text": "جواب مالک"}})
     assert any(t[0] == "991" and "جواب مالک" in str(t[1]) for t in bale.sent)
     assert any("ارسال شد" in str(t[1]) for t in tg.sent)
-    # owner taps REPORT
+    # owner taps REPORT -> v2.2 reason menu appears (item 2), then files the report
     await bot_mod.process_update("telegram", {"update_id": 500105, "callback_query": {
         "id": "ar2", "from": {"id": 990}, "message": {"chat": {"id": 990}}, "data": f"anonrep_{thread_id}"}})
-    assert any("گزارش" in str(t[1]) and "ثبت شد" in str(t[1]) for t in tg.sent)
-    # owner taps BLOCK -> thread blocked + Block row
+    assert any("دلیل" in str(t[1]) for t in tg.sent)
+    tg.sent.clear()
     await bot_mod.process_update("telegram", {"update_id": 500106, "callback_query": {
+        "id": "ar2b", "from": {"id": 990}, "message": {"chat": {"id": 990}},
+        "data": f"anonrep_{thread_id}_spam"}})
+    assert any("گزارش" in str(t[1]) and "ثبت شد" in str(t[1]) for t in tg.sent)
+    async with db.session_scope() as s:
+        rep = (await s.execute(select(Report).where(Report.reported_id != 0))).scalar_one()
+        assert rep.reason == "spam"
+    # owner taps BLOCK -> thread blocked + Block row
+    await bot_mod.process_update("telegram", {"update_id": 500107, "callback_query": {
         "id": "ar3", "from": {"id": 990}, "message": {"chat": {"id": 990}}, "data": f"anonblk_{thread_id}"}})
     assert any("بلاک" in str(t[1]) or "مسدود" in str(t[1]) for t in tg.sent)
     async with db.session_scope() as s:
@@ -1313,9 +1411,9 @@ async def test_anon_reply_report_block(adapters):
         assert blk.blocked_id == th.sender_id
     # stranger tries again via link -> gets blocked notice, owner gets nothing new
     tg.sent.clear(); bale.sent.clear()
-    await bot_mod.process_update("bale", {"update_id": 500107, "message": {
-        "message_id": 6, "chat": {"id": 991}, "from": {"id": 991}, "text": f"/start msg_{code}"}})
     await bot_mod.process_update("bale", {"update_id": 500108, "message": {
+        "message_id": 6, "chat": {"id": 991}, "from": {"id": 991}, "text": f"/start msg_{code}"}})
+    await bot_mod.process_update("bale", {"update_id": 500109, "message": {
         "message_id": 7, "chat": {"id": 991}, "from": {"id": 991}, "text": "باز هم می‌نویسم"}})
     assert any("مسدود" in str(t[1]) for t in bale.sent)
     assert not any("باز هم می‌نویسم" in str(t[1]) for t in tg.sent)
@@ -1375,7 +1473,7 @@ async def test_wallet_menu_and_buy(adapters):
     await bot_mod.process_update("telegram", {"update_id": 600100, "message": {
         "message_id": 1, "chat": {"id": 992}, "from": {"id": 992}, "text": "/wallet"}})
     joined = "".join(str(t_[1]) for t_ in tg.sent)
-    assert "کیف پول" in joined and "20" in joined
+    assert "کیف پول" in joined and "30" in joined
     kb_any = [t_[2] for t_ in tg.sent if t_[2]]
     assert any(any(b.get("callback_data") == "store" for r in k for b in r) for k in kb_any)
     # store (buy) opens from wallet — in tests no payment token is configured,
@@ -1520,3 +1618,264 @@ async def test_anon_reply_targets_exact_thread(adapters):
     a_got = any(t_[0] == "998" and "جواب برای A" in str(t_[1]) for t_ in bale.sent)
     b_got = any(t_[0] == "999" and "جواب برای A" in str(t_[1]) for t_ in bale.sent)
     assert a_got and not b_got
+
+
+# ------------------------------------------------- v2.2 feature tests ----
+@pytest.mark.asyncio
+async def test_display_name_validation(adapters):
+    """v2.2 (item 1): offensive display names are refused in fa/en/ru while
+    ordinary names pass; the vocabulary lives in app/profanity.py."""
+    from app.moderation import check_display_name
+    from app.profanity import DEFAULT_DICTIONARY, FA_WORDS, EN_WORDS, RU_WORDS
+    assert FA_WORDS and EN_WORDS and RU_WORDS
+    # ordinary names must NEVER be rejected (only clear profanity is listed)
+    for n in ("علی", "سارا", "محمد", "Anna", "Sara", "Sergey", "Aline",
+              "مهدی ۲۰۰۷", "Nastaran", "خودم", "امام علی"):
+        assert check_display_name(n).ok, n
+    # clearly offensive names in all three languages + obfuscations
+    for n in ("کصکش", "جنده", "fuck", "bitch", "мудак", "k.o.s", "FU CK",
+              "jende", "koskesh", "خایه"):
+        assert not check_display_name(n).ok, n
+    # end-to-end: registration and name change both reject the name
+    from app import bot as bot_mod
+    tg, _ = adapters
+    await bot_mod.process_update("telegram", {"update_id": 700, "message": {
+        "message_id": 1, "chat": {"id": 71}, "from": {"id": 71}, "text": "/start"}})
+    await bot_mod.process_update("telegram", {"update_id": 701, "callback_query": {
+        "id": "c1", "from": {"id": 71}, "message": {"chat": {"id": 71}}, "data": "lang_fa"}})
+    await bot_mod.process_update("telegram", {"update_id": 702, "callback_query": {
+        "id": "c2", "from": {"id": 71}, "message": {"chat": {"id": 71}}, "data": "accept_rules"}})
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 703, "message": {
+        "message_id": 2, "chat": {"id": 71}, "from": {"id": 71}, "text": "fuck"}})
+    assert any("واژگان نامناسب" in str(t[1]) for t in tg.sent)
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "71"))).scalar_one()
+        assert u.state["step"] == "name"
+    # a normal name goes through to the birthdate step
+    await bot_mod.process_update("telegram", {"update_id": 704, "message": {
+        "message_id": 3, "chat": {"id": 71}, "from": {"id": 71}, "text": "امیرعلی"}})
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "71"))).scalar_one()
+        assert u.display_name == "امیرعلی" and u.state["step"] == "birth_calendar"
+
+
+@pytest.mark.asyncio
+async def test_report_reason_selection(adapters):
+    """v2.2 (item 2): the report button adds a reason-choosing step; the chosen
+    reason is stored with the report."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "751", "Reporter", 25, "male")
+    await register_via_bot(adapters, "telegram", "752", "BadGuy", 25, "male")
+    for pid in ("751", "752"):
+        await bot_mod.process_update("telegram", {"update_id": 710 + int(pid), "callback_query": {
+            "id": f"c{pid}", "from": {"id": int(pid)},
+            "message": {"chat": {"id": int(pid)}}, "data": "gf_everyone"}})
+    tg.sent.clear()
+    # pressing گزارش shows the four-reason menu
+    await bot_mod.process_update("telegram", {"update_id": 720, "callback_query": {
+        "id": "cr1", "from": {"id": 751}, "message": {"chat": {"id": 751}}, "data": "chat_report"}})
+    joined = "".join(str(t[1]) for t in tg.sent)
+    assert "دلیل" in joined
+    kb_all = [t[2] for t in tg.sent if t[2]]
+    datas = {b.get("callback_data") for k in kb_all for r in k for b in r}
+    assert {"report_bad_name", "report_abuse", "report_spam", "report_other"} <= datas
+    # choosing "spam" files the report with that reason
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 721, "callback_query": {
+        "id": "cr2", "from": {"id": 751}, "message": {"chat": {"id": 751}}, "data": "report_spam"}})
+    assert any("ثبت شد" in str(t[1]) for t in tg.sent)
+    async with db.session_scope() as s:
+        rep = (await s.execute(select(Report))).scalar_one()
+        assert rep.reason == "spam"
+    # /report command also opens the reason menu
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 722, "message": {
+        "message_id": 9, "chat": {"id": 752}, "from": {"id": 752}, "text": "/report"}})
+    assert any("دلیل" in str(t[1]) for t in tg.sent)
+
+
+@pytest.mark.asyncio
+async def test_store_packages_rates_and_custom_invoice(adapters):
+    """v2.2 (item 3): new packages (10k=20 ... 100k=200), legacy packages retired,
+    custom-amount invoices priced via the changeable rates; 50 coins = 25,000 Toman."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    async with db.session_scope() as s:
+        pkgs = {p.id: p for p in (await s.execute(select(StorePackage))).scalars()}
+        assert pkgs["pkg_20"].coins == 20 and pkgs["pkg_20"].bale_toman_price == 10000
+        assert pkgs["pkg_40"].coins == 40 and pkgs["pkg_40"].bale_toman_price == 20000
+        assert pkgs["pkg_100"].coins == 100 and pkgs["pkg_100"].bale_toman_price == 50000
+        assert pkgs["pkg_150"].coins == 150 and pkgs["pkg_150"].bale_toman_price == 75000
+        assert pkgs["pkg_200"].coins == 200 and pkgs["pkg_200"].bale_toman_price == 100000
+        # stars follow 1 star = 20 coins (7.5 -> rounded up to 8)
+        assert pkgs["pkg_20"].telegram_stars_price == 1
+        assert pkgs["pkg_150"].telegram_stars_price == 8
+        assert pkgs["pkg_200"].telegram_stars_price == 10
+        # legacy packages are deactivated, not deleted
+        legacy = [p for p in pkgs.values() if p.id in ("pkg_300", "pkg_700", "pkg_1500")]
+        for p in legacy:
+            assert p.active is False
+    # the user's example: 50 coins = 25,000 Toman invoice (rate 500 Toman/coin)
+    await register_via_bot(adapters, "telegram", "761", "Buyer", 25, "male")
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "761"))).scalar_one()
+        uid = u.id
+        store = await service.get_setting(s, "store")
+        assert service.coins_price_toman(store, 50) == 25000
+    # enable payments for this test, then request a custom invoice
+    old_token = settings.telegram_bot_token
+    settings.telegram_bot_token = "test-token"
+    try:
+        await bot_mod.process_update("telegram", {"update_id": 730, "callback_query": {
+            "id": "cc1", "from": {"id": 761}, "message": {"chat": {"id": 761}}, "data": "store"}})
+        kb_all = [t[2] for t in tg.sent if t[2]]
+        datas = {b.get("callback_data") for k in kb_all for r in k for b in r}
+        assert "custom_coins" in datas and "buy_pkg_20" in datas
+        await bot_mod.process_update("telegram", {"update_id": 731, "callback_query": {
+            "id": "cc2", "from": {"id": 761}, "message": {"chat": {"id": 761}}, "data": "custom_coins"}})
+        assert any("تعداد سکه" in str(t[1]) for t in tg.sent)
+        tg.sent.clear()
+        await bot_mod.process_update("telegram", {"update_id": 732, "message": {
+            "message_id": 5, "chat": {"id": 761}, "from": {"id": 761}, "text": "50"}})
+        invoices = [t for t in tg.sent if t[1] == "invoice"]
+        assert invoices and invoices[0][2] == f"custom:50:{uid}"
+        # out-of-range values are refused
+        await bot_mod.process_update("telegram", {"update_id": 733, "callback_query": {
+            "id": "cc3", "from": {"id": 761}, "message": {"chat": {"id": 761}}, "data": "custom_coins"}})
+        await bot_mod.process_update("telegram", {"update_id": 734, "message": {
+            "message_id": 6, "chat": {"id": 761}, "from": {"id": 761}, "text": "5"}})
+        assert any("باید عددی بین" in str(t[1]) for t in tg.sent)
+    finally:
+        settings.telegram_bot_token = old_token
+    # paying the custom invoice credits exactly 50 coins (idempotent)
+    sp_msg = {"message_id": 7, "chat": {"id": 761}, "from": {"id": 761},
+              "successful_payment": {"currency": "XTR", "total_amount": 3,
+                                     "invoice_payload": f"custom:50:{uid}",
+                                     "telegram_payment_charge_id": "chg_custom_1"}}
+    await bot_mod.handle_successful_payment("telegram", sp_msg)
+    await bot_mod.handle_successful_payment("telegram", sp_msg)  # duplicate ignored
+    async with db.session_scope() as s:
+        u = await s.get(User, uid)
+        assert u.coin_balance == 30 + 50
+        pay = (await s.execute(select(Payment).where(
+            Payment.package_id == "custom"))).scalar_one()
+        assert pay.coins == 50
+    # rates are changeable via settings — the price follows immediately
+    async with db.session_scope() as s:
+        store = await service.get_setting(s, "store")
+        store["tomanPerCoin"] = 600
+        await service.set_setting(s, "store", store)
+        assert service.coins_price_toman(store, 50) == 30000
+
+
+@pytest.mark.asyncio
+async def test_send_throttle_and_429_cooldown():
+    """v2.2 (item 5): per-chat spacing, global sliding window and a global
+    cooldown after a 429 (retry_after) so the bot never floods the API."""
+    import asyncio as aio
+    import httpx
+    from app.platform import TelegramAdapter
+
+    tg = TelegramAdapter("1:throttle", "s")
+    tg.min_chat_interval = 0.15
+    tg.rate_per_sec = 1000
+    state = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(200, json={"ok": False, "error_code": 429,
+                                             "description": "Too Many Requests",
+                                             "parameters": {"retry_after": 1}})
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": state["n"]}})
+
+    tg._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    t0 = time.monotonic()
+    results = await aio.gather(tg.send_message(1, "a"), tg.send_message(2, "b"),
+                               tg.send_message(3, "c"))
+    elapsed = time.monotonic() - t0
+    assert all(r["message_id"] for r in results)
+    # the first call hit a 429 with retry_after=1 -> every send waited it out
+    assert elapsed >= 1.0, elapsed
+    # per-chat spacing: three sends to the SAME chat must be spaced apart
+    t0 = time.monotonic()
+    for _ in range(3):
+        await tg.send_message(9, "x")
+    spaced = time.monotonic() - t0
+    assert spaced >= 2 * tg.min_chat_interval - 0.05, spaced
+    await tg.close()
+
+
+@pytest.mark.asyncio
+async def test_referral_shows_both_links(adapters):
+    """v2.2 (item 6): both the Telegram and Bale invite links are shown, with
+    the note that joining via either one rewards both people."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "771", "Inviter2", 25, "male")
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 740, "callback_query": {
+        "id": "rf1", "from": {"id": 771}, "message": {"chat": {"id": 771}}, "data": "referral"}})
+    joined = "".join(str(t[1]) for t in tg.sent)
+    assert "t.me" in joined and "ble.ir" in joined
+    assert "پاداش هر دو نفر" in joined
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "771"))).scalar_one()
+        assert f"start=ref_{u.referral_code}" in joined
+
+
+@pytest.mark.asyncio
+async def test_menu_structure(adapters):
+    """v2.2 (item 7): main menu shows دریافت پاداش (rewards submenu) and no
+    language button; the rewards submenu has invite/daily-bonus/back-home."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "781", "MenuUser", 25, "male")
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 750, "callback_query": {
+        "id": "mn1", "from": {"id": 781}, "message": {"chat": {"id": 781}}, "data": "back_home"}})
+    kb0 = [t[2] for t in tg.sent if t[2]][0]
+    datas0 = {b.get("callback_data") for r in kb0 for b in r}
+    assert "rewards" in datas0 and "language" not in datas0 and "referral" not in datas0
+    assert "bonus" not in datas0          # daily bonus moved into the submenu
+    # rewards submenu contents
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 751, "callback_query": {
+        "id": "mn2", "from": {"id": 781}, "message": {"chat": {"id": 781}}, "data": "rewards"}})
+    kb1 = [t[2] for t in tg.sent if t[2]][0]
+    datas1 = {b.get("callback_data") for r in kb1 for b in r}
+    assert {"referral", "bonus", "back_home"} <= datas1
+    # daily bonus still works from the submenu
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 752, "callback_query": {
+        "id": "mn3", "from": {"id": 781}, "message": {"chat": {"id": 781}}, "data": "bonus"}})
+    assert any("پاداش روزانه" in str(t[1]) for t in tg.sent)
+
+
+@pytest.mark.asyncio
+async def test_data_safety_guard():
+    """v2.2 (item 8): booting on Railway without Postgres must fail loudly so
+    no deploy silently swaps the database for an ephemeral SQLite file."""
+    from app import main as main_mod
+    old_url, old_env = settings.database_url, os.environ.get("RAILWAY_ENVIRONMENT")
+    try:
+        settings.database_url = "sqlite+aiosqlite:///./kanarchat.db"
+        os.environ["RAILWAY_ENVIRONMENT"] = "production"
+        with pytest.raises(RuntimeError, match="DATA SAFETY"):
+            main_mod.ensure_persistent_database()
+        os.environ.pop("RAILWAY_ENVIRONMENT", None)
+        os.environ.pop("RAILWAY_PROJECT_ID", None)
+        # off-Railway: local SQLite dev is still fine
+        main_mod.ensure_persistent_database()
+        # on Railway WITH Postgres: fine
+        os.environ["RAILWAY_ENVIRONMENT"] = "production"
+        settings.database_url = "postgresql+asyncpg://u:p@h:5432/db"
+        main_mod.ensure_persistent_database()
+    finally:
+        settings.database_url = old_url
+        if old_env is None:
+            os.environ.pop("RAILWAY_ENVIRONMENT", None)
+        else:
+            os.environ["RAILWAY_ENVIRONMENT"] = old_env
