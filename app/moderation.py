@@ -10,30 +10,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
-# --------------------------------------------------------------- lists ----
-FA_WORDS = [
-    "کس", "کص", "کون", "کیر", "جنده", "جنده", "حرومزاده", "حرامزاده",
-    "ناموس", "عوضی", "هرزه", "فاحشه", "شلوق", "لختی", "سکسی", "سیکسی",
-    "پستون", "خایه", "کونده", "کیرم", "کصکش", "کسکش", "ممه", "فک",
-]
-FA_FINGLISH = [
-    "kos", "koon", "kir", "jendeh", "jende", "kooni", "koskesh", "kirie",
-    "haramzade", "namoos", "avazi", "faheshe", "sholough", "khalaf",
-]
-EN_WORDS = [
-    "fuck", "fucking", "bitch", "asshole", "cunt", "motherfucker", "whore",
-    "slut", "dickhead", "faggot", "nigger", "retard", "bastard", "pussy",
-]
-RU_WORDS = [
-    "бля", "блядь", "хуй", "хуе", "пизда", "пизде", "ебать", "еба", "сука",
-    "гандон", "мудак", "шлюха", "пидор", "заебал", "херня",
-]
-
-DEFAULT_DICTIONARY = [
-    (w, "high", "block_and_warn") for w in FA_WORDS + EN_WORDS + RU_WORDS
-] + [(w, "medium", "block_and_warn") for w in FA_FINGLISH]
-
-DEFAULT_ALLOWLIST = ["kun", "kirsi", "suka"]  # avoid false positives on non-Russian tokens
+# v2.2: the vocabulary lives in its own file (app/profanity.py)
+from .profanity import (DEFAULT_ALLOWLIST, DEFAULT_DICTIONARY,  # noqa: F401
+                        EN_WORDS, FA_FINGLISH, FA_WORDS, RU_WORDS)
 
 # ------------------------------------------------------------ normalizer ----
 _ARABIC_TO_PERSIAN = str.maketrans({"ي": "ی", "ك": "ک", "ة": "ه", "أ": "ا", "إ": "ا", "آ": "ا", "ؤ": "و"})
@@ -127,6 +106,41 @@ def check_profanity(text: str, dictionary: Iterable[tuple[str, str, str]],
             for sw in ("کس", "کص", "کیر", "کون"):
                 if sw[0] == compact[0] and SequenceMatcher(None, sw, compact).ratio() >= 0.5:
                     return ModerationResult(False, "profanity", sw)
+    return ModerationResult(True)
+
+
+# ------------------------------------------------- display name check ----
+def check_display_name(name: str, dictionary: Iterable[tuple[str, str, str]] = None,
+                       allowlist: Iterable[str] = None) -> ModerationResult:
+    """v2.2: strict validation for display names (item 1).
+
+    Deliberately does NOT use the fuzzy/censored-message heuristics of
+    check_profanity: only exact token matches, whole-name compact matches and
+    (for dictionary words >= 4 chars) substring matches inside a single token.
+    This guarantees ordinary names in fa/en/ru are never rejected.
+    """
+    if dictionary is None:
+        dictionary = DEFAULT_DICTIONARY
+    if allowlist is None:
+        allowlist = DEFAULT_ALLOWLIST
+    toks = tokens(name)
+    allow = {normalize(a) for a in allowlist if a}
+    for word, _severity, _action in dictionary:
+        w = normalize(word)
+        if not w or w in allow:
+            continue
+        # exact word match ("عوضی", "fuck", "мудак")
+        if w in toks:
+            return ModerationResult(False, "profanity", w)
+        # compact whole-name match ("ف.ک" -> "فک", "f_u_c_k" -> "fuck")
+        compact = re.sub(r"[^\w\u0600-\u06FF]", "", normalize(name))
+        if compact and w == compact:
+            return ModerationResult(False, "profanity", w)
+        # substring only inside one token and only for unambiguous words >= 4 chars
+        if len(w) >= 4:
+            for tok in toks:
+                if w in tok and tok not in allow:
+                    return ModerationResult(False, "profanity", w)
     return ModerationResult(True)
 
 
