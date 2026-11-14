@@ -3,9 +3,9 @@ from __future__ import annotations
 
 S = {
     # ------------------------------------------------------------ intro ----
-    "welcome": {"fa": "👋🌟 سلام خوش اومدی!\nبه چت ناشناس کانار خوش اومدی 🎭✨\nاینجا می‌تونی بدون افشای هویتت، با آدم‌های جدید و جالب گفتگو کنی 💬🔥\n\n🚀 برای شروع، زبان مورد نظرت رو انتخاب کن 👇",
-                "en": "👋🌟 Hi there!\nWelcome to Kanar Anonymous Chat 🎭✨\nTalk to new people without revealing your identity 💬🔥\n\n🚀 To start, pick your language 👇",
-                "ru": "👋🌟 Привет!\nДобро пожаловать в анонимный чат Kanar 🎭✨\nОбщайтесь с новыми людьми, не раскрывая личность 💬🔥\n\n🚀 Для начала выберите язык 👇"},
+    "welcome": {"fa": "👋🌟 سلام خوش اومدی!\nبه چت ناشناس هم‌چت خوش اومدی 🎭✨\nاینجا می‌تونی بدون افشای هویتت، با آدم‌های جدید و جالب گفتگو کنی 💬🔥\n\n🚀 برای شروع، زبان مورد نظرت رو انتخاب کن 👇",
+                "en": "👋🌟 Hi there!\nWelcome to HamChat — Anonymous Chat 🎭✨\nTalk to new people without revealing your identity 💬🔥\n\n🚀 To start, pick your language 👇",
+                "ru": "👋🌟 Привет!\nДобро пожаловать в анонимный чат HamChat 🎭✨\nОбщайтесь с новыми людьми, не раскрывая личность 💬🔥\n\n🚀 Для начала выберите язык 👇"},
     "choose_lang": {"fa": "🌐 زبانت رو انتخاب کن 👇", "en": "🌐 Choose your language 👇", "ru": "🌐 Выберите язык 👇"},
     "rules_title": {"fa": "📜✨ قوانین ربات چت ناشناس", "en": "📜✨ Anonymous Chat Rules", "ru": "📜✨ Правила анонимного чата"},
 
@@ -52,23 +52,24 @@ S = {
                  "ru": "🎉🎊 Регистрация завершена!\n\n🎁 {coins} приветственных монет зачислено 🪙✨\n🚀 Найдите первого собеседника. Удачи! 🍀"},
 
     # ----------------------------------------------------------- main ----
-    "main_menu": {"fa": "🏠✨ منوی اصلی کانار\n🎯 از دکمه‌های زیر استفاده کن 👇",
-                  "en": "🏠✨ Kanar main menu\n🎯 Use the buttons below 👇",
-                  "ru": "🏠✨ Главное меню Kanar\n🎯 Используйте кнопки ниже 👇"},
+    "main_menu": {"fa": "🏠✨ منوی اصلی هم‌چت\n🎯 از دکمه‌های زیر استفاده کن 👇",
+                  "en": "🏠✨ HamChat main menu\n🎯 Use the buttons below 👇",
+                  "ru": "🏠✨ Главное меню HamChat\n🎯 Используйте кнопки ниже 👇"},
     "btn_search": {"fa": "🔍 جستجوی هم‌چت", "en": "🔍 Find partner", "ru": "🔍 Поиск собеседника"},
     "btn_profile": {"fa": "👤 پروفایل و تنظیمات", "en": "👤 Profile & settings", "ru": "👤 Профиль и настройки"},
     "btn_coins": {"fa": "👛 کیف پول", "en": "👛 Wallet", "ru": "👛 Кошелёк"},
     "btn_store": {"fa": "🛒 خرید سکه", "en": "🛒 Buy coins", "ru": "🛒 Купить монеты"},
     "btn_bonus": {"fa": "🎁 پاداش روزانه", "en": "🎁 Daily bonus", "ru": "🎁 Ежедневный бонус"},
     "btn_myref": {"fa": "👥 دعوت دوستان", "en": "👥 Invite friends", "ru": "👥 Приглашения"},
-    "btn_rewards": {"fa": "🎁 دریافت پاداش", "en": "🎁 Get rewards", "ru": "🎁 Награды"},
-    "rewards_title": {"fa": "🎁✨ دریافت پاداش\n\nسکه رایگان از این راه‌ها بگیر 👇",
-                      "en": "🎁✨ Get rewards\n\nFree coins via the options below 👇",
-                      "ru": "🎁✨ Награды\n\nБесплатные монеты 👇"},
+    "btn_rewards": {"fa": "🪙 سکه رایگان", "en": "🪙 Free coins", "ru": "🪙 Бесплатные монеты"},
+    "rewards_title": {"fa": "🪙✨ سکه رایگان\n\nاز این راه‌ها سکه رایگان بگیر 👇",
+                      "en": "🪙✨ Free coins\n\nGet free coins via the options below 👇",
+                      "ru": "🪙✨ Бесплатные монеты\n\nСпособы получить монеты 👇"},
     "btn_language": {"fa": "🌐 تغییر زبان", "en": "🌐 Change language", "ru": "🌐 Сменить язык"},
     "btn_help": {"fa": "❓ راهنمای کامل", "en": "❓ Full guide", "ru": "❓ Руководство"},
     "btn_admin": {"fa": "🛡 پنل مدیریت", "en": "🛡 Admin panel", "ru": "🛡 Панель админа"},
     "btn_back": {"fa": "🏠 بازگشت به منوی اصلی", "en": "🏠 Back to main menu", "ru": "🏠 В главное меню"},
+    "btn_back_step": {"fa": "↩️ مرحله قبل", "en": "↩️ Previous step", "ru": "↩️ Назад"},
     "btn_gift": {"fa": "🎁 هدیه به هم‌چت", "en": "🎁 Gift to partner", "ru": "🎁 Подарок собеседнику"},
 
     # ----------------------------------------------------------- chat ----
@@ -116,7 +117,7 @@ S = {
     "msg_rejected_media_big": {"fa": "🚫📦 حجم فایل برای انتقال بین‌پلتفرمی بیش از حد مجازه (حداکثر ۲۰ مگابایت)",
                                "en": "🚫📦 File too large for cross-platform transfer (max 20 MB)",
                                "ru": "🚫📦 Файл слишком велик (макс. 20 МБ)"},
-    "no_coins": {"fa": "🪙😞 سکه کافی برای این کار نداری.\n\n💡 راه‌های دریافت سکه:\n🎁 دریافت پاداش (پاداش روزانه و دعوت دوستان)\n🛒 خرید از کیف پول", "en": "🪙😞 Not enough coins.\n\n💡 Ways to get coins:\n🎁 Get rewards (daily bonus & inviting friends)\n🛒 Buy from the wallet", "ru": "🪙😞 Недостаточно монет.\n\n💡 Способы получить:\n🎁 Награды (бонус и приглашения)\n🛒 Магазин"},
+    "no_coins": {"fa": "🪙😞 سکه کافی برای این کار نداری.\n\n💡 راه‌های دریافت سکه:\n🎁 سکه رایگان (پاداش روزانه و دعوت دوستان)\n🛒 خرید از کیف پول", "en": "🪙😞 Not enough coins.\n\n💡 Ways to get coins:\n🎁 Get rewards (daily bonus & inviting friends)\n🛒 Buy from the wallet", "ru": "🪙😞 Недостаточно монет.\n\n💡 Способы получить:\n🎁 Награды (бонус и приглашения)\n🛒 Магазин"},
 
     # ---------------------------------------------------------- economy ----
     "coins_balance": {"fa": "🪙💰 موجودی کیف پولت: {coins} سکه\n\n✨ با سکه‌ها می‌تونی:\n🎯 در جستجو فیلتر جنسیت فعال کنی\n🎁 به هم‌چتت هدیه بدی", "en": "🪙💰 Your balance: {coins} coins\n\n✨ With coins you can:\n🎯 Use gender filters\n🎁 Gift your partner", "ru": "🪙💰 Баланс: {coins} монет\n\n✨ За монеты можно:\n🎯 Фильтры пола\n🎁 Подарки"},
@@ -129,7 +130,7 @@ S = {
                       "ru": "👥🔥 Приглашайте друзей!\n\n🔵✨ Ссылка Telegram:\n{tg_link}\n\n🟢✨ Ссылка Bale:\n{bale_link}\n\n📋 Как это работает:\n1️⃣ Отправьте другу любую из двух ссылок 📤\n2️⃣ Друг регистрируется по ссылке Telegram или Bale ✅\n3️⃣ После его первого чата вы ОБА получите {coins} монет 🎉\n\n💡 Вход по любой из ссылок активирует награду для обоих!"},
     "referral_count": {"fa": "🏆👥 تعداد دعوت‌های موفقت: {count} نفر", "en": "🏆👥 Successful referrals: {count}", "ru": "🏆👥 Успешных приглашений: {count}"},
     "store_title": {"fa": "🛒💎 خرید سکه\n\n✨ سکه‌ها برای فیلتر جنسیت، هدیه دادن به هم‌چت‌ها و... استفاده می‌شن.\n🎯 بسته مورد نظرت رو انتخاب کن 👇", "en": "🛒💎 Buy coins\n\n✨ Coins are used for gender filters, gifting partners and more.\n🎯 Choose a package 👇", "ru": "🛒💎 Купить монеты\n\n�️ Монеты нужны для фильтров и подарков.\n🎯 Выберите пакет 👇"},
-    "wallet_title": {"fa": "👛💰 کیف پول کانار\n\n🪙 موجودی: {coins} سکه\n\n✨ با سکه‌ها می‌تونی:\n🎯 در جستجو فیلتر جنسیت فعال کنی\n🎁 به هم‌چتت هدیه بدی", "en": "👛💰 Kanar wallet\n\n🪙 Balance: {coins} coins\n\n✨ With coins you can:\n🎯 Use gender filters\n🎁 Gift your partner", "ru": "👛💰 Кошелёк Kanar\n\n🪙 Баланс: {coins} монет\n\n✨ За монеты можно:\n🎯 Фильтры пола\n🎁 Подарки"},
+    "wallet_title": {"fa": "👛💰 کیف پول هم‌چت\n\n🪙 موجودی: {coins} سکه\n\n✨ با سکه‌ها می‌تونی:\n🎯 در جستجو فیلتر جنسیت فعال کنی\n🎁 به هم‌چتت هدیه بدی", "en": "👛💰 HamChat wallet\n\n🪙 Balance: {coins} coins\n\n✨ With coins you can:\n🎯 Use gender filters\n🎁 Gift your partner", "ru": "👛💰 Кошелёк HamChat\n\n🪙 Баланс: {coins} монет\n\n✨ За монеты можно:\n🎯 Фильтры пола\n🎁 Подарки"},
     "pay_stars": {"fa": "⭐ {stars} ستاره = {coins} سکه", "en": "⭐ {stars} Stars = {coins} coins", "ru": "⭐ {stars} звёзд = {coins} монет"},
     "pay_bale": {"fa": "💳 {toman} تومان = {coins} سکه", "en": "💳 {toman} Toman = {coins} coins", "ru": "💳 {toman} томанов = {coins} монет"},
     "pay_unavailable": {"fa": "🔌💳 درگاه پرداخت این پلتفرم الان فعال نیست.\n⏳ لطفاً بعداً تلاش کن یا با پشتیبانی تماس بگیر 🙏", "en": "🔌💳 The payment gateway on this platform is currently unavailable.\n⏳ Please try later or contact support 🙏", "ru": "🔌💳 Платёжный шлюз недоступен.\n⏳ Попробуйте позже 🙏"},
@@ -141,8 +142,8 @@ S = {
     "store_custom_invalid": {"fa": "❌🔢 تعداد سکه باید عددی بین {min} و {max} باشه. دوباره تلاش کن:",
                              "en": "❌🔢 Coin count must be a number between {min} and {max}. Try again:",
                              "ru": "❌🔢 Количество монет — число от {min} до {max}. Попробуйте снова:"},
-    "custom_invoice_title": {"fa": "🪙 {coins} سکه کانار (دلخواه)", "en": "🪙 {coins} Kanar coins (custom)", "ru": "🪙 {coins} монет Kanar"},
-    "invoice_desc": {"fa": "خرید سکه برای چت ناشناس کانار", "en": "Kanar Anonymous Chat coin purchase", "ru": "Покупка монет Kanar"},
+    "custom_invoice_title": {"fa": "🪙 {coins} سکه هم‌چت (دلخواه)", "en": "🪙 {coins} HamChat coins (custom)", "ru": "🪙 {coins} монет HamChat"},
+    "invoice_desc": {"fa": "خرید سکه برای چت ناشناس هم‌چت", "en": "HamChat Anonymous Chat coin purchase", "ru": "Покупка монет HamChat"},
     "paysupport": {"fa": "💳🆘 پشتیبانی پرداخت\n\n😕 پرداخت انجام شده اما سکه‌ها به حسابت اضافه نشدن؟\n\n1️⃣ چند دقیقه صبر کن و موجودیت رو با /coins بررسی کن ⏳\n2️⃣ اگه مشکل ادامه داشت، با دکمه زیر یک تیکت پشتیبانی بساز تا کارشناسامون سریع رسیدگی کنن 🚀",
                    "en": "💳🆘 Payment support\n\n😕 Paid but coins were not added?\n\n1️⃣ Wait a few minutes and check /coins ⏳\n2️⃣ If the problem persists, create a support ticket below — our team will handle it ASAP 🚀",
                    "ru": "💳🆘 Поддержка оплат\n\n😕 Оплата прошла, но монеты не зачислены?\n\n1️⃣ Подождите и проверьте /coins ⏳\n2️⃣ Если проблема осталась, создайте тикет ниже 🚀"},
@@ -309,8 +310,8 @@ S = {
                            "ru": "⬇️💬 Кнопки управления чатом (всегда доступны):"},
 
     # ------------------------------------------------------------ help ----
-    "help_body": {"fa": "❓📖 راهنمای کامل ربات چت ناشناس کانار\n\n🎯 چطور کار می‌کنه؟\nروی «جستجوی هم‌چت» بزن تا رباتت رو با یک کاربر تصادفی — از تلگرام یا بله — کاملاً ناشناس وصل کنه 🎭\n🛡 هویتت محفوظ می‌مونه؛ فقط نام، سن، جنسیت و بیوگرافی‌ای که خودت وارد کردی نمایش داده می‌شه ✨\n\n🪙 سکه‌ها به چه دردی می‌خورن؟\n• 💬 ارسال هر پیام ۱ سکه هزینه داره (دستورات و دکمه‌ها رایگان‌ان)\n• 🎯 فیلتر جنسیت در جستجو ۵ سکه (فقط در صورت اتصال موفق)\n• 🎁 سکه رایگان: دریافت پاداش (پاداش روزانه و دعوت دوستان)! 🔥\n\n💌 امکانات ویژه:\n• 🔗 لینک ناشناس: لینک‌هات رو به اشتراک بذار تا دیگران برات پیام ناشناس بفرستن (/link)\n• 🎯 پیام ناشناس به کاربر: با یوزرنیم یا آیدی برای هر عضوی پیام بفرست (/msg)\n• 🎁 هدیه: در حین گفتگو به هم‌چتت سکه هدیه بده (/gift)!\n• 🔗 اتصال حساب: حساب تلگرام و بله‌ت رو متصل کن و ۵۰ سکه بگیر 💎\n\n📋 دستورات سریع:\n🔍 /search — جستجوی هم‌چت\n⏭ /next — کاربر بعدی\n🛑 /stop — توقف جستجو یا گفتگو\n👤 /profile — پروفایل و تنظیمات\n🪙 /coins — موجودی سکه\n👛 /wallet — کیف پول و خرید سکه\n🎁 /bonus — پاداش روزانه\n👥 /referral — دعوت دوستان\n🔗 /link — لینک ناشناس\n💌 /msg — پیام ناشناس به کاربر\n🎁 /gift — هدیه به هم‌چت\n🌐 /language — تغییر زبان\n📜 /rules — قوانین\n💳 /paysupport — پشتیبانی پرداخت\n🚩 /report — گزارش تخلف\n⛔ /block — مسدودسازی\n✍️ /appeal — اعتراض به مسدودی دائمی\n🛡 /admin — پنل مدیریت (مدیران)\n\n💡✨ همه این کارها با دکمه‌های شیشه‌ای داخل منوها هم قابل انجام‌ان. شروع کن! 🚀",
-                  "en": "❓📖 Complete guide to Kanar Anonymous Chat\n\n🎯 How does it work?\nTap \"Find partner\" and the bot connects you with a random user — from Telegram or Bale — completely anonymously 🎭\n🛡 Only the name, age, gender and bio you provided are shown ✨\n\n🪙 What are coins for?\n• 💬 Each message costs 1 coin (commands and buttons are free)\n• 🎯 Gender filter costs 5 coins (only on successful match)\n• 🎁 Free coins: daily bonus and inviting friends! 🔥\n\n💌 Special features:\n• 🔗 Anonymous link: share your links to receive anonymous messages (/link)\n• 🎯 Direct anonymous message: message any member by @username or ID (/msg)\n• 🎁 Gifts: send coins to your partner during a chat (/gift)!\n• 🔗 Account linking: connect Telegram & Bale and get 50 coins 💎\n\n📋 Commands:\n🔍 /search ⏭ /next 🛑 /stop 👤 /profile 🪙 /coins 🛒 /store 🎁 /bonus 👥 /referral 🔗 /link 💌 /msg 🎁 /gift 🌐 /language 📜 /rules 💳 /paysupport 🚩 /report ⛔ /block ✍️ /appeal 🛡 /admin\n\n💡✨ Everything is also doable via the inline buttons. Enjoy! 🚀",
+    "help_body": {"fa": "❓📖 راهنمای کامل ربات چت ناشناس هم‌چت\n\n🎯 چطور کار می‌کنه؟\nروی «جستجوی هم‌چت» بزن تا رباتت رو با یک کاربر تصادفی — از تلگرام یا بله — کاملاً ناشناس وصل کنه 🎭\n🛡 هویتت محفوظ می‌مونه؛ فقط نام، سن، جنسیت و بیوگرافی‌ای که خودت وارد کردی نمایش داده می‌شه ✨\n\n🪙 سکه‌ها به چه دردی می‌خورن؟\n• 💬 ارسال هر پیام ۱ سکه هزینه داره (دستورات و دکمه‌ها رایگان‌ان)\n• 🎯 فیلتر جنسیت در جستجو ۵ سکه (فقط در صورت اتصال موفق)\n• 🪙 سکه رایگان: پاداش روزانه و دعوت دوستان! 🔥\n\n💌 امکانات ویژه:\n• 🔗 لینک ناشناس: لینک‌هات رو به اشتراک بذار تا دیگران برات پیام ناشناس بفرستن (/link)\n• 🎯 پیام ناشناس به کاربر: با یوزرنیم یا آیدی برای هر عضوی پیام بفرست (/msg)\n• 🎁 هدیه: در حین گفتگو به هم‌چتت سکه هدیه بده (/gift)!\n• 🔗 اتصال حساب: حساب تلگرام و بله‌ت رو متصل کن و ۵۰ سکه بگیر 💎\n\n📋 دستورات سریع:\n🔍 /search — جستجوی هم‌چت\n⏭ /next — کاربر بعدی\n🛑 /stop — توقف جستجو یا گفتگو\n👤 /profile — پروفایل و تنظیمات\n🪙 /coins — موجودی سکه\n👛 /wallet — کیف پول و خرید سکه\n🎁 /bonus — پاداش روزانه\n👥 /referral — دعوت دوستان\n🔗 /link — لینک ناشناس\n💌 /msg — پیام ناشناس به کاربر\n🎁 /gift — هدیه به هم‌چت\n🌐 /language — تغییر زبان\n📜 /rules — قوانین\n💳 /paysupport — پشتیبانی پرداخت\n🚩 /report — گزارش تخلف\n⛔ /block — مسدودسازی\n✍️ /appeal — اعتراض به مسدودی دائمی\n🛡 /admin — پنل مدیریت (مدیران)\n\n💡✨ همه این کارها با دکمه‌های شیشه‌ای داخل منوها هم قابل انجام‌ان. شروع کن! 🚀",
+                  "en": "❓📖 Complete guide to HamChat — Anonymous Chat\n\n🎯 How does it work?\nTap \"Find partner\" and the bot connects you with a random user — from Telegram or Bale — completely anonymously 🎭\n🛡 Only the name, age, gender and bio you provided are shown ✨\n\n🪙 What are coins for?\n• 💬 Each message costs 1 coin (commands and buttons are free)\n• 🎯 Gender filter costs 5 coins (only on successful match)\n• 🎁 Free coins: daily bonus and inviting friends! 🔥\n\n💌 Special features:\n• 🔗 Anonymous link: share your links to receive anonymous messages (/link)\n• 🎯 Direct anonymous message: message any member by @username or ID (/msg)\n• 🎁 Gifts: send coins to your partner during a chat (/gift)!\n• 🔗 Account linking: connect Telegram & Bale and get 50 coins 💎\n\n📋 Commands:\n🔍 /search ⏭ /next 🛑 /stop 👤 /profile 🪙 /coins 🛒 /store 🎁 /bonus 👥 /referral 🔗 /link 💌 /msg 🎁 /gift 🌐 /language 📜 /rules 💳 /paysupport 🚩 /report ⛔ /block ✍️ /appeal 🛡 /admin\n\n💡✨ Everything is also doable via the inline buttons. Enjoy! 🚀",
                   "ru": "❓📖 Полное руководство\n\n🎯 Нажмите «Поиск» — бот соединит вас со случайным пользователем из Telegram или Bale анонимно 🎭\n🛡 Видны только имя, возраст, пол и био ✨\n\n🪙 Монеты:\n• 💬 Сообщение — 1 монета (команды бесплатны)\n• 🎯 Фильтр пола — 5 монет (при успехе)\n• 🎁 Бесплатные: бонус и приглашения! 🔥\n\n💌 Возможности:\n🔗 Анонимная ссылка (/link), 🎯 прямое сообщение (/msg), 🎁 подарки (/gift), 🔗 связка аккаунтов — 50 монет 💎\n\n📋 Команды: 🔍 /search ⏭ /next 🛑 /stop 👤 /profile 🪙 /coins 🛒 /store 🎁 /bonus 👥 /referral 🔗 /link 💌 /msg 🎁 /gift 🌐 /language 📜 /rules 💳 /paysupport 🚩 /report ⛔ /block ✍️ /appeal 🛡 /admin\n\n💡✨ Всё доступно через кнопки. Приятного общения! 🚀"},
 }
 

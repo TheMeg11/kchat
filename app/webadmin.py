@@ -168,21 +168,10 @@ class LoginBody(BaseModel):
     password: str
 
 
-class TotpBody(BaseModel):
-    challengeId: str
-    code: str
-    isRecoveryCode: bool = False
-
-
 class ChangePwdBody(BaseModel):
     challengeId: str
     currentPassword: str
     newPassword: str
-
-
-class EnrollBody(BaseModel):
-    challengeId: str
-    code: str
 
 
 async def _new_session(admin_id: int, request: Request) -> str:
@@ -260,53 +249,9 @@ async def login(body: LoginBody, request: Request):
             s.add(LoginChallenge(id=ch, admin_id=admin.id, stage="password",
                                  expires_at=utcnow() + timedelta(minutes=10)))
             return {"status": "password_change_required", "challengeId": ch}
-        if not admin.totp_enabled:
-            secret = security.new_totp_secret()
-            ch = str(uuid.uuid4())
-            s.add(LoginChallenge(id=ch, admin_id=admin.id, stage="enroll",
-                                 payload={"totp_secret": secret},
-                                 expires_at=utcnow() + timedelta(minutes=10)))
-            return {"status": "totp_enrollment_required", "challengeId": ch,
-                    "totpSetup": {"otpauthUri": security.otpauth_uri(secret, admin.username),
-                                  "manualKey": secret, "issuer": "Kanar Super Admin"}}
-        ch = str(uuid.uuid4())
-        s.add(LoginChallenge(id=ch, admin_id=admin.id, stage="totp",
-                             expires_at=utcnow() + timedelta(minutes=10)))
-        return {"status": "totp_required", "challengeId": ch}
-
-
-@router.post("/auth/verify-totp")
-async def verify_totp(body: TotpBody, request: Request):
-    async with db.session_scope() as s:
-        ch = await s.get(LoginChallenge, body.challengeId)
-        if not ch or ch.expires_at < utcnow() or ch.stage != "totp":
-            raise ApiErr(400, "چالش ورود نامعتبر یا منقضی است.", "INVALID_CHALLENGE")
-        admin = await s.get(WebAdmin, ch.admin_id)
-        ok = False
-        if body.isRecoveryCode:
-            from .db import RecoveryCode
-            h = security.hash_recovery_code(body.code)
-            res = await s.execute(select(RecoveryCode).where(
-                RecoveryCode.admin_id == admin.id, RecoveryCode.code_hash == h,
-                RecoveryCode.used == False))  # noqa
-            rc = res.scalar_one_or_none()
-            if rc:
-                rc.used = True
-                ok = True
-        else:
-            try:
-                secret = security.decrypt_field(admin.totp_secret_enc, settings.encryption_key)
-                ok = security.totp_verify(secret, body.code)
-            except Exception:
-                ok = False
-        if not ok:
-            s.add(SecurityEvent(type="totp_failed", severity="warning",
-                                admin_username=admin.username, ip_address=_ip(request),
-                                user_agent="", message="کد تأیید دو مرحله‌ای نامعتبر"))
-            raise ApiErr(401, "کد تأیید دو مرحله‌ای نامعتبر است.", "INVALID_TOTP")
-        await s.delete(ch)
-        a2 = await s.get(WebAdmin, admin.id)
-    return await _authed_response(a2, request)
+        # v2.3: two-factor (TOTP) login removed by product decision —
+        # username + password is the only credential pair.
+        return await _authed_response(admin, request)
 
 
 @router.post("/auth/change-initial-password")
@@ -323,43 +268,11 @@ async def change_initial_password(body: ChangePwdBody, request: Request):
         admin.password_hash = security.hash_password(body.newPassword)
         admin.must_change_password = False
         await s.delete(ch)
-        if not admin.totp_enabled:
-            secret = security.new_totp_secret()
-            ch2 = str(uuid.uuid4())
-            s.add(LoginChallenge(id=ch2, admin_id=admin.id, stage="enroll",
-                                 payload={"totp_secret": secret},
-                                 expires_at=utcnow() + timedelta(minutes=10)))
-            s.add(SecurityEvent(type="password_changed", severity="info",
-                                admin_username=admin.username, ip_address=_ip(request),
-                                user_agent="", message="تغییر رمز اولیه انجام شد"))
-            return {"status": "totp_enrollment_required", "challengeId": ch2,
-                    "totpSetup": {"otpauthUri": security.otpauth_uri(secret, admin.username),
-                                  "manualKey": secret, "issuer": "Kanar Super Admin"}}
+        s.add(SecurityEvent(type="password_changed", severity="info",
+                            admin_username=admin.username, ip_address=_ip(request),
+                            user_agent="", message="تغییر رمز اولیه انجام شد"))
+        # v2.3: no TOTP enrollment — go straight to the authenticated session
         return await _authed_response(admin, request)
-
-
-@router.post("/auth/totp/enroll/confirm")
-async def confirm_enroll(body: EnrollBody, request: Request):
-    async with db.session_scope() as s:
-        ch = await s.get(LoginChallenge, body.challengeId)
-        if not ch or ch.expires_at < utcnow() or ch.stage != "enroll":
-            raise ApiErr(400, "چالش نامعتبر یا منقضی است.", "INVALID_CHALLENGE")
-        admin = await s.get(WebAdmin, ch.admin_id)
-        secret = (ch.payload or {}).get("totp_secret", "")
-        if not security.totp_verify(secret, body.code):
-            raise ApiErr(400, "کد ۶ رقمی معتبر نیست.", "INVALID_TOTP")
-        admin.totp_secret_enc = security.encrypt_field(secret, settings.encryption_key)
-        admin.totp_enabled = True
-        codes = security.new_recovery_codes()
-        from .db import RecoveryCode
-        for c in codes:
-            s.add(RecoveryCode(admin_id=admin.id, code_hash=security.hash_recovery_code(c)))
-        await s.delete(ch)
-        s.add(SecurityEvent(type="login_success", severity="info", admin_username=admin.username,
-                            ip_address=_ip(request), user_agent="",
-                            message="فعال‌سازی TOTP و صدور کدهای بازیابی"))
-        a2 = await s.get(WebAdmin, admin.id)
-    return await _authed_response(a2, request, {"recoveryCodes": codes})
 
 
 @router.get("/auth/me")
@@ -1688,7 +1601,7 @@ async def backups_all(request: Request):
                              "retentionDays": cfg.get("retentionDays", 90),
                              "encryptionEnabled": cfg.get("encryptionEnabled", True),
                              "deliveryChannels": [{
-                                 "id": "tg-owner", "name": "بازوی تلگرام کانار → مالک",
+                                 "id": "tg-owner", "name": "بازوی تلگرام هم‌چت → مالک",
                                  "type": "telegram_vault", "status": "connected",
                                  "lastDeliveredAt": last_delivered}]}}
 
@@ -1739,7 +1652,7 @@ async def backup_settings(body: BackupSettingsBody, request: Request):
                 "autoBackupEnabled": cfg["autoBackupEnabled"],
                 "retentionDays": cfg["retentionDays"],
                 "encryptionEnabled": cfg.get("encryptionEnabled", True),
-                "deliveryChannels": [{"id": "tg-owner", "name": "بازوی تلگرام کانار → مالک",
+                "deliveryChannels": [{"id": "tg-owner", "name": "بازوی تلگرام هم‌چت → مالک",
                                       "type": "telegram_vault", "status": "connected",
                                       "lastDeliveredAt": ""}]}
 
@@ -2034,8 +1947,7 @@ async def security_overview(request: Request):
             WebSession.admin_id == admin.id, WebSession.revoked == False))).scalars()  # noqa
         events = (await s.execute(select(SecurityEvent).order_by(
             SecurityEvent.id.desc()).limit(100))).scalars()
-        admins = (await s.execute(select(WebAdmin))).scalars()
-        totp_all = all(a.totp_enabled for a in admins) and any(True for _ in admins)
+        # v2.3: TOTP removed — the flag stays for API compatibility only.
         return {"sessions": [{"id": r.id, "device": r.device or "مرورگر", "ip": r.ip or "—",
                               "location": "نامشخص", "createdAt": iso(r.created_at),
                               "lastActiveAt": iso(r.last_active_at), "current": r.id == sess.id}
@@ -2044,7 +1956,7 @@ async def security_overview(request: Request):
                             "adminUsername": e.admin_username, "ipAddress": e.ip_address,
                             "userAgent": e.user_agent, "message": e.message,
                             "createdAt": iso(e.created_at)} for e in events],
-                "totpEnforcedForAll": totp_all}
+                "totpEnforcedForAll": False}
 
 
 @router.get("/monitoring/railway")

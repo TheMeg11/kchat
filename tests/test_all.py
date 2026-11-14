@@ -1081,25 +1081,21 @@ async def test_web_auth_flow():
         # unauthenticated
         r = await cli.get("/api/admin/v1/auth/me")
         assert r.status_code == 401
-        # login -> totp challenge
+        # login -> authenticated (v2.3: TOTP two-factor removed)
         r = await cli.post("/api/admin/v1/auth/login",
                            json={"username": "owner1", "password": "InitialPass123!"})
-        assert r.status_code == 200
-        assert r.json()["status"] == "totp_required"
-        ch = r.json()["challengeId"]
-        # wrong totp
-        r = await cli.post("/api/admin/v1/auth/verify-totp",
-                           json={"challengeId": ch, "code": "000000"})
-        assert r.status_code == 401
-        # correct totp (JBSWY3DPEHPK3PXP is the canonical test secret)
-        code = security.totp_code("JBSWY3DPEHPK3PXP")
-        r = await cli.post("/api/admin/v1/auth/verify-totp",
-                           json={"challengeId": ch, "code": code})
         assert r.status_code == 200
         assert r.json()["status"] == "authenticated"
         csrf = r.headers.get("x-csrf-token")
         assert csrf
         cookies = dict(r.cookies)
+        # legacy TOTP endpoints no longer exist
+        r = await cli.post("/api/admin/v1/auth/verify-totp",
+                           json={"challengeId": "x", "code": "000000"})
+        assert r.status_code in (403, 404, 405)  # endpoint removed (403 CSRF / 404 / 405 SPA)
+        r = await cli.post("/api/admin/v1/auth/totp/enroll/confirm",
+                           json={"challengeId": "x", "code": "000000"})
+        assert r.status_code in (403, 404, 405)
         # me works
         r = await cli.get("/api/admin/v1/auth/me")
         assert r.status_code == 200 and r.json()["role"] == "owner"
@@ -1156,18 +1152,13 @@ async def test_web_history_permissions():
             r = await cli.post("/api/admin/v1/auth/login",
                                json={"username": username, "password": "ModPass123!!"
                                      if username == "mod1" else "InitialPass123!"})
-            ch = r.json()["challengeId"]
-            code = security.totp_code("JBSWY3DPEHPK3PXP")
-            r = await cli.post("/api/admin/v1/auth/verify-totp",
-                               json={"challengeId": ch, "code": code})
+            assert r.json()["status"] == "authenticated"
             return r.headers.get("x-csrf-token")
 
         # moderator (mod1 password differs)
         r = await cli.post("/api/admin/v1/auth/login",
                            json={"username": "mod1", "password": "ModPass123!!"})
-        ch = r.json()["challengeId"]
-        r = await cli.post("/api/admin/v1/auth/verify-totp",
-                           json={"challengeId": ch, "code": security.totp_code("JBSWY3DPEHPK3PXP")})
+        assert r.json()["status"] == "authenticated"
         mod_csrf = r.headers.get("x-csrf-token")
         r = await cli.get("/api/admin/v1/chats")
         data = r.json()
@@ -1207,9 +1198,7 @@ async def test_web_matching_locked_invariants():
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
         r = await cli.post("/api/admin/v1/auth/login",
                            json={"username": "owner2", "password": "OwnerPass123!"})
-        ch = r.json()["challengeId"]
-        r = await cli.post("/api/admin/v1/auth/verify-totp",
-                           json={"challengeId": ch, "code": security.totp_code("JBSWY3DPEHPK3PXP")})
+        assert r.json()["status"] == "authenticated"
         csrf = r.headers.get("x-csrf-token")
         # attempt to disable age separation / cross-platform (must stay locked)
         r = await cli.patch("/api/admin/v1/settings/matching",
@@ -1250,28 +1239,17 @@ async def test_webadmin_initial_password_flow():
                            json={"challengeId": ch, "currentPassword": "TempPass123!",
                                  "newPassword": "short"})
         assert r.status_code == 400
-        # proper change -> TOTP enrollment
+        # proper change -> directly authenticated (v2.3: no TOTP enrollment)
         r = await cli.post("/api/admin/v1/auth/change-initial-password",
                            json={"challengeId": ch, "currentPassword": "TempPass123!",
                                  "newPassword": "MuchStronger456!"})
-        assert r.json()["status"] == "totp_enrollment_required"
-        secret = r.json()["totpSetup"]["manualKey"]
-        ch2 = r.json()["challengeId"]
-        r = await cli.post("/api/admin/v1/auth/totp/enroll/confirm",
-                           json={"challengeId": ch2, "code": security.totp_code(secret)})
         assert r.json()["status"] == "authenticated"
-        assert len(r.json()["recoveryCodes"]) == 8
-        # recovery code login works once
+        assert r.headers.get("x-csrf-token")
+        # re-login with the new password works
         await cli.post("/api/admin/v1/auth/logout")
         r = await cli.post("/api/admin/v1/auth/login",
                            json={"username": "newbie", "password": "MuchStronger456!"})
-        ch = r.json()["challengeId"]
-        rc = r.json()
-        r = await cli.post("/api/admin/v1/auth/verify-totp",
-                           json={"challengeId": ch, "code": r.json()["recoveryCodes"][0]
-                                 if "recoveryCodes" in r.json() else "000000",
-                                 "isRecoveryCode": False})
-        assert r.status_code == 401  # wrong code path
+        assert r.json()["status"] == "authenticated"
     wa._login_attempts.clear()
 
 
@@ -1879,3 +1857,139 @@ async def test_data_safety_guard():
             os.environ.pop("RAILWAY_ENVIRONMENT", None)
         else:
             os.environ["RAILWAY_ENVIRONMENT"] = old_env
+
+
+# ================================================= v2.3 regression tests ===
+@pytest.mark.asyncio
+async def test_birthdate_gregorian_year_page_and_back_nav(adapters):
+    """v2.3 regression: after choosing the gregorian calendar the year page must
+    show GREGORIAN years (the stale user.state bug rendered jalali years, so
+    every click failed with invalid_input), and each signup stage offers a
+    back-to-previous-step button instead of back-to-main-menu."""
+    from app import bot as bot_mod
+    import datetime as _dt
+    tg, _ = adapters
+    pid = "977"
+    upd_id = [700000]
+
+    def upd(**kw):
+        upd_id[0] += 1
+        return {"update_id": upd_id[0], **kw}
+
+    async def cq(cq_id, data):
+        await bot_mod.process_update("telegram", upd(callback_query={
+            "id": cq_id, "from": {"id": int(pid)},
+            "message": {"chat": {"id": int(pid)}}, "data": data}))
+
+    def last_kb():
+        return [k for (_c, _t, k) in tg.sent if k][-1]
+
+    def datas_of(kb_):
+        return {b.get("callback_data") for row in kb_ for b in row}
+
+    await bot_mod.process_update("telegram", upd(message={
+        "message_id": 1, "chat": {"id": int(pid)},
+        "from": {"id": int(pid), "first_name": "Nav"}, "text": "/start"}))
+    await cq("n1", "lang_fa")
+    await cq("n2", "accept_rules")
+    await bot_mod.process_update("telegram", upd(message={
+        "message_id": 2, "chat": {"id": int(pid)},
+        "from": {"id": int(pid)}, "text": "NickNav"}))
+    today = _dt.date.today()
+    # calendar intro: back goes to the name step, not home
+    tg.sent.clear()
+    kb_ = [k for (_c, _t, k) in tg.sent if k][-1] if [k for (_c, _t, k) in tg.sent if k] else None
+    await cq("n3", "bcal_gregorian")
+    datas = datas_of(last_kb())
+    assert f"byear_{today.year - 13}" in datas  # regression: stale state showed jalali years
+    assert "bcal_back" in datas and "back_home" not in datas
+    # click the youngest gregorian year -> month page (previously: invalid_input)
+    tg.sent.clear()
+    await cq("n4", f"byear_{today.year - 13}")
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == pid))).scalar_one()
+        assert u.state["step"] == "birth_month" and u.state["calendar"] == "gregorian"
+    datas = datas_of(last_kb())
+    assert "bmon_back" in datas and "back_home" not in datas
+    # back to the year page
+    await cq("n5", "bmon_back")
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == pid))).scalar_one()
+        assert u.state["step"] == "birth_year"
+    # forward again month -> day -> confirm, checking back buttons at each hop
+    await cq("n6", f"byear_{today.year - 13}")
+    await cq("n7", f"bmon_{today.month}")
+    datas = datas_of(last_kb())
+    assert "bday_back" in datas and "back_home" not in datas
+    await cq("n8", f"bday_{today.day}")
+    datas = datas_of(last_kb())
+    assert "bage_back" in datas and "bage_redo" in datas and "back_home" not in datas
+    await cq("n9", "bage_back")
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == pid))).scalar_one()
+        assert u.state["step"] == "birth_day"
+
+
+@pytest.mark.asyncio
+async def test_restore_one_click_forward_with_caption(adapters):
+    """v2.3: the owner forwards the bot's backup file with its caption (the
+    restore password travels in the caption); the bot validates instantly and
+    ONE confirm click replaces all current data with the backup."""
+    from app import bot as bot_mod
+    from app import backup as bk
+    from app import bot_admin as ba
+    owner_pid = "860835914"
+    await register_via_bot(adapters, "telegram", owner_pid, "OwnerS", 30, "male")
+    await register_via_bot(adapters, "telegram", "978", "KeepMe", 25, "male")
+    async with db.session_scope() as s:
+        u1 = (await s.execute(select(User).where(User.platform_user_id == "978"))).scalar_one()
+        u1.bio = "precious"
+    async with db.session_scope() as s:
+        out = await bk.create_backup(s, "manual", "test")
+        assert isinstance(out, tuple)
+        rec, blob = out
+    async with db.session_scope() as s:
+        await s.execute(delete(User).where(User.platform_user_id == "978"))
+    # open the restore wait-state from the admin menu
+    await bot_mod.process_update("telegram", {"update_id": 700500, "callback_query": {
+        "id": "r0", "from": {"id": int(owner_pid)},
+        "message": {"chat": {"id": int(owner_pid)}}, "data": "adm_restore"}})
+    assert owner_pid in ba.RESTORE_WAIT
+    # forward the file with the caption the bot itself attaches
+    caption = (f"🔐 پشتیبان پایگاه‌داده هم‌چت\nشناسه: {rec.id}\n"
+               f"بخش 1 از 1\n🔑 رمز بازیابی: {settings.backup_password}\n"
+               "↩️ برای بازگردانی، همین فایل را با همین کپشن به ربات فوروارد کن.")
+    async with db.session_scope() as s:
+        owner = (await s.execute(select(User).where(
+            User.platform_user_id == owner_pid))).scalar_one()
+    handled = await ba.admin_document(owner, blob, caption=caption,
+                                      filename=f"{rec.filename}")
+    assert handled is True
+    st = ba.RESTORE_WAIT[owner_pid]
+    assert st.get("blob"), "blob must be validated and staged instantly"
+    assert st["password"] == settings.backup_password
+    tg_sent = RUNTIME["adapter_telegram"].sent
+    assert any("adm_restore_go" in str(k) for (_c, _t, k) in tg_sent if k), \
+        "one-click confirm button must be offered right after validation"
+    # ONE click replaces the data
+    await bot_mod.process_update("telegram", {"update_id": 700501, "callback_query": {
+        "id": "r1", "from": {"id": int(owner_pid)},
+        "message": {"chat": {"id": int(owner_pid)}}, "data": "adm_restore_go"}})
+    async with db.session_scope() as s:
+        u1 = (await s.execute(select(User).where(User.platform_user_id == "978"))).scalar_one()
+        assert u1.bio == "precious"
+    assert owner_pid not in ba.RESTORE_WAIT
+
+
+@pytest.mark.asyncio
+async def test_restore_caption_password_variants():
+    """The caption parser accepts the bot's format and a manual 'رمز: ...' line."""
+    from app.bot_admin import _parse_restore_caption
+    pwd, idx, total = _parse_restore_caption(
+        "🔐 پشتیبان پایگاه‌داده هم‌چت\nبخش 2 از 3\n🔑 رمز بازیابی: Secret-Key-9",
+        "BKP-x.enc.part02of03")
+    assert pwd == "Secret-Key-9" and (idx, total) == (2, 3)
+    pwd2, idx2, total2 = _parse_restore_caption("رمز: MyPass-2026", "backup.enc")
+    assert pwd2 == "MyPass-2026" and idx2 is None and total2 is None
+    pwd3, _, _ = _parse_restore_caption("", "x.enc")
+    assert pwd3 is None

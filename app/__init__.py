@@ -1,1 +1,1 @@
-"""Kanar Anonymous Chat — application package."""
+"""HamChat (هم‌چت) Anonymous Chat — application package."""

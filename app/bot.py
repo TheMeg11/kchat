@@ -857,7 +857,9 @@ async def begin_birthdate(user: User, calendar: str = "") -> None:
         ("jalali" if user.language == "fa" else "gregorian")
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        u.state = {"step": "birth_year", "calendar": cal}
+        u.state = {"step": "birth_year", "calendar": cal, "page": 0}
+    # keep the in-memory object in sync: send_birth_year_page reads user.state
+    user.state = {"step": "birth_year", "calendar": cal, "page": 0}
     await send_birth_year_page(user, 0)
 
 
@@ -876,7 +878,7 @@ def _year_rows(user: User, calendar: str, page: int) -> list:
         nav.append(btn(tr(user.language, "birth_year_newer"), f"bypage_{page - 1}"))
     if nav:
         rows.append(nav)
-    rows.append([btn(tr(user.language, "btn_back"), "back_home")])
+    rows.append([btn(tr(user.language, "btn_back_step"), "bcal_back")])
     return rows
 
 
@@ -900,7 +902,7 @@ async def birth_year_chosen(user: User, year: int) -> None:
     months = _months_for(user.language, calendar)
     rows = [[btn(months[i].strip(), f"bmon_{i + 1}"), btn(months[i + 6].strip(), f"bmon_{i + 7}")]
             for i in range(6)]
-    rows.append([btn(tr(user.language, "btn_back"), "back_home")])
+    rows.append([btn(tr(user.language, "btn_back_step"), "bmon_back")])
     await send(user, "birthday_ask_month", keyboard=rows)
 
 
@@ -916,7 +918,7 @@ async def birth_month_chosen(user: User, month: int) -> None:
     rows = []
     for i in range(0, maxday, 6):
         rows.append([btn(str(d), f"bday_{d}") for d in range(i + 1, min(i + 6, maxday) + 1)])
-    rows.append([btn(tr(user.language, "btn_back"), "back_home")])
+    rows.append([btn(tr(user.language, "btn_back_step"), "bday_back")])
     await send(user, "birthday_ask_day", month=months[month - 1].strip(), maxday=maxday,
                keyboard=rows)
 
@@ -948,7 +950,8 @@ async def birth_day_chosen(user: User, day: int) -> None:
         return
     await send(user, "age_confirm_q", age=age, keyboard=kb(
         [btn(tr(user.language, "age_confirm_yes"), "bage_ok")],
-        [btn(tr(user.language, "age_confirm_no"), "bage_redo")]))
+        [btn(tr(user.language, "btn_back_step"), "bage_back"),
+         btn(tr(user.language, "age_confirm_no"), "bage_redo")]))
 
 
 async def birth_confirm_ok(user: User) -> None:
@@ -985,8 +988,73 @@ async def birth_redo(user: User) -> None:
     async with session_scope() as s:
         u = await s.get(User, user.id)
         state = u.state or {}
-        u.state = {"step": "birth_year", "calendar": state.get("calendar", "jalali")}
+        u.state = {"step": "birth_year", "calendar": state.get("calendar", "jalali"), "page": 0}
+    user.state = {"step": "birth_year", "calendar": (user.state or {}).get("calendar", "jalali"),
+                  "page": 0}
     await send_birth_year_page(user, 0)
+
+
+async def resend_birth_intro(user: User) -> None:
+    """Back-step target from the year page: re-ask the calendar choice."""
+    calendar = (user.state or {}).get("calendar", "jalali")
+    async with session_scope() as s:
+        u = await s.get(User, user.id)
+        u.state = {"step": "birth_calendar", "calendar": calendar}
+    user.state = {"step": "birth_calendar", "calendar": calendar}
+    await send(user, "birth_intro", keyboard=kb(
+        [btn(tr(user.language, "birth_jalali"), "bcal_jalali"),
+         btn(tr(user.language, "birth_gregorian"), "bcal_gregorian")],
+        [btn(tr(user.language, "btn_back_step"), "back_name")]))
+
+
+async def resend_birth_year_page(user: User) -> None:
+    """Back-step target from the month page: re-show the year page."""
+    state = user.state or {}
+    calendar = state.get("calendar", "jalali")
+    page = int(state.get("page") or 0)
+    async with session_scope() as s:
+        u = await s.get(User, user.id)
+        u.state = {"step": "birth_year", "calendar": calendar, "page": page}
+    user.state = {"step": "birth_year", "calendar": calendar, "page": page}
+    await send_birth_year_page(user, page)
+
+
+async def resend_birth_month_page(user: User) -> None:
+    """Back-step target from the day page: re-show the month page."""
+    state = user.state or {}
+    calendar = state.get("calendar", "jalali")
+    async with session_scope() as s:
+        u = await s.get(User, user.id)
+        u.state = {"step": "birth_month", "calendar": calendar,
+                   "year": state.get("year"), "page": state.get("page", 0)}
+    user.state = {"step": "birth_month", "calendar": calendar,
+                  "year": state.get("year"), "page": state.get("page", 0)}
+    months = _months_for(user.language, calendar)
+    rows = [[btn(months[i].strip(), f"bmon_{i + 1}"), btn(months[i + 6].strip(), f"bmon_{i + 7}")]
+            for i in range(6)]
+    rows.append([btn(tr(user.language, "btn_back_step"), "bmon_back")])
+    await send(user, "birthday_ask_month", keyboard=rows)
+
+
+async def resend_birth_day_page(user: User) -> None:
+    """Back-step target from the age-confirm page: re-show the day page."""
+    state = user.state or {}
+    calendar = state.get("calendar", "jalali")
+    month = int(state.get("month") or 1)
+    maxday = int(state.get("maxday") or (31 if calendar == "gregorian" else 31))
+    async with session_scope() as s:
+        u = await s.get(User, user.id)
+        u.state = {"step": "birth_day", "calendar": calendar, "year": state.get("year"),
+                   "month": month, "maxday": maxday, "page": state.get("page", 0)}
+    user.state = {"step": "birth_day", "calendar": calendar, "year": state.get("year"),
+                  "month": month, "maxday": maxday, "page": state.get("page", 0)}
+    months = _months_for(user.language, calendar)
+    rows = []
+    for i in range(0, maxday, 6):
+        rows.append([btn(str(d), f"bday_{d}") for d in range(i + 1, min(i + 6, maxday) + 1)])
+    rows.append([btn(tr(user.language, "btn_back_step"), "bday_back")])
+    await send(user, "birthday_ask_day", month=months[month - 1].strip(), maxday=maxday,
+               keyboard=rows)
 
 
 # --------------------------------------------------------- name/age edit ----
@@ -1066,14 +1134,13 @@ async def show_referral(user: User) -> None:
 
 
 async def show_wallet(user: User) -> None:
-    """v2.1: wallet menu — balance + buy-coins entry + paysupport."""
+    """v2.2: wallet menu — balance + buy-coins entry (payment tickets via /paysupport)."""
     lang = user.language
     async with session_scope() as s:
         u = await s.get(User, user.id)
         coins = u.coin_balance
     rows = [
         [btn(tr(lang, "btn_store"), "store")],
-        [btn(tr(lang, "pay_support_btn"), "paysupport_ticket")],
     ]
     await send(user, "wallet_title", coins=coins, keyboard=back_kb(lang, rows))
 
@@ -1173,12 +1240,12 @@ async def start_purchase(user: User, package_id: str) -> None:
         payload = f"pkg:{pkg.id}:{u.id}"
         try:
             if u.platform == "telegram":
-                await adp.send_invoice(u.platform_user_id, f"🪙 {pkg.coins} سکه کانار",
-                                       "خرید سکه برای چت ناشناس کانار", payload,
+                await adp.send_invoice(u.platform_user_id, f"🪙 {pkg.coins} سکه هم‌چت",
+                                       "خرید سکه برای چت ناشناس هم‌چت", payload,
                                        [{"label": f"{pkg.coins} coins", "amount": pkg.telegram_stars_price}])
             else:
-                await adp.send_invoice(u.platform_user_id, f"🪙 {pkg.coins} سکه کانار",
-                                       "خرید سکه برای چت ناشناس کانار", payload,
+                await adp.send_invoice(u.platform_user_id, f"🪙 {pkg.coins} سکه هم‌چت",
+                                       "خرید سکه برای چت ناشناس هم‌چت", payload,
                                        [{"label": f"{pkg.coins} coins", "amount": pkg.bale_toman_price * 10}])
         except UnsupportedMethod as exc:
             await send(u, "pay_unavailable")
@@ -1308,14 +1375,16 @@ async def handle_message(platform: str, msg: dict) -> None:
             from .bot_admin import admin_text_flow
             if await admin_text_flow(user, text):
                 return
-        # --- owner uploads backup file during restore wait-state ---
+        # --- owner forwards a backup file during restore wait-state ---
         doc = msg.get("document")
         if doc:
             from .bot_admin import RESTORE_WAIT, admin_document
             if str(user.platform_user_id) in RESTORE_WAIT:
                 try:
                     data = await adp.download_file(doc["file_id"], 200 * 1024 * 1024)
-                    if await admin_document(user, data):
+                    if await admin_document(user, data,
+                                            caption=msg.get("caption") or "",
+                                            filename=doc.get("file_name") or ""):
                         return
                 except Exception:
                     log.exception("restore upload download failed")
@@ -1347,7 +1416,7 @@ async def handle_message(platform: str, msg: dict) -> None:
             await send(user, "birth_intro", keyboard=kb(
                 [btn(tr(user.language, "birth_jalali"), "bcal_jalali"),
                  btn(tr(user.language, "birth_gregorian"), "bcal_gregorian")],
-                [btn(tr(user.language, "btn_back"), "back_home")]))
+                [btn(tr(user.language, "btn_back_step"), "back_name")]))
             return
         if step in ("birth_calendar",):
             await send(user, "invalid_input")
@@ -1608,7 +1677,7 @@ async def relay_media(src, dst, partner: User, msg: dict, mtype: str,
                                        "first_name": c.get("first_name", "")})
         return True
     data = await src.download_file(media["file_id"], settings.cross_media_max_bytes)
-    filename = (media.get("file_name") or f"kanar_{mtype}")
+    filename = (media.get("file_name") or f"hamchat_{mtype}")
     await dst.send_media(partner.platform_user_id, mtype, bytes_data=data,
                          filename=filename, caption=caption)
     return True
@@ -1675,13 +1744,39 @@ async def handle_callback(platform: str, query: dict) -> None:
             await s.commit()
             await begin_birthdate(user, "jalali" if data == "bcal_jalali" else "gregorian")
             return
+        if data == "bcal_back":       # year page -> calendar choice
+            await s.commit()
+            await resend_birth_intro(user)
+            return
+        if data == "bmon_back":       # month page -> year page
+            await s.commit()
+            await resend_birth_year_page(user)
+            return
+        if data == "bday_back":       # day page -> month page
+            await s.commit()
+            await resend_birth_month_page(user)
+            return
+        if data == "bage_back":       # age confirm -> day page
+            await s.commit()
+            await resend_birth_day_page(user)
+            return
+        if data == "back_name":       # calendar choice -> re-enter display name
+            user.state = {"step": "name"}
+            await send(user, "ask_name")
+            return
         if data.startswith("byear_"):
             await s.commit()
             await birth_year_chosen(user, int(data[6:]))
             return
         if data.startswith("bypage_"):
             await s.commit()
-            await send_birth_year_page(user, int(data[7:]))
+            page = max(0, int(data[7:]))
+            state = user.state or {}
+            user.state = {"step": "birth_year", "calendar": state.get("calendar", "jalali"),
+                          "page": page}
+            s.add(user)
+            await s.commit()
+            await send_birth_year_page(user, page)
             return
         if data.startswith("bmon_"):
             await s.commit()

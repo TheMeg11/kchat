@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 
 from sqlalchemy import delete, func, select
@@ -16,8 +17,32 @@ from .platform import PlatformError
 
 log = logging.getLogger("kanar.botadmin")
 
-# in-memory restore wait-state (chat_id -> parts)
-RESTORE_WAIT: dict[str, list[bytes]] = {}
+# in-memory restore wait-state (chat_id -> collected parts / password / validated blob)
+# v2.3 one-click flow: owner forwards the backup file with the restore password
+# in its caption; the bot validates instantly and replaces data on one confirm.
+RESTORE_WAIT: dict[str, dict] = {}
+
+_CAP_PWD_RE = re.compile(r"(?:رمز\s*(?:بازیابی|نگاری)?|password)\s*[:：]\s*([^\s]{4,})", re.I)
+_CAP_PART_RE = re.compile(r"بخش\s*(\d+)\s*از\s*(\d+)")
+_FN_PART_RE = re.compile(r"\.(?:part)?(\d+)of(\d+)", re.I)
+
+
+def _parse_restore_caption(caption: str, filename: str):
+    """Extract (password, partIndex, partTotal) from a forwarded backup caption/filename."""
+    pwd = None
+    if caption:
+        m = _CAP_PWD_RE.search(caption)
+        if m:
+            pwd = m.group(1)
+    idx = total = None
+    m = _CAP_PART_RE.search(caption or "")
+    if m:
+        idx, total = int(m.group(1)), int(m.group(2))
+    else:
+        m = _FN_PART_RE.search(filename or "")
+        if m:
+            idx, total = int(m.group(1)), int(m.group(2))
+    return pwd, idx, total
 
 
 def kb(rows):
@@ -102,7 +127,7 @@ async def _menu(user: User, role: str) -> None:
     rows.append([btn("🏠 بازگشت به منوی اصلی", "back_home")])
     labels = {"owner": "مالک (Owner)", "senior_admin": "مدیر ارشد",
               "moderator": "ناظر", "support": "پشتیبان"}
-    await _say(user, f"🛡 پنل مدیریت کانار\n"
+    await _say(user, f"🛡 پنل مدیریت هم‌چت\n"
                     f"👤 نقش شما: {labels.get(role, role)}\n"
                     f"💡 یک گزینه را انتخاب کنید:", keyboard=rows or None)
 
@@ -262,13 +287,14 @@ async def admin_callback(user: User, data: str, chat_id) -> None:
         return
 
     if data == "adm_restore" and role == "owner":
-        RESTORE_WAIT[str(chat_id)] = []
-        await _say(user, "♻️ حالت انتظار فایل فعال شد.\n"
-                        "فایل(های) پشتیبان .enc را همین‌جا بفرستید (اگر چند بخش است، به ترتیب همه را).\n"
-                        "سپس دکمه «شروع بازیابی» را بزنید.\n"
+        RESTORE_WAIT[str(chat_id)] = {"parts": {}, "password": None, "expected": None}
+        await _say(user, "♻️ حالت بازیابی فعال شد.\n\n"
+                        "فایل پشتیبانی که ربات برایت فرستاده را همین‌جا فوروارد کن.\n"
+                        "🔑 رمز بازیابی باید در کپشن فایل باشد (ربات خودش آن را در کپشن می‌نویسد؛ "
+                        "اگر کپشن را دستی تغییر دادی، به شکل «رمز بازیابی: ...» بنویس).\n\n"
+                        "پشتیبان بلافاصله اعتبارسنجی می‌شود و با یک کلیک جایگزین می‌شود.\n"
                         "⚠️ بازیابی کامل، همه داده‌های فعلی را با نسخه پشتیبان جایگزین می‌کند.",
-                   keyboard=kb([[btn("🚀 شروع بازیابی", "adm_restore_go")],
-                                [btn("❌ لغو", "adm_restore_cancel")]]))
+                   keyboard=kb([[btn("❌ لغو", "adm_restore_cancel")]]))
         return
 
     if data == "adm_restore_cancel":
@@ -277,19 +303,18 @@ async def admin_callback(user: User, data: str, chat_id) -> None:
         return
 
     if data == "adm_restore_go" and role == "owner":
-        parts = RESTORE_WAIT.get(str(chat_id)) or []
-        if not parts:
-            await _say(user, "هیچ فایلی دریافت نشد. ابتدا فایل پشتیبان را بفرستید.")
-            return
-        blob = b"".join(parts)
+        # one-click confirm: the blob was already validated in admin_document
+        st = RESTORE_WAIT.get(str(chat_id)) or {}
+        blob = st.get("blob") or b""
+        password = st.get("password") or settings.backup_password
         RESTORE_WAIT.pop(str(chat_id), None)
-        await _say(user, "⏳ اعتبارسنجی رمزنگاری و MANIFEST...")
-        v = backup_mod.validate_blob(blob, password=settings.backup_password)
-        if not v["valid"]:
-            await _say(user, f"❌ آرشیو نامعتبر است:\n" + "\n".join(v["warnings"]))
+        if not blob:
+            await _say(user, "هیچ فایلی دریافت نشد. ابتدا فایل پشتیبان را فوروارد کن "
+                             "(از منوی مدیریت ← ♻️ بازیابی از فایل).")
             return
-        await _say(user, "✅ معتبر. ایجاد اسنپ‌شات اضطراری و بازیابی... (حالت تعمیر فعال می‌شود)")
-        result = await backup_mod.execute_restore(blob, settings.backup_password)
+        await _say(user, "⏳ اسنپ‌شات اضطراری گرفته می‌شود و بازیابی آغاز می‌شود "
+                         "(حالت تعمیر فعال می‌شود)...")
+        result = await backup_mod.execute_restore(blob, password)
         icon = "✅" if result["status"] == "succeeded" else "⚠️"
         await _say(user, f"{icon} {result['message']}\nاسنپ‌شات بازگشت: {result['rollbackSnapshotId']}\n"
                         f"مدت: {result['durationSec']} ثانیه")
@@ -440,17 +465,57 @@ async def admin_text_flow(user: User, text: str) -> bool:
     return False
 
 
-async def admin_document(user: User, file_bytes: bytes) -> bool:
-    """Owner uploads a backup part during restore wait-state."""
+async def admin_document(user: User, file_bytes: bytes,
+                         caption: str = "", filename: str = "") -> bool:
+    """Owner forwards a backup file during restore wait-state (v2.3 one-click).
+
+    The forwarded caption carries everything needed for the restore — most
+    importantly the encryption password (the bot itself puts it there when
+    delivering the backup). The blob is validated instantly; one confirm
+    button replaces all current data with the backup.
+    """
     chat_key = str(user.platform_user_id)
-    if chat_key not in RESTORE_WAIT:
+    st = RESTORE_WAIT.get(chat_key)
+    if st is None:
         return False
     role = await get_role(user)
     if role != "owner":
         return False
-    RESTORE_WAIT[chat_key].append(file_bytes)
-    await _say(user, f"📄 بخش {len(RESTORE_WAIT[chat_key])} دریافت شد ({len(file_bytes)/1e6:.1f} MB). "
-                    "در صورت وجود بخش‌های بیشتر بفرستید، سپس «شروع بازیابی» را بزنید.")
+    pwd, idx, total = _parse_restore_caption(caption, filename)
+    if pwd:
+        st["password"] = pwd
+    if total:
+        st["expected"] = total
+    st["parts"][idx or len(st["parts"]) + 1] = file_bytes
+    received = len(st["parts"])
+    expected = st.get("expected")
+    if expected and received < expected:
+        await _say(user, f"📄 بخش {received} از {expected} دریافت شد "
+                         f"({len(file_bytes) / 1e6:.1f} MB). "
+                         "بخش‌های باقی‌مانده را هم فوروارد کن.")
+        return True
+    blob = b"".join(st["parts"][i] for i in sorted(st["parts"]))
+    password = st.get("password") or settings.backup_password
+    v = backup_mod.validate_blob(blob, password=password)
+    if not v["valid"]:
+        if not expected:
+            # might be part 1 of a multi-part archive (or a wrong/missing password)
+            await _say(user, f"📄 فایل {received} دریافت شد ({len(file_bytes) / 1e6:.1f} MB) "
+                             "اما هنوز یک آرشیو کامل و معتبر نیست.\n"
+                             "• اگر پشتیبان چندبخشی است، بقیه بخش‌ها را هم فوروارد کن.\n"
+                             "• اگر رمز در کپشن نبود، هنگام فوروارد بنویس: رمز بازیابی: ...")
+            return True
+        await _say(user, "❌ آرشیو نامعتبر است:\n" + "\n".join(v["warnings"]))
+        RESTORE_WAIT.pop(chat_key, None)
+        return True
+    st["blob"] = blob
+    await _say(user,
+               f"✅ پشتیبان معتبر است — حجم {v['sizeMb']} MB | اسکیما {v['schemaVersion']} "
+               f"| چک‌سام SHA-256 تایید شد.\n"
+               "⚠️ با تأیید، همه داده‌های فعلی با این نسخه جایگزین می‌شود "
+               "(اسنپ‌شات اضطراری هم گرفته می‌شود).",
+               keyboard=kb([[btn("♻️ جایگزینی با این پشتیبان", "adm_restore_go")],
+                            [btn("❌ لغو", "adm_restore_cancel")]]))
     return True
 
 

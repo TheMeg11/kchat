@@ -149,13 +149,13 @@ async def ensure_webadmin() -> None:
     username = security.random_username()
     password = security.random_password()
     async with session_scope() as s:
-        s.add(WebAdmin(username=username, full_name="مالک کانار", email="",
+        s.add(WebAdmin(username=username, full_name="مالک هم‌چت", email="",
                        password_hash=security.hash_password(password),
                        role="owner", must_change_password=True, status="active"))
     log.info("initial web admin created: %s", username)
     if settings.delivery_bot_token:
         panel = settings.public_url or "(PUBLIC_URL تنظیم نشده)"
-        text = ("🔐 پنل مدیریت وب کانار — اطلاعات ورود اولیه\n\n"
+        text = ("🔐 پنل مدیریت وب هم‌چت — اطلاعات ورود اولیه\n\n"
                 f"آدرس: {panel}\nنام کاربری: <code>{username}</code>\n"
                 f"رمز عبور: <code>{password}</code>\n\n"
                 "⚠️ این رمز فقط همین یک‌بار نمایش داده می‌شود؛ در اولین ورود باید آن را تغییر دهید "
@@ -396,7 +396,7 @@ async def lifespan(app: FastAPI):
     await db.dispose_engine()
 
 
-app = FastAPI(title="Kanar Anonymous Chat", lifespan=lifespan,
+app = FastAPI(title="HamChat — Anonymous Chat", lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)
 
 
@@ -405,9 +405,8 @@ async def csrf_middleware(request: Request, call_next):
     path = request.url.path
     if (path.startswith("/api/admin/v1") and
             request.method in ("POST", "PUT", "PATCH", "DELETE") and
-            not path.endswith(("/auth/login", "/auth/verify-totp",
+            not path.endswith(("/auth/login",
                                "/auth/change-initial-password",
-                               "/auth/totp/enroll/confirm",
                                "/auth/logout"))):
         sid = request.cookies.get(SESSION_COOKIE)
         token = request.headers.get("X-CSRF-Token")

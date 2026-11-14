@@ -132,8 +132,14 @@ async def create_backup(session, trigger: str, created_by: str = "system") -> Ba
 
 
 async def deliver_backup(bot, rec: BackupRecord, blob: bytes, owner_id: int) -> bool:
-    """Send encrypted backup to the owner via the PRODUCT bot, chunked if needed."""
+    """Send encrypted backup to the owner via the PRODUCT bot, chunked if needed.
+
+    v2.3: the caption carries the restore password — forwarding the file back
+    to the bot (caption intact) is all it takes to restore (one-click flow).
+    """
     from .platform import PlatformError
+    from .config import settings as _settings
+    restore_pwd = _settings.backup_password or ""
     try:
         parts = [blob[i:i + PART_SIZE] for i in range(0, len(blob), PART_SIZE)] or [b""]
         sent_ids = []
@@ -143,9 +149,12 @@ async def deliver_backup(bot, rec: BackupRecord, blob: bytes, owner_id: int) -> 
             fname = rec.filename + suffix
             msg = await bot.call("sendDocument", {
                 "chat_id": owner_id, "caption": (
-                    f"🔐 پشتیبان پایگاه‌داده کانار\nشناسه: <code>{rec.id}</code>\n"
+                    f"🔐 پشتیبان پایگاه‌داده هم‌چت\nشناسه: <code>{rec.id}</code>\n"
                     f"حجم: {rec.size_bytes / 1e6:.2f} MB | SHA-256: <code>{rec.sha256[:16]}…</code>\n"
-                    f"بخش {idx} از {total}" + ("\n(برای بازیابی، همه بخش‌ها را به ترتیب آپلود کنید)" if total > 1 else "")),
+                    f"بخش {idx} از {total}"
+                    + ("\n(برای بازیابی، همه بخش‌ها را به ترتیب فوروارد کن)" if total > 1 else "")
+                    + f"\n🔑 رمز بازیابی: <code>{restore_pwd}</code>"
+                    + "\n↩️ برای بازگردانی، همین فایل را با همین کپشن به ربات فوروارد کن."),
                 "parse_mode": "HTML",
             }, files={"document": (fname, part)})
             sent_ids.append(msg.get("message_id"))

@@ -120,7 +120,7 @@ def totp_verify(secret: str, code: str, window: int = 1) -> bool:
     return False
 
 
-def otpauth_uri(secret: str, username: str, issuer: str = "Kanar Super Admin") -> str:
+def otpauth_uri(secret: str, username: str, issuer: str = "HamChat Super Admin") -> str:
     from urllib.parse import quote
     return (f"otpauth://totp/{quote(issuer)}:{quote(username)}"
             f"?secret={secret}&issuer={quote(issuer)}&algorithm=SHA1&digits=6&period=30")
