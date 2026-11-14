@@ -20,7 +20,7 @@ def _parse_ids(raw: str) -> List[int]:
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_ignore_empty=True)
 
     # Database (SQLite for local dev/tests, Postgres on Railway)
     database_url: str = "sqlite+aiosqlite:///./kanarchat.db"

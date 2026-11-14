@@ -30,3 +30,46 @@ python -m pytest tests/ -q
 
 ## Railway deploy
 See `docs/DEPLOYMENT.md`. Set the variables from `.env.example` (esp. `DATABASE_URL`, `PUBLIC_URL`, `ENCRYPTION_KEY`, `BACKUP_PASSWORD`, `WEBHOOK_SECRET`, tokens), then deploy the Dockerfile. Health: `/health`.
+
+## Environment variables (empty template)
+
+Copy the block into Railway → Variables (or a local `.env`) and fill in your own values. Railway injects `DATABASE_URL` (when a Postgres service is attached), `PORT` and `RAILWAY_*` automatically — do not set those by hand. Empty values are ignored and fall back to the built-in defaults, so pasting the whole block as-is is safe.
+
+```
+DATABASE_URL=
+TELEGRAM_BOT_TOKEN=
+BALE_BOT_TOKEN=
+BALE_PROVIDER_TOKEN=
+DELIVERY_BOT_TOKEN=
+ENCRYPTION_KEY=
+BACKUP_PASSWORD=
+WEBHOOK_SECRET=
+PUBLIC_URL=
+ADMIN_TELEGRAM_IDS=
+ADMIN_BALE_IDS=
+BACKUP_OWNER_TELEGRAM_ID=
+BACKUP_HOUR_TEHRAN=
+ADMIN_PANEL_USERNAME=
+ADMIN_PANEL_PASSWORD=
+CROSS_MEDIA_MAX_BYTES=
+TELEGRAM_CHUNK_BYTES=
+ALLOW_SQLITE_ON_RAILWAY=
+```
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL URL (Railway injects it when Postgres is attached; SQLite is used for local dev) |
+| `TELEGRAM_BOT_TOKEN` / `BALE_BOT_TOKEN` | Platform bot tokens from Telegram @BotFather / Bale @BotFather |
+| `BALE_PROVIDER_TOKEN` | Bale wallet payment token ("پرداخت در بازوها") — empty keeps Bale payments disabled |
+| `DELIVERY_BOT_TOKEN` | Separate bot used only for one-time credential / backup-password delivery |
+| `ENCRYPTION_KEY` | 32-byte key for AES-256-GCM message encryption |
+| `BACKUP_PASSWORD` | Passphrase for the daily encrypted DB backup |
+| `WEBHOOK_SECRET` | Shared secret between the platform webhook and the app |
+| `PUBLIC_URL` | Public HTTPS URL (webhook mode; empty → long polling fallback) |
+| `ADMIN_TELEGRAM_IDS` / `ADMIN_BALE_IDS` | Owner user IDs per platform (comma separated) |
+| `BACKUP_OWNER_TELEGRAM_ID` | Telegram ID that receives the daily 03:00 (Asia/Tehran) backup |
+| `BACKUP_HOUR_TEHRAN` | Backup hour in Tehran time (default 3) |
+| `ADMIN_PANEL_USERNAME` / `ADMIN_PANEL_PASSWORD` | Super Admin web panel bootstrap credentials (reconciled at every startup) |
+| `CROSS_MEDIA_MAX_BYTES` | Cross-platform media relay cap (default 20 MB) |
+| `TELEGRAM_CHUNK_BYTES` | Telegram multipart upload chunk (default 40 MB) |
+| `ALLOW_SQLITE_ON_RAILWAY` | Escape hatch: `1` permits SQLite on Railway (normally guarded against) |
