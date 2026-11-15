@@ -90,14 +90,24 @@ def _is_dt(type_) -> bool:
 
 
 async def _restore_into(session, payload: dict) -> dict:
-    """Wipe & load inside the caller's transaction; verify consistency."""
+    """Wipe & load inside the caller's transaction; verify consistency.
+
+    v2.4.3 fix: deletion MUST run in REVERSE dependency order (children
+    before parents). The old manifest-order deletion started with `users`,
+    so any current row still referencing a user (coin_transactions, chats,
+    …) aborted the whole restore with a ForeignKeyViolationError on real
+    Postgres (incident 2026-11-15 05:22) — the sqlite test suite never
+    enforced FKs, which is why it slipped through. All metadata tables are
+    wiped children-first (including tables absent from the archive), then
+    rows load in manifest (parent-first) order."""
     order = payload.get("manifest", {}).get("table_order") or BACKUP_TABLES
     loaded: dict[str, int] = {}
+    for table in reversed(db.Base.metadata.sorted_tables):
+        await session.execute(delete(table))
     for tname in order:
         table = MODEL_BY_TABLE.get(tname)
         if table is None:
             continue
-        await session.execute(delete(table))
         rows = payload.get("data", {}).get(tname, [])
         if rows:
             await session.execute(table.insert(), [_coerce(table, r) for r in rows])

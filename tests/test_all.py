@@ -2756,3 +2756,40 @@ async def test_spawn_keeps_strong_reference_and_cleans_up():
         if t not in _BG_TASKS:
             break
     assert t not in _BG_TASKS, "completed task must be dropped from the set"
+
+
+@pytest.mark.asyncio
+async def test_restore_deletes_children_before_parents_fk_safe(adapters):
+    """v2.4.3 REGRESSION (real Postgres incident 2026-11-15 05:22): the restore
+    wiped tables in manifest order starting with `users`, so any CURRENT row
+    still referencing a user (coin_transactions, chats, …) aborted the whole
+    restore with ForeignKeyViolationError. sqlite does not enforce FKs by
+    default, which is why the suite never caught it — this test turns FK
+    enforcement ON and pins the children-first wipe order."""
+    from app import backup as bk
+    from sqlalchemy import event
+    await register_via_bot(adapters, "telegram", "991", "FkA", 25, "male")
+    async with db.session_scope() as s:
+        out = await bk.create_backup(s, "manual", "test")
+        _, blob = out
+    # a child row created AFTER the backup — with the old manifest-order wipe
+    # (users first) this row made `DELETE FROM users` fail on real Postgres
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "991"))).scalar_one()
+        s.add(CoinTransaction(user_id=u.id, amount=5, balance_after=5, type="test",
+                              description="post-backup row"))
+    engine = db.get_engine()
+
+    def _fk_on(conn, _rec):
+        from sqlalchemy import text as _t
+        conn.execute(_t("PRAGMA foreign_keys=ON"))
+
+    event.listen(engine.sync_engine, "connect", _fk_on)
+    try:
+        result = await bk.execute_restore(blob, "")
+        assert result["status"] == "succeeded", result
+    finally:
+        event.remove(engine.sync_engine, "connect", _fk_on)
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "991"))).scalar_one()
+        assert u is not None, "restored backup row must be back"
