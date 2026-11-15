@@ -89,6 +89,39 @@ def _is_dt(type_) -> bool:
     return isinstance(type_, (sa.DateTime, sa.types.DateTime))
 
 
+def _selfref_columns(table) -> list[str]:
+    """Columns whose FK points back at the SAME table (users.referred_by_id)."""
+    return [fk.parent.name for fk in table.foreign_keys if fk.column.table is table]
+
+
+async def _insert_rows(session, table, rows: list[dict]) -> None:
+    """Insert rows with self-referential FK handling (v2.4.3).
+
+    Real-Postgres incident 2026-11-15 05:27: users.referred_by_id -> users.id
+    broke the bulk INSERT whenever a row referenced another row LATER in the
+    file (FK checked immediately, no DEFERRABLE). Two-phase insert: first
+    pass stores the self-ref columns as NULL, second pass UPDATEs the real
+    values once every row of the table exists."""
+    selfrefs = _selfref_columns(table)
+    if not selfrefs or not rows:
+        await session.execute(table.insert(), rows)
+        return
+    first = [{k: (None if k in selfrefs else v) for k, v in r.items()} for r in rows]
+    await session.execute(table.insert(), first)
+    from sqlalchemy import select as _sel
+    pk = list(table.primary_key.columns)[0].name
+    existing = {row[pk]: row for row in
+                (await session.execute(_sel(table))).mappings().all()}
+    for r in rows:
+        key = r.get(pk)
+        cur = existing.get(key)
+        if cur is None or all(cur[c] == r.get(c) for c in selfrefs):
+            continue
+        await session.execute(
+            table.update().where(table.c[pk] == key).values(
+                **{c: r.get(c) for c in selfrefs}))
+
+
 async def _restore_into(session, payload: dict) -> dict:
     """Wipe & load inside the caller's transaction; verify consistency.
 
@@ -110,7 +143,7 @@ async def _restore_into(session, payload: dict) -> dict:
             continue
         rows = payload.get("data", {}).get(tname, [])
         if rows:
-            await session.execute(table.insert(), [_coerce(table, r) for r in rows])
+            await _insert_rows(session, table, [_coerce(table, r) for r in rows])
         loaded[tname] = len(rows)
     # ---- consistency checks ----
     problems = []

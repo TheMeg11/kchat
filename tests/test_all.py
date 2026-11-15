@@ -2793,3 +2793,46 @@ async def test_restore_deletes_children_before_parents_fk_safe(adapters):
     async with db.session_scope() as s:
         u = (await s.execute(select(User).where(User.platform_user_id == "991"))).scalar_one()
         assert u is not None, "restored backup row must be back"
+
+
+@pytest.mark.asyncio
+async def test_restore_handles_selfref_fk_row_order(adapters):
+    """v2.4.3 REGRESSION (real Postgres incident 2026-11-15 05:27): the bulk
+    users INSERT violated users_referred_by_id_fkey whenever a row's
+    referred_by_id pointed at a row LATER in the file (immediate FK check, no
+    DEFERRABLE). The two-phase insert (NULL first, UPDATE after) fixes it —
+    pinned here with FK enforcement ON and a deliberately reversed row order."""
+    from app import backup as bk
+    from sqlalchemy import event
+    await register_via_bot(adapters, "telegram", "995", "RefOrigin", 25, "male")
+    await register_via_bot(adapters, "telegram", "996", "RefTarget", 25, "female")
+    async with db.session_scope() as s:
+        a = (await s.execute(select(User).where(User.platform_user_id == "995"))).scalar_one()
+        b = (await s.execute(select(User).where(User.platform_user_id == "996"))).scalar_one()
+        b.referred_by_id = a.id
+    async with db.session_scope() as s:
+        out = await bk.create_backup(s, "manual", "test")
+        _, blob = out
+    # craft a payload where the REFERRING row (996) comes BEFORE the referee
+    # row (995) — the exact shape that killed the single-phase INSERT
+    import gzip, json as _json
+    payload = _json.loads(gzip.decompress(blob))
+    users = payload["data"]["users"]
+    users.sort(key=lambda u: (u.get("platform_user_id") != "996",))
+    bad_blob = gzip.compress(_json.dumps(payload, ensure_ascii=False).encode())
+    engine = db.get_engine()
+
+    def _fk_on(conn, _rec):
+        from sqlalchemy import text as _t
+        conn.execute(_t("PRAGMA foreign_keys=ON"))
+
+    event.listen(engine.sync_engine, "connect", _fk_on)
+    try:
+        result = await bk.execute_restore(bad_blob, "")
+        assert result["status"] == "succeeded", result
+    finally:
+        event.remove(engine.sync_engine, "connect", _fk_on)
+    async with db.session_scope() as s:
+        b = (await s.execute(select(User).where(User.platform_user_id == "996"))).scalar_one()
+        a = (await s.execute(select(User).where(User.platform_user_id == "995"))).scalar_one()
+        assert b.referred_by_id == a.id, "self-ref FK value must survive the two-phase insert"
