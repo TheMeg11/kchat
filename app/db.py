@@ -437,7 +437,7 @@ class BackupRecord(Base):
     __tablename__ = "backups"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     filename: Mapped[str] = mapped_column(String(128))
-    trigger: Mapped[str] = mapped_column(String(16), default="manual")
+    trigger: Mapped[str] = mapped_column(String(32), default="manual")
     status: Mapped[str] = mapped_column(String(12), default="success")
     size_bytes: Mapped[int] = mapped_column(BigInteger(), default=0)
     sha256: Mapped[str] = mapped_column(String(64), default="")
@@ -519,7 +519,18 @@ def init_engine(url: str):
     elif url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     if url.startswith("postgres"):
-        _engine = create_async_engine(url, pool_size=5, max_overflow=5, pool_pre_ping=True)
+        # v2.4.3: hard server-side timeouts. Incident 2026-11-14: a stuck query
+        # (row-lock wait without lock_timeout) froze the Bale polling handler
+        # FOREVER — getUpdates stopped mid-loop, 1500+ updates piled up and the
+        # bot went completely deaf. No query may hang longer than these caps;
+        # the timeouts turn a silent infinite hang into a logged, retried error.
+        _engine = create_async_engine(
+            url, pool_size=5, max_overflow=5, pool_pre_ping=True,
+            connect_args={"server_settings": {
+                "statement_timeout": "30000",                 # ms
+                "lock_timeout": "10000",                      # ms
+                "idle_in_transaction_session_timeout": "60000",  # ms
+            }}, pool_timeout=30)
     else:
         _engine = create_async_engine(url, pool_pre_ping=True)
     SessionLocal = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
@@ -611,6 +622,10 @@ def _sync_columns(sync_conn, table: str) -> set:
 # birth-confirmation step (each retry re-prompted — the "message flood").
 _WIDEN_COLUMNS: list[tuple[str, str, int]] = [
     ("users", "birth_calendar", 16),
+    # v2.4.3 FIX: execute_restore writes trigger="restore_rollback_snapshot"
+    # (25 chars) into this column — varchar(16) made EVERY restore fail with
+    # StringDataRightTruncationError at the emergency-snapshot step.
+    ("backups", "trigger", 32),
 ]
 
 

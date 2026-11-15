@@ -1,7 +1,15 @@
-"""Encrypted database backup, Telegram delivery, restore & rollback engine."""
+"""Compressed database backup, Telegram delivery, restore & rollback engine.
+
+v2.4.3 product change: the super-admin backup is COMPRESSED (gzip) but NOT
+ENCRYPTED — restore needs zero credentials. The old encrypted flow failed in
+practice twice (BACKUP_PASSWORD rotated between the backup and the restore,
+and caption-password parsing is fragile), so a plain .json.gz is delivered.
+Legacy AES-encrypted .enc archives remain fully restorable: validate/execute
+auto-detect the format by magic bytes (KNRB1 = encrypted, gzip = plain)."""
 from __future__ import annotations
 
 import asyncio
+import gzip
 import io
 import json
 import logging
@@ -109,37 +117,28 @@ async def _restore_into(session, payload: dict) -> dict:
 
 
 async def create_backup(session, trigger: str, created_by: str = "system") -> BackupRecord:
-    """Dump -> compress -> AES-256-GCM encrypt -> SHA-256 -> record."""
+    """Dump -> gzip (v2.4.3: no encryption) -> SHA-256 -> record."""
     import gzip
     stamp = utcnow().strftime("%Y%m%d_%H%M%S")
     bid = f"BKP-{stamp}-{secrets.token_hex(2)}"
-    rec = BackupRecord(id=bid, filename=f"kanar_db_{stamp}.json.gz.enc",
+    rec = BackupRecord(id=bid, filename=f"kanar_db_{stamp}.json.gz",
                        trigger=trigger, schema_version="1.0.0", created_by=created_by)
-    from .config import settings
-    password = settings.backup_password
-    if not password:
-        rec.status = "failed"
-        rec.error_message = "BACKUP_PASSWORD not configured"
-        session.add(rec)
-        return rec
     raw = await dump_database(session)
-    comp = gzip.compress(raw, compresslevel=6)
-    blob, digest = security.encrypt_backup(comp, password)
+    blob = gzip.compress(raw, compresslevel=6)
+    rec.encrypted = False
+    rec.cipher = "gzip only (no encryption)"
     rec.size_bytes = len(blob)
-    rec.sha256 = digest
+    rec.sha256 = security.sha256_hex(blob)
     session.add(rec)
     return rec, blob  # type: ignore[return-value]
 
 
 async def deliver_backup(bot, rec: BackupRecord, blob: bytes, owner_id: int) -> bool:
-    """Send encrypted backup to the owner via the PRODUCT bot, chunked if needed.
+    """Send the backup to the owner via the PRODUCT bot, chunked if needed.
 
-    v2.3: the caption carries the restore password — forwarding the file back
-    to the bot (caption intact) is all it takes to restore (one-click flow).
-    """
+    v2.4.3: the file is plain gzip — no restore password anymore. Forwarding
+    the file back to the bot (caption intact) is all it takes to restore."""
     from .platform import PlatformError
-    from .config import settings as _settings
-    restore_pwd = _settings.backup_password or ""
     try:
         parts = [blob[i:i + PART_SIZE] for i in range(0, len(blob), PART_SIZE)] or [b""]
         sent_ids = []
@@ -149,11 +148,11 @@ async def deliver_backup(bot, rec: BackupRecord, blob: bytes, owner_id: int) -> 
             fname = rec.filename + suffix
             msg = await bot.call("sendDocument", {
                 "chat_id": owner_id, "caption": (
-                    f"🔐 پشتیبان پایگاه‌داده هم‌چت\nشناسه: <code>{rec.id}</code>\n"
+                    f"📦 پشتیبان پایگاه‌داده هم‌چت\nشناسه: <code>{rec.id}</code>\n"
                     f"حجم: {rec.size_bytes / 1e6:.2f} MB | SHA-256: <code>{rec.sha256[:16]}…</code>\n"
-                    f"بخش {idx} از {total}"
+                    f"بخش {idx} از {total}\n"
+                    "🔒 gzip بدون رمزنگاری — نیازی به رمز بازیابی نیست."
                     + ("\n(برای بازیابی، همه بخش‌ها را به ترتیب فوروارد کن)" if total > 1 else "")
-                    + f"\n🔑 رمز بازیابی: <code>{restore_pwd}</code>"
                     + "\n↩️ برای بازگردانی، همین فایل را با همین کپشن به ربات فوروارد کن."),
                 "parse_mode": "HTML",
             }, files={"document": (fname, part)})
@@ -218,28 +217,54 @@ async def run_backup_job(bot, trigger: str, created_by: str = "system") -> Optio
 
 
 # ---------------------------------------------------------------- restore ----
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+def _load_payload(blob: bytes, password: str) -> tuple[dict, bool]:
+    """Auto-detect the archive format and return (payload, encrypted).
+
+    Raises ValueError with a user-safe message on any failure."""
+    if blob[:5] == security.BACKUP_MAGIC:
+        if not password:
+            raise ValueError("ENCRYPTED_NO_PASSWORD")
+        try:
+            comp = security.decrypt_backup(blob, password)
+        except ValueError as exc:
+            raise ValueError(f"AUTH_FAILED: {exc}") from exc
+        return json.loads(gzip.decompress(comp)), True
+    if blob[:2] == GZIP_MAGIC:
+        return json.loads(gzip.decompress(blob)), False
+    raise ValueError("BAD_FORMAT: not a kanar backup archive")
+
+
 def validate_blob(blob: bytes, expected_sha256: str = "", password: str = "") -> dict:
-    """Manifest/format/checksum/encryption validation without touching the DB."""
+    """Manifest/format/checksum/encryption validation without touching the DB.
+
+    v2.4.3: auto-detects plain gzip (new) vs AES-encrypted (legacy)."""
     result: dict[str, Any] = {"valid": False, "encrypted": True, "warnings": [],
                               "sha256": security.sha256_hex(blob), "checksumMatch": None,
                               "schemaVersion": "", "currentSchemaVersion": "1.0.0",
                               "compatible": False, "sizeMb": round(len(blob) / 1e6, 2)}
     if expected_sha256:
         result["checksumMatch"] = (expected_sha256 == result["sha256"])
-    if not password:
-        result["warnings"].append("BACKUP_PASSWORD تنظیم نشده؛ رمزگشایی ممکن نیست.")
+    if blob[:5] == security.BACKUP_MAGIC:
+        result["encrypted"] = True
+        if not password:
+            result["warnings"].append("این فایل رمزنگاری‌شده است؛ رمز بازیابی لازم است "
+                                      "(فایل‌های جدید gzip بدون رمز هستند).")
+            return result
+    elif blob[:2] == GZIP_MAGIC:
+        result["encrypted"] = False
+    else:
+        result["warnings"].append("فرمت آرشیو ناشناخته است (نه gzip و نه KNRB1).")
         return result
     try:
-        comp = security.decrypt_backup(blob, password)
+        payload, _ = _load_payload(blob, password)
     except ValueError as exc:
-        result["warnings"].append(f"رمزگشایی ناموفق: {exc}")
+        result["warnings"].append(f"باز کردن آرشیو ناموفق بود: {exc}")
         return result
-    import gzip
-    try:
-        raw = gzip.decompress(comp)
-        payload = json.loads(raw)
     except Exception:
-        result["warnings"].append("محتوای آرشیو پس از رمزگشایی معتبر نیست.")
+        result["warnings"].append("محتوای آرشیو معتبر نیست.")
         return result
     manifest = payload.get("manifest", {})
     if manifest.get("format") != "kanar-db-backup":
@@ -255,28 +280,34 @@ def validate_blob(blob: bytes, expected_sha256: str = "", password: str = "") ->
     return result
 
 
-async def execute_restore(blob: bytes, password: str) -> dict:
-    """Emergency backup -> restore -> verify -> auto-rollback on failure."""
+async def execute_restore(blob: bytes, password: str = "") -> dict:
+    """Emergency backup -> restore -> verify -> auto-rollback on failure.
+
+    v2.4.3 fixes applied here:
+    - accepts BOTH plain .json.gz (new) and legacy .enc archives;
+    - the emergency rollback snapshot is plain gzip (no BACKUP_PASSWORD needed);
+    - the snapshot record used trigger='restore_rollback_snapshot' (25 chars)
+      which OVERFLOWED backups.trigger varchar(16) — every restore died with
+      StringDataRightTruncationError before touching any data (incident
+      2026-11-14 22:58 & 23:02). Short trigger + column widened to 32 at boot."""
     import gzip
     t0 = asyncio.get_event_loop().time()
     emergency_id = None
     try:
-        comp = security.decrypt_backup(blob, password)   # auth via AES-GCM tag
-        payload = json.loads(gzip.decompress(comp))
+        payload, _enc = _load_payload(blob, password)
     except ValueError as exc:
-        raise ValueError(f"AUTH_FAILED: {exc}")
+        raise ValueError(f"AUTH_FAILED: {exc}") from exc
 
-    # 1) emergency snapshot of the CURRENT database (encrypted, not delivered)
+    # 1) emergency snapshot of the CURRENT database (plain gzip, not delivered)
     async with session_scope() as session:
         raw = await dump_database(session)
         import gzip as gz
-        from .config import settings as st
-        if not st.backup_password:
-            raise ValueError("BACKUP_PASSWORD missing")
-        em_blob, em_sha = security.encrypt_backup(gz.compress(raw), st.backup_password)
+        em_blob = gz.compress(raw)
+        em_sha = security.sha256_hex(em_blob)
         emergency_id = f"RBK-{utcnow().strftime('%Y%m%d%H%M%S')}"
-        session.add(BackupRecord(id=emergency_id, filename=f"emergency_{emergency_id}.enc",
-                                 trigger="restore_rollback_snapshot", status="success",
+        session.add(BackupRecord(id=emergency_id, filename=f"emergency_{emergency_id}.json.gz",
+                                 trigger="restore_rb", status="success",
+                                 encrypted=False, cipher="gzip only (no encryption)",
                                  size_bytes=len(em_blob), sha256=em_sha,
                                  delivery_status="local", delivery_target="rollback snapshot"))
         # 2) maintenance ON before destructive replacement
@@ -308,8 +339,7 @@ async def execute_restore(blob: bytes, password: str) -> dict:
         # 4) rollback to emergency snapshot
         async with session_scope() as session:
             payload_back = {"manifest": {"table_order": BACKUP_TABLES, "schema_version": "1.0.0"},
-                            "data": json.loads(gzip.decompress(
-                                security.decrypt_backup(em_blob, password)))["data"]}
+                            "data": json.loads(gzip.decompress(em_blob))["data"]}
             await _restore_into(session, payload_back)
         return {"status": "rolled_back", "rollbackSnapshotId": emergency_id,
                 "maintenanceEnabled": True,

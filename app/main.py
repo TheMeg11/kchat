@@ -25,6 +25,27 @@ from .platform import BaleAdapter, PlatformError, TelegramAdapter
 
 log = logging.getLogger("kanar.main")
 
+# v2.4.3: asyncio only keeps WEAK references to tasks — a fire-and-forget
+# create_task() result can be garbage-collected mid-execution (documented
+# asyncio pitfall: "save a reference to the result of this function"). All
+# background work goes through spawn(): the strong reference set keeps the
+# task alive until it finishes and any uncaught crash is logged instead of
+# disappearing silently.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _bg_done(task: asyncio.Task) -> None:
+    _BG_TASKS.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        log.error("background task crashed: %r", task.exception())
+
+
+def spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_bg_done)
+    return task
+
 WEB_DIR = Path(__file__).resolve().parent.parent / "webadmin"
 SESSION_COOKIE = "kanar_admin_session"
 
@@ -63,6 +84,7 @@ async def init_app() -> None:
     widened = await db.ensure_widened_columns(engine)
     if widened:
         log.info("v2.4.1 column widening applied: %s", ", ".join(widened))
+    await _one_shot_boot_restore()
     async with session_scope() as s:
         await service.seed(s)
     # STABLE webhook path secret: derived from WEBHOOK_SECRET so redeploys never
@@ -80,6 +102,40 @@ async def init_app() -> None:
     await setup_commands()
     await setup_webhooks()
     await log_database_summary()
+
+
+async def _one_shot_boot_restore() -> None:
+    """v2.4.3 one-shot data-recovery gate (incident 2026-11-14).
+
+    The runtime database was reset during a deploy; the owner supplied the
+    backup taken minutes earlier (BKP-20261114_225200-02dd). Ship the archive
+    with the deploy and set RESTORE_ON_BOOT_FILE=<path inside the container>
+    (plus RESTORE_ON_BOOT_PASSWORD=<key> for legacy encrypted archives). At
+    boot — before any traffic is served and before seeding — the archive is
+    restored via the regular execute_restore flow (emergency snapshot, full
+    replace, verify, auto-rollback on failure) and the file is renamed to
+    *.done so it can never run twice. Remove the env + file after recovery."""
+    path = os.getenv("RESTORE_ON_BOOT_FILE", "")
+    if not path:
+        return
+    if not os.path.exists(path):
+        log.warning("RESTORE_ON_BOOT_FILE=%s not found — boot restore skipped", path)
+        return
+    password = os.getenv("RESTORE_ON_BOOT_PASSWORD", "")
+    blob = Path(path).read_bytes()
+    log.warning("BOOT RESTORE starting from %s (%d bytes) — replacing ALL data",
+                path, len(blob))
+    try:
+        result = await backup_mod.execute_restore(blob, password)
+    except Exception:
+        log.exception("BOOT RESTORE failed hard — continuing with current data")
+        return
+    log.warning("BOOT RESTORE result: %s — %s", result.get("status"),
+                result.get("message"))
+    try:
+        Path(path).rename(path + ".done")
+    except OSError:
+        pass
 
 
 async def log_database_summary() -> None:
@@ -363,7 +419,7 @@ async def process_broadcasts() -> None:
         queue.append(bid)
         return
     active.add(bid)
-    asyncio.create_task(_run_broadcast(bid, active))
+    spawn(_run_broadcast(bid, active))
 
 
 async def _run_broadcast(bid: int, active: set) -> None:
@@ -453,7 +509,41 @@ async def polling_task(platform: str) -> None:
         return
     stop = asyncio.Event()
     log.info("starting long-polling fallback for %s", platform)
-    await adp.poll_updates(lambda upd: bot_mod.process_update(platform, upd), stop)
+    # v2.4.3 backlog flush: after an outage the platform queue can hold
+    # thousands of stale updates (incident 2026-11-14: 1512 pending on Bale
+    # after the poller died for ~6h). Replaying them spams users with
+    # hours-old state machines, so a huge backlog is dropped instead.
+    start_offset = 0
+    try:
+        info = await adp.get_webhook_info()
+        pending = int(info.get("pending_update_count") or 0)
+        if pending > 200:
+            # offset=-1 returns the most recent update (Telegram Bot API
+            # semantics; Bale mirrors it). max() keeps it correct even if a
+            # platform ignores -1 and returns the whole queue.
+            last = await adp.call("getUpdates", {"offset": -1, "limit": 1}) or []
+            if last:
+                start_offset = max(int(u.get("update_id", 0)) for u in last) + 1
+                log.warning("%s: dropping stale backlog of %d pending updates "
+                            "(resume from update_id=%d)", platform, pending,
+                            start_offset)
+    except Exception:
+        log.exception("backlog check failed for %s (continuing from oldest)",
+                      platform)
+    # Supervisor: poll_updates returns only when `stop` is set (shutdown). If
+    # it ever exits or raises for any other reason, restart it — the poller
+    # must never go dark permanently.
+    while not stop.is_set():
+        try:
+            await adp.poll_updates(lambda upd: bot_mod.process_update(platform, upd),
+                                   stop, start_offset=start_offset)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("poller for %s exited unexpectedly — restarting in 5s",
+                          platform)
+            await asyncio.sleep(5)
+        start_offset = 0
 
 
 # ------------------------------------------------------------------ app ----
@@ -531,7 +621,7 @@ async def _handle_webhook(platform: str, secret: str, request: Request) -> JSONR
     except Exception:
         return JSONResponse({"ok": True})
     from . import bot as bot_mod
-    asyncio.create_task(bot_mod.process_update(platform, upd))
+    spawn(bot_mod.process_update(platform, upd))
     return JSONResponse({"ok": True})
 
 

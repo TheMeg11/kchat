@@ -945,58 +945,83 @@ async def test_appeal_only_permanent(adapters):
 
 # ------------------------------------------------------ backup & restore ----
 @pytest.mark.asyncio
-async def test_backup_encrypt_validate_restore_rollback(adapters):
+async def test_backup_plain_validate_restore_rollback(adapters):
+    """v2.4.3: backups are COMPRESSED gzip but NOT encrypted — restore needs no
+    password. Legacy AES .enc archives stay restorable via auto-detection."""
     from app import backup as bk
     await register_via_bot(adapters, "telegram", "961", "DataA", 25, "male")
     await register_via_bot(adapters, "telegram", "962", "DataB", 25, "female")
     async with db.session_scope() as s:
         ua = (await s.execute(select(User).where(User.platform_user_id == "961"))).scalar_one()
         ua.bio = "secret bio"
-    rec_and_blob = None
     async with db.session_scope() as s:
         out = await bk.create_backup(s, "manual", "test")
         assert isinstance(out, tuple)
         rec, blob = out
-        rec_and_blob = (rec.id, blob)
+        assert rec.encrypted is False
+        assert rec.filename.endswith(".json.gz")
+        assert not rec.filename.endswith(".enc")
         assert rec.sha256 == security.sha256_hex(blob)
-    # wrong password must fail
-    v = bk.validate_blob(blob, password="WRONG")
-    assert v["valid"] is False
+        assert blob[:2] == b"\x1f\x8b"  # gzip magic — plain, decryptable by anyone
+    # NO password needed: validates and restores with an empty password arg
+    v = bk.validate_blob(blob)
+    assert v["valid"] is True and v["compatible"] is True
+    assert v["encrypted"] is False
+    # wrong password must still fail for ENCRYPTED archives (legacy path)
+    enc_blob, _ = security.encrypt_backup(blob, settings.backup_password)
+    v_wrong = bk.validate_blob(enc_blob, password="WRONG")
+    assert v_wrong["valid"] is False
+    v_nopwd = bk.validate_blob(enc_blob, password="")
+    assert v_nopwd["valid"] is False and "رمز" in " ".join(v_nopwd["warnings"])
+    v_enc = bk.validate_blob(enc_blob, password=settings.backup_password)
+    assert v_enc["valid"] is True and v_enc["encrypted"] is True
     # tampered blob must fail
     tampered = bytearray(blob)
     tampered[-1] ^= 0xFF
-    v2 = bk.validate_blob(bytes(tampered), password=settings.backup_password)
+    v2 = bk.validate_blob(bytes(tampered))
     assert v2["valid"] is False
-    # correct password validates
-    v3 = bk.validate_blob(blob, password=settings.backup_password)
-    assert v3["valid"] is True and v3["compatible"] is True
-    # mutate DB, then restore -> data returns
+    # mutate DB, then restore -> data returns (plain restore, no password)
     async with db.session_scope() as s:
         ua = (await s.execute(select(User).where(User.platform_user_id == "961"))).scalar_one()
         ua.bio = "changed after backup"
         await s.execute(delete(User).where(User.platform_user_id == "962"))
-    result = await bk.execute_restore(blob, settings.backup_password)
+    result = await bk.execute_restore(blob, "")
     assert result["status"] == "succeeded"
     async with db.session_scope() as s:
         ua = (await s.execute(select(User).where(User.platform_user_id == "961"))).scalar_one()
         ub = (await s.execute(select(User).where(User.platform_user_id == "962"))).scalar_one()
         assert ua.bio == "secret bio"
         assert ub is not None
-    # rollback path: corrupt payload with valid encryption -> consistency/rollback
+    # rollback path: corrupt payload with valid gzip -> consistency/rollback
     import gzip, json as _json
-    comp = security.decrypt_backup(blob, settings.backup_password)
-    payload = _json.loads(gzip.decompress(comp))
+    payload = _json.loads(gzip.decompress(blob))
     payload["data"]["coin_transactions"].append({"id": 999999, "user_id": 123456,
                                                  "amount": 5, "balance_after": 5,
                                                  "type": "x", "description": "",
                                                  "created_at": "2026-01-01T00:00:00"})
-    bad_blob, _ = security.encrypt_backup(gzip.compress(_json.dumps(
-        payload, ensure_ascii=False).encode()), settings.backup_password)
-    res2 = await bk.execute_restore(bad_blob, settings.backup_password)
+    bad_blob = gzip.compress(_json.dumps(payload, ensure_ascii=False).encode())
+    res2 = await bk.execute_restore(bad_blob, "")
     assert res2["status"] == "rolled_back"
     async with db.session_scope() as s:
         ua = (await s.execute(select(User).where(User.platform_user_id == "961"))).scalar_one()
         assert ua.bio == "secret bio"  # rollback preserved pre-failure state
+
+
+@pytest.mark.asyncio
+async def test_restore_emergency_snapshot_record_is_valid():
+    """v2.4.3 REGRESSION: the emergency snapshot record used
+    trigger='restore_rollback_snapshot' (25 chars) which OVERFLOWED
+    backups.trigger varchar(16) — EVERY restore died with
+    StringDataRightTruncationError before touching any data (incident
+    2026-11-14 22:58 & 23:02). The short trigger + widened column fix it."""
+    from app import backup as bk
+    from app.db import _WIDEN_COLUMNS
+    assert len("restore_rb") <= 16, "trigger must fit even the OLD varchar(16)"
+    assert len("restore_rollback_snapshot") > 16  # documents the original bug
+    assert ("backups", "trigger", 32) in _WIDEN_COLUMNS
+    # and the snapshot filename ends in .json.gz (plain gzip snapshot now)
+    assert bk.GZIP_MAGIC == b"\x1f\x8b"
+
 
 
 # ----------------------------------------------------------- adapters ----
@@ -1983,9 +2008,11 @@ async def test_restore_one_click_forward_with_caption(adapters):
         "id": "r0", "from": {"id": int(owner_pid)},
         "message": {"chat": {"id": int(owner_pid)}}, "data": "adm_restore"}})
     assert owner_pid in ba.RESTORE_WAIT
-    # forward the file with the caption the bot itself attaches
-    caption = (f"🔐 پشتیبان پایگاه‌داده هم‌چت\nشناسه: {rec.id}\n"
-               f"بخش 1 از 1\n🔑 رمز بازیابی: {settings.backup_password}\n"
+    # forward the file with the caption the bot itself attaches (v2.4.3:
+    # plain gzip backups carry NO restore password line — and the caption must
+    # not accidentally match the "رمز ...:" caption-password pattern)
+    caption = (f"📦 پشتیبان پایگاه‌داده هم‌چت\nشناسه: {rec.id}\n"
+               f"بخش 1 از 1\n🔒 gzip بدون رمزنگاری — نیازی به رمز بازیابی نیست.\n"
                "↩️ برای بازگردانی، همین فایل را با همین کپشن به ربات فوروارد کن.")
     async with db.session_scope() as s:
         owner = (await s.execute(select(User).where(
@@ -1995,7 +2022,7 @@ async def test_restore_one_click_forward_with_caption(adapters):
     assert handled is True
     st = ba.RESTORE_WAIT[owner_pid]
     assert st.get("blob"), "blob must be validated and staged instantly"
-    assert st["password"] == settings.backup_password
+    assert st["password"] is None  # plain gzip — no password in caption
     tg_sent = RUNTIME["adapter_telegram"].sent
     assert any("adm_restore_go" in str(k) for (_c, _t, k) in tg_sent if k), \
         "one-click confirm button must be offered right after validation"
@@ -2664,3 +2691,68 @@ async def test_bale_always_polls_telegram_keeps_webhook(adapters):
     assert not RUNTIME.get("webhook_set_bale")
     RUNTIME.pop("bale_polling", None)
     RUNTIME.pop("webhook_set_telegram", None)
+
+
+# ------------------------------------------------ v2.4.3 poller hardening ----
+@pytest.mark.asyncio
+async def test_poller_survives_hung_handler():
+    """v2.4.3 incident fix: ONE stuck handler (DB row-lock wait without
+    lock_timeout) froze the whole poll loop forever — getUpdates stopped
+    mid-batch and Bale went completely deaf (1512 pending updates piled up).
+    Every handler now runs under a hard wait_for cap; the loop MUST continue."""
+    from app.platform import BaseAdapter
+
+    class StubAdapter(BaseAdapter):
+        platform = "stub"
+
+        def __init__(self):
+            super().__init__("tok")
+            self.updates = [[{"update_id": 101, "message": {"text": "x"}}], []]
+            self.getupdates_calls = 0
+
+        async def call(self, method, payload=None, files=None):
+            assert method == "getUpdates"
+            self.getupdates_calls += 1
+            # yield to the event loop exactly like a real 25s long-poll does —
+            # an await-free call() would busy-spin the loop synchronously and
+            # starve every other coroutine (test-only pitfall).
+            await asyncio.sleep(0.01)
+            return self.updates.pop(0) if self.updates else []
+
+    adp = StubAdapter()
+    adp.UPDATE_TIMEOUT = 0.2
+    handled: list = []
+
+    async def handler(upd):
+        handled.append(upd.get("update_id"))
+        await asyncio.sleep(5)  # simulate the incident hang
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(adp.poll_updates(handler, stop))
+    await asyncio.sleep(1.0)  # call1 -> handler hangs -> timeout -> call2
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert adp.getupdates_calls >= 2, "poll loop must continue after a hung handler"
+    assert 101 in handled, "the update was picked up before the timeout cut it"
+
+
+@pytest.mark.asyncio
+async def test_spawn_keeps_strong_reference_and_cleans_up():
+    """v2.4.3: asyncio only holds WEAK references to tasks — fire-and-forget
+    create_task results can be garbage-collected mid-execution. spawn() keeps
+    a strong reference until completion and removes it afterwards."""
+    from app.main import spawn, _BG_TASKS
+    done = asyncio.Event()
+
+    async def work():
+        await asyncio.sleep(0.01)
+        done.set()
+
+    t = spawn(work())
+    assert t in _BG_TASKS
+    await asyncio.wait_for(done.wait(), 2)
+    for _ in range(5):
+        await asyncio.sleep(0.01)
+        if t not in _BG_TASKS:
+            break
+    assert t not in _BG_TASKS, "completed task must be dropped from the set"

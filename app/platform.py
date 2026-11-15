@@ -250,8 +250,11 @@ class BaseAdapter:
         raise NotImplementedError
 
     # --------------------------------------------------------- polling ----
-    async def poll_updates(self, handler, stop: asyncio.Event):
-        """Long-polling fallback loop (v2.4: hardened).
+    UPDATE_TIMEOUT = 60  # hard cap for one update's handler (seconds)
+
+    async def poll_updates(self, handler, stop: asyncio.Event,
+                           start_offset: int = 0):
+        """Long-polling fallback loop (v2.4: hardened; v2.4.3: hang-proof).
 
         - network failures (dial/timeout) and API errors back off differently:
           network problems retry sooner (they are often transient), hard API
@@ -259,8 +262,15 @@ class BaseAdapter:
           recovers within ~2 minutes instead of going dark for 10.
         - jitter avoids thundering reconnections after a platform outage.
         - every outcome is recorded in RUNTIME["poll_health"] for the auto
-          alerting engine (growth.check_alerts)."""
-        offset = 0
+          alerting engine (growth.check_alerts).
+        - v2.4.3 incident fix: ONE stuck handler (a DB row-lock wait with no
+          lock_timeout, a dead platform send, …) froze the WHOLE poll loop
+          forever — getUpdates stopped mid-batch and the bot went deaf while
+          ~1500 updates piled up. Every handler now runs under a hard
+          asyncio.wait_for cap; a timeout is logged and the loop moves on.
+        - start_offset lets the caller skip a stale backlog (flushed at boot).
+        """
+        offset = max(int(start_offset or 0), 0)
         fails = 0
         health = RUNTIME.setdefault("poll_health", {}).setdefault(self.platform, {
             "last_ok": 0.0, "last_error": "", "fails": 0, "ok": 0,
@@ -277,7 +287,12 @@ class BaseAdapter:
                 for upd in result or []:
                     offset = max(offset, int(upd.get("update_id", 0)) + 1)
                     try:
-                        await handler(upd)
+                        await asyncio.wait_for(handler(upd), timeout=self.UPDATE_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        log.error("update handler TIMEOUT after %ss (polling %s, "
+                                  "update_id=%s) — skipping to keep the poller alive",
+                                  self.UPDATE_TIMEOUT, self.platform,
+                                  upd.get("update_id"))
                     except Exception:
                         log.exception("update handler failed (polling %s)", self.platform)
             except asyncio.CancelledError:
