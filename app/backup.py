@@ -156,8 +156,8 @@ async def _restore_into(session, payload: dict) -> dict:
         for table in db.Base.metadata.sorted_tables:
             pk = list(table.primary_key.columns)[0].name
             seq = (await session.execute(_text(
-                "SELECT pg_get_serial_sequence(:t, :c)",
-                {"t": table.name, "c": pk}))).scalar()
+                "SELECT pg_get_serial_sequence(:t, :c)"),
+                {"t": table.name, "c": pk})).scalar()
             if not seq:
                 continue
             mx = (await session.execute(_text(
