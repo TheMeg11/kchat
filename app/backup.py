@@ -145,6 +145,27 @@ async def _restore_into(session, payload: dict) -> dict:
         if rows:
             await _insert_rows(session, table, [_coerce(table, r) for r in rows])
         loaded[tname] = len(rows)
+    # v2.4.3: rows are inserted with their EXPLICIT ids, which does NOT
+    # advance the Postgres identity sequences — the first write after the
+    # restore then collides with a restored id (UniqueViolationError on
+    # security_events at the very next panel login, incident 05:36; and
+    # processed_updates would make the dedup guard swallow EVERY update).
+    # Re-sync every autoincrement sequence to MAX(id) after the load.
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        from sqlalchemy import text as _text
+        for table in db.Base.metadata.sorted_tables:
+            pk = list(table.primary_key.columns)[0].name
+            seq = (await session.execute(_text(
+                "SELECT pg_get_serial_sequence(:t, :c)",
+                {"t": table.name, "c": pk}))).scalar()
+            if not seq:
+                continue
+            mx = (await session.execute(_text(
+                f"SELECT COALESCE(MAX({pk}), 0) FROM {table.name}"))).scalar() or 0
+            if mx > 0:
+                await session.execute(_text(f"SELECT setval('{seq}', {mx}, true)"))
+            else:
+                await session.execute(_text(f"SELECT setval('{seq}', 1, false)"))
     # ---- consistency checks ----
     problems = []
     users = {u["id"]: u for u in payload.get("data", {}).get("users", [])}
