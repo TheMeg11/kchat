@@ -218,15 +218,36 @@ async def admin_callback(user: User, data: str, chat_id) -> None:
     if data == "adm_store" and "store.manage" in perms:
         async with session_scope() as s:
             pkgs = (await s.execute(select(StorePackage).order_by(StorePackage.coins))).scalars()
-            lines = [f"🪙 {p.coins} سکه → ⭐{p.telegram_stars_price} | {p.bale_toman_price:,} تومان "
-                     f"({'فعال' if p.active else 'غیرفعال'})" for p in pkgs]
             store = await service.get_setting(s, "store")
-        await _say(user, "🛒 قیمت‌های فروشگاه (نرخ جاری: هر سکه = "
-                        f"{store.get('tomanPerCoin', 500):,} تومان | هر ⭐ استارز = "
-                        f"{store.get('coinsPerStar', 20)} سکه):\n\n"
-                        + "\n".join(lines) +
-                        "\n\n✏️ تغییر نرخ‌ها و قیمت بسته‌ها از پنل وب انجام می‌شود.",
-                   keyboard=kb([[btn("🏠 بازگشت به منوی اصلی", "back_home")]]))
+        # v2.4.4: the rate drives ALL packages — show the effective prices that
+        # users actually pay, computed from store.tomanPerCoin / coinsPerStar.
+        lines = [f"🪙 {p.coins} سکه → ⭐{service.coins_price_stars(store, p.coins)} | "
+                 f"{service.coins_price_toman(store, p.coins):,} تومان "
+                 f"({'فعال' if p.active else 'غیرفعال'})" for p in pkgs]
+        txt = ("🛒 قیمت‌های فروشگاه (نرخ جاری: هر سکه = "
+               f"{store.get('tomanPerCoin', 500):,} تومان | هر ⭐ استارز = "
+               f"{store.get('coinsPerStar', 20)} سکه):\n\n"
+               + "\n".join(lines)
+               + "\n\n💡 نرخ روی همهٔ بسته‌ها و مبلغ دلخواه خودکار اعمال می‌شود.")
+        if "economy.configure" in perms:
+            txt += "\n\n✏️ برای تغییر نرخ، یکی از دکمه‌های زیر را بزنید:"
+            rows = [[btn("🪙 تغییر نرخ تومان/سکه", "adm_store_rate")],
+                    [btn("⭐ تغییر سکه به ازای هر استارز", "adm_store_star")],
+                    [btn("🏠 بازگشت به منوی اصلی", "back_home")]]
+            await _say(user, txt, keyboard=kb(rows))
+        else:
+            await _say(user, txt, keyboard=kb([[btn("🏠 بازگشت به منوی اصلی", "back_home")]]))
+        return
+
+    if data == "adm_store_rate" and "economy.configure" in perms:
+        user.state = {"step": "adm_store_rate"}
+        await _say(user, "نرخ جدید هر سکه به تومان را بفرستید (فقط عدد، مثل 200).\n"
+                         "همهٔ بسته‌ها و مبلغ دلخواه بلافاصله با این نرخ قیمت می‌خورند.")
+        return
+
+    if data == "adm_store_star" and "economy.configure" in perms:
+        user.state = {"step": "adm_store_star"}
+        await _say(user, "تعداد سکه به ازای هر ⭐ استارز را بفرستید (فقط عدد، مثل 20).")
         return
 
     if data == "adm_bans" and "bans.manage" in perms:
@@ -454,6 +475,57 @@ async def admin_text_flow(user: User, text: str) -> bool:
                 await _say(user, "❌ مقدار نامعتبر.")
         else:
             await _say(user, "دستور نامعتبر. مثال: set eco daily 10")
+        return True
+
+    # v2.4.4: coin-store rate editing from the Telegram admin panel
+    if step == "adm_store_rate" and "economy.configure" in perms:
+        try:
+            val = int(text.strip().replace("٬", "").replace(",", ""))
+            if val <= 0:
+                raise ValueError
+            async with session_scope() as s:
+                store = await service.get_setting(s, "store")
+                store["tomanPerCoin"] = val
+                store["coinsPerStar"] = store.get("coinsPerStar", 20)
+                store["customMinCoins"] = store.get("customMinCoins", 10)
+                store["customMaxCoins"] = store.get("customMaxCoins", 5000)
+                store["updatedBy"] = f"bot:{user.platform_user_id}"
+                await service.set_setting(s, "store", store)
+                pkgs = (await s.execute(select(StorePackage).order_by(StorePackage.coins))).scalars()
+                eff = [f"🪙 {p.coins} → ⭐{service.coins_price_stars(store, p.coins)} | "
+                       f"{service.coins_price_toman(store, p.coins):,} تومان" for p in pkgs]
+                await service.audit(s, actor_type="bot", admin_id=user.platform_user_id,
+                                    admin_name=user.display_name, admin_role=role,
+                                    action="store.rate_updated", module="store",
+                                    details=f"tomanPerCoin={val}")
+            user.state = None
+            await _say(user, f"✅ نرخ جدید ثبت شد: هر سکه = {val:,} تومان\n"
+                             "قیمت همهٔ بسته‌ها خودکار به‌روز شد:\n" + "\n".join(eff))
+        except ValueError:
+            await _say(user, "❌ عدد نامعتبر. فقط عدد بفرستید (مثل 200).")
+        return True
+
+    if step == "adm_store_star" and "economy.configure" in perms:
+        try:
+            val = int(text.strip())
+            if val <= 0:
+                raise ValueError
+            async with session_scope() as s:
+                store = await service.get_setting(s, "store")
+                store["coinsPerStar"] = val
+                store["tomanPerCoin"] = store.get("tomanPerCoin", 500)
+                store["customMinCoins"] = store.get("customMinCoins", 10)
+                store["customMaxCoins"] = store.get("customMaxCoins", 5000)
+                store["updatedBy"] = f"bot:{user.platform_user_id}"
+                await service.set_setting(s, "store", store)
+                await service.audit(s, actor_type="bot", admin_id=user.platform_user_id,
+                                    admin_name=user.display_name, admin_role=role,
+                                    action="store.rate_updated", module="store",
+                                    details=f"coinsPerStar={val}")
+            user.state = None
+            await _say(user, f"✅ ثبت شد: هر ⭐ استارز = {val} سکه.")
+        except ValueError:
+            await _say(user, "❌ عدد نامعتبر. فقط عدد بفرستید (مثل 20).")
         return True
 
     if step == "adm_bcast_text" and "broadcast.send" in perms:

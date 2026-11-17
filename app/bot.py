@@ -1365,21 +1365,27 @@ async def show_wallet(user: User) -> None:
 
 
 async def show_store(user: User) -> None:
-    """v2.2: coin purchase packages + custom amount (inside the wallet menu)."""
+    """v2.2: coin purchase packages + custom amount (inside the wallet menu).
+    v2.4.4: package prices are ALWAYS derived from the store rate
+    (store.tomanPerCoin / store.coinsPerStar) so a rate change applies to
+    every package automatically — per-row prices are legacy/history only."""
     rows = []
     async with session_scope() as s:
         pkgs = (await s.execute(select(StorePackage).where(StorePackage.active == True))).scalars()  # noqa
+        store_cfg = await service.get_setting(s, "store")
         app_cfg = await service.get_setting(s, "app")
         pay_tg = app_cfg.get("paymentsTelegramEnabled", True) and bool(settings.telegram_bot_token)
         pay_bale = app_cfg.get("paymentsBaleEnabled", False) and bool(settings.bale_provider_token)
         has_any = False
     for p in pkgs:
         if user.platform == "telegram" and p.telegram_enabled and pay_tg:
-            rows.append([btn(tr(user.language, "pay_stars", stars=p.telegram_stars_price,
+            rows.append([btn(tr(user.language, "pay_stars",
+                                stars=service.coins_price_stars(store_cfg, p.coins),
                                 coins=p.coins), f"buy_{p.id}")])
             has_any = True
         elif user.platform == "bale" and p.bale_enabled and pay_bale:
-            rows.append([btn(tr(user.language, "pay_bale", toman=p.bale_toman_price,
+            rows.append([btn(tr(user.language, "pay_bale",
+                                toman=service.coins_price_toman(store_cfg, p.coins),
                                 coins=p.coins), f"buy_{p.id}")])
             has_any = True
     if has_any:
@@ -1456,16 +1462,21 @@ async def start_purchase(user: User, package_id: str) -> None:
         u = await s.get(User, user.id)
         if not pkg:
             return
+        # v2.4.4: price is computed from the store rate so the configured
+        # Toman/coin (and coins-per-Star) rate applies to ALL packages.
+        store_cfg = await service.get_setting(s, "store")
         payload = f"pkg:{pkg.id}:{u.id}"
         try:
             if u.platform == "telegram":
                 await adp.send_invoice(u.platform_user_id, f"🪙 {pkg.coins} سکه هم‌چت",
                                        "خرید سکه برای چت ناشناس هم‌چت", payload,
-                                       [{"label": f"{pkg.coins} coins", "amount": pkg.telegram_stars_price}])
+                                       [{"label": f"{pkg.coins} coins",
+                                         "amount": service.coins_price_stars(store_cfg, pkg.coins)}])
             else:
+                toman = service.coins_price_toman(store_cfg, pkg.coins)
                 await adp.send_invoice(u.platform_user_id, f"🪙 {pkg.coins} سکه هم‌چت",
                                        "خرید سکه برای چت ناشناس هم‌چت", payload,
-                                       [{"label": f"{pkg.coins} coins", "amount": pkg.bale_toman_price * 10}])
+                                       [{"label": f"{pkg.coins} coins", "amount": toman * 10}])
         except UnsupportedMethod as exc:
             await send(u, "pay_unavailable")
             log.info("invoice unavailable: %s", exc)
@@ -1481,6 +1492,7 @@ async def handle_pre_checkout(platform: str, query: dict) -> None:
     await adp.call("answerPreCheckoutQuery", {
         "pre_checkout_query_id": query["id"], "ok": ok,
         **({} if ok else {"error_message": "خطا در پردازش سفارش؛ لطفاً دوباره تلاش کنید."})})
+    log.info("pre_checkout answered (%s): id=%s ok=%s", platform, query.get("id"), ok)
 
 
 async def handle_successful_payment(platform: str, msg: dict) -> None:
@@ -2318,6 +2330,12 @@ async def process_update(platform: str, upd: dict) -> None:
         if "message" in upd and upd["message"]:
             msg = upd["message"]
             if msg.get("successful_payment"):
+                log.info("successful_payment received (%s): payload=%s charge=%s total=%s %s",
+                         platform, (msg["successful_payment"].get("invoice_payload") or "")[:64],
+                         (msg["successful_payment"].get("telegram_payment_charge_id")
+                          or msg["successful_payment"].get("provider_payment_charge_id") or "")[:32],
+                         msg["successful_payment"].get("total_amount"),
+                         msg["successful_payment"].get("currency"))
                 await handle_successful_payment(platform, msg)
             else:
                 await handle_message(platform, msg)
@@ -2326,6 +2344,10 @@ async def process_update(platform: str, upd: dict) -> None:
         elif "callback_query" in upd and upd["callback_query"]:
             await handle_callback(platform, upd["callback_query"])
         elif "pre_checkout_query" in upd and upd["pre_checkout_query"]:
+            log.info("pre_checkout_query received (%s): payload=%s currency=%s total=%s",
+                     platform, (upd["pre_checkout_query"].get("invoice_payload") or "")[:64],
+                     upd["pre_checkout_query"].get("currency"),
+                     upd["pre_checkout_query"].get("total_amount"))
             await handle_pre_checkout(platform, upd["pre_checkout_query"])
     except Exception:
         log.exception("update processing failed (%s)", platform)

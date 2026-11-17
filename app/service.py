@@ -47,8 +47,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
                 "backupRetentionDisclosureFa": "آرشیوهای پشتیبان رمزنگاری‌شده ممکن است متن گفتگوهای قدیمی‌تر از ۳۰ روز را در نسخه‌های قبلی خود حفظ کنند."},
     "backup": {"autoBackupEnabled": True, "scheduleTimeTehran": "03:00",
                "retentionDays": 90, "encryptionEnabled": True, "lastRunDate": ""},
-    # v2.2: coin-store conversion rates (changeable via settings/economy)
-    "store": {"tomanPerCoin": 500,        # 500 Toman = 1 coin
+    # v2.2: coin-store conversion rates (changeable via settings/economy);
+    # v2.4.4: default rate 200 Toman = 1 coin (live value changed 2026-11-17)
+    "store": {"tomanPerCoin": 200,        # 200 Toman = 1 coin
               "coinsPerStar": 20,         # 1 Telegram Star = 20 coins
               "customMinCoins": 10, "customMaxCoins": 5000,
               "updatedBy": "system", "updatedAt": None},
@@ -492,11 +493,16 @@ async def try_match(session) -> Optional[tuple[User, User, bool]]:
                 continue
             cooldown = (await get_setting(session, "matching")).get("repeatMatchCooldownMin", 30)
             since = utcnow() - timedelta(minutes=cooldown)
-            recent = await session.execute(select(RecentPair).where(
+            # v2.4.4: limit(1)+first() — a pair can have SEVERAL RecentPair rows
+            # inside the window (two chats in different orientations, restored
+            # rows, …) and scalar_one_or_none() raised MultipleResultsFound,
+            # crashing every match attempt and the scheduler match tick (prod
+            # incident 2026-11-17). We only need to know "at least one exists".
+            recent = await session.execute(select(RecentPair.id).where(
                 ((RecentPair.user_a_id == a.user_id) & (RecentPair.user_b_id == b.user_id)) |
                 ((RecentPair.user_a_id == b.user_id) & (RecentPair.user_b_id == a.user_id)),
-                RecentPair.ended_at >= since))
-            if recent.scalar_one_or_none():
+                RecentPair.ended_at >= since).limit(1))
+            if recent.first():
                 continue
             ua, ub = await session.get(User, a.user_id), await session.get(User, b.user_id)
             if not ua or not ub or ua.status != "active" or ub.status != "active":

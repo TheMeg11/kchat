@@ -70,7 +70,7 @@ class FakeAdapter:
 
     async def send_invoice(self, chat_id, title, description, payload, prices,
                            provider_token=""):
-        self.sent.append((chat_id, "invoice", payload))
+        self.sent.append((chat_id, "invoice", payload, prices))
         return {"message_id": 1}
 
     async def answer_callback(self, cid, text="", alert=False):
@@ -1723,7 +1723,8 @@ async def test_report_reason_selection(adapters):
 @pytest.mark.asyncio
 async def test_store_packages_rates_and_custom_invoice(adapters):
     """v2.2 (item 3): new packages (10k=20 ... 100k=200), legacy packages retired,
-    custom-amount invoices priced via the changeable rates; 50 coins = 25,000 Toman."""
+    custom-amount invoices priced via the changeable rates. v2.4.4: default rate
+    is 200 Toman/coin and package invoices ALSO follow the rate automatically."""
     from app import bot as bot_mod
     tg, _ = adapters
     async with db.session_scope() as s:
@@ -1741,13 +1742,13 @@ async def test_store_packages_rates_and_custom_invoice(adapters):
         legacy = [p for p in pkgs.values() if p.id in ("pkg_300", "pkg_700", "pkg_1500")]
         for p in legacy:
             assert p.active is False
-    # the user's example: 50 coins = 25,000 Toman invoice (rate 500 Toman/coin)
+    # the v2.4.4 default: 50 coins = 10,000 Toman (rate 200 Toman/coin)
     await register_via_bot(adapters, "telegram", "761", "Buyer", 25, "male")
     async with db.session_scope() as s:
         u = (await s.execute(select(User).where(User.platform_user_id == "761"))).scalar_one()
         uid = u.id
         store = await service.get_setting(s, "store")
-        assert service.coins_price_toman(store, 50) == 25000
+        assert service.coins_price_toman(store, 50) == 10000
     # enable payments for this test, then request a custom invoice
     old_token = settings.telegram_bot_token
     settings.telegram_bot_token = "test-token"
@@ -1792,6 +1793,22 @@ async def test_store_packages_rates_and_custom_invoice(adapters):
         store["tomanPerCoin"] = 600
         await service.set_setting(s, "store", store)
         assert service.coins_price_toman(store, 50) == 30000
+    # v2.4.4: package invoices auto-follow the rate — Bale pkg_20 at 600
+    # Toman/coin = 12,000 Toman = 120,000 Rial (Bale amounts are Rials)
+    await register_via_bot(adapters, "bale", "771", "BaleBuyer", 22, "male")
+    bale = RUNTIME["adapter_bale"]
+    async with db.session_scope() as s:
+        bu = (await s.execute(select(User).where(User.platform_user_id == "771"))).scalar_one()
+    await bot_mod.start_purchase(bu, "pkg_20")
+    binv = [t for t in bale.sent if t[1] == "invoice"]
+    assert binv and binv[0][2] == f"pkg:pkg_20:{bu.id}"
+    assert binv[0][3] == [{"label": "20 coins", "amount": 120000}]
+    # ...and the Telegram side derives Stars from coinsPerStar (20/20 -> 1 star)
+    async with db.session_scope() as s:
+        tu = await s.get(User, uid)
+    await bot_mod.start_purchase(tu, "pkg_20")
+    tinv = [t for t in tg.sent if t[1] == "invoice" and t[2] == f"pkg:pkg_20:{uid}"]
+    assert tinv and tinv[0][3] == [{"label": "20 coins", "amount": 1}]
 
 
 @pytest.mark.asyncio

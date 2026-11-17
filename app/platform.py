@@ -277,7 +277,12 @@ class BaseAdapter:
             "started_at": time.time()})
         while not stop.is_set():
             try:
-                params = {"timeout": 25, "offset": offset, "limit": 50}
+                # v2.4.4: allowed_updates is explicit — some Bot-API servers
+                # (Bale included) may not deliver pre_checkout_query by their
+                # default subscription, which silently breaks wallet payments.
+                params = {"timeout": 25, "offset": offset, "limit": 50,
+                          "allowed_updates": ["message", "edited_message",
+                                              "callback_query", "pre_checkout_query"]}
                 result = await self.call("getUpdates", params)
                 fails = 0
                 health["ok"] += 1
@@ -407,10 +412,15 @@ class BaleAdapter(BaseAdapter):
         if not (provider_token or self.provider_token):
             raise UnsupportedMethod("sendInvoice", "BALE_PROVIDER_TOKEN not configured")
         # Verified: amounts are in Rial; provider_token required; no currency param.
-        return await self.call("sendInvoice", {
-            "chat_id": chat_id, "title": title[:32], "description": description[:255],
-            "payload": payload, "provider_token": provider_token or self.provider_token,
-            "prices": prices})
+        token = provider_token or self.provider_token
+        body = {"chat_id": chat_id, "title": title[:32], "description": description[:255],
+                "payload": payload, "provider_token": token, "prices": prices}
+        log.info("bale sendInvoice chat=%s payload=%s prices=%s token=%s…",
+                 chat_id, payload[:48], prices, str(token)[:12])
+        res = await self.call("sendInvoice", body)
+        log.info("bale sendInvoice OK: message_id=%s (wallet pre_checkout must follow "
+                 "when the user taps pay)", (res or {}).get("result", {}).get("message_id"))
+        return res
 
     async def refund_payment(self, user_id: int, charge_id: str) -> Any:
         # Verified absence: no refund method documented in Bale Bot API.
