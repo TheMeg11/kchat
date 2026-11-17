@@ -2853,3 +2853,34 @@ async def test_restore_handles_selfref_fk_row_order(adapters):
         b = (await s.execute(select(User).where(User.platform_user_id == "996"))).scalar_one()
         a = (await s.execute(select(User).where(User.platform_user_id == "995"))).scalar_one()
         assert b.referred_by_id == a.id, "self-ref FK value must survive the two-phase insert"
+
+
+@pytest.mark.asyncio
+async def test_package_patch_persists_camelcase_fields():
+    """v2.4.4 regression: PATCH /store/packages/{pid} used to setattr() the raw
+    camelCase API key on the ORM object — SQLAlchemy silently ignored it and
+    the panel returned 200 without persisting anything. The endpoint must map
+    camelCase API fields to snake_case columns."""
+    import httpx
+    from app.main import app
+    from app.db import StorePackage
+    async with db.session_scope() as s:
+        s.add(WebAdmin(username="owner_pkg", full_name="Pkg Owner", email="",
+                       password_hash=security.hash_password("InitialPass123!"),
+                       role="owner", must_change_password=False, totp_enabled=False))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+        r = await cli.post("/api/admin/v1/auth/login",
+                           json={"username": "owner_pkg", "password": "InitialPass123!"})
+        assert r.status_code == 200
+        csrf = r.headers["x-csrf-token"]
+        r = await cli.patch("/api/admin/v1/store/packages/pkg_40",
+                            json={"baleTomanPrice": 8000},
+                            headers={"X-CSRF-Token": csrf})
+        assert r.status_code == 200, r.text
+        assert r.json()["baleTomanPrice"] == 8000
+    async with db.session_scope() as s:
+        p = await s.get(StorePackage, "pkg_40")
+        assert p.bale_toman_price == 8000, "PATCH must persist the column, not an attr"
+        # restore the seed value so other tests keep their expectations
+        p.bale_toman_price = 20000

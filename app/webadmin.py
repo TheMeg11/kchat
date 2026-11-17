@@ -1136,12 +1136,21 @@ class PackagePatch(BaseModel):
 @router.patch("/store/packages/{pid}")
 async def patch_package(pid: str, body: PackagePatch, request: Request):
     admin, _ = await require(request, "store.manage")
+    # v2.4.4 fix: the API uses camelCase field names but the StorePackage
+    # columns are snake_case — setattr() with the raw key silently set a
+    # plain Python attribute, SQLAlchemy ignored it and the PATCH returned
+    # 200 WITHOUT persisting anything (package price edits never saved).
+    col_map = {"telegramStarsPrice": "telegram_stars_price",
+               "baleTomanPrice": "bale_toman_price",
+               "active": "active",
+               "telegramEnabled": "telegram_enabled",
+               "baleEnabled": "bale_enabled"}
     async with db.session_scope() as s:
         p = await s.get(StorePackage, pid)
         if not p:
             raise ApiErr(404, "بسته سکه یافت نشد.", "PACKAGE_NOT_FOUND")
         for k, v in body.model_dump(exclude_none=True).items():
-            setattr(p, k, v)
+            setattr(p, col_map.get(k, k), v)
         await service.audit(s, actor_type="web", admin_id=admin.id, admin_name=admin.username,
                             admin_role=admin.role, action="store.package_updated",
                             module="payments", target_type="coin_package", target_id=p.id,
