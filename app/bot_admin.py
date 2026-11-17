@@ -219,6 +219,7 @@ async def admin_callback(user: User, data: str, chat_id) -> None:
         async with session_scope() as s:
             pkgs = (await s.execute(select(StorePackage).order_by(StorePackage.coins))).scalars()
             store = await service.get_setting(s, "store")
+            app_cfg = await service.get_setting(s, "app")
         # v2.4.4: the rate drives ALL packages — show the effective prices that
         # users actually pay, computed from store.tomanPerCoin / coinsPerStar.
         lines = [f"🪙 {p.coins} سکه → ⭐{service.coins_price_stars(store, p.coins)} | "
@@ -229,25 +230,67 @@ async def admin_callback(user: User, data: str, chat_id) -> None:
                f"{store.get('coinsPerStar', 20)} سکه):\n\n"
                + "\n".join(lines)
                + "\n\n💡 نرخ روی همهٔ بسته‌ها و مبلغ دلخواه خودکار اعمال می‌شود.")
-        if "economy.configure" in perms:
+        if "store.manage" in perms:
+            # v2.4.4: payment-gateway switches — a set provider token with the
+            # app toggle left OFF silently showed "gateway unavailable" to
+            # buyers; surface the effective gate (toggle AND token) here.
+            tg_eff = app_cfg.get("paymentsTelegramEnabled", True) and bool(settings.telegram_bot_token)
+            bale_eff = app_cfg.get("paymentsBaleEnabled", False) and bool(settings.bale_provider_token)
+            tg_tok = "✓" if settings.telegram_bot_token else "✗ توکن تنظیم نشده"
+            bale_tok = "✓" if settings.bale_provider_token else "✗ توکن تنظیم نشده"
+            txt += ("\n\n💳 درگاه پرداخت تلگرام: " + ("روشن ✅" if tg_eff else "خاموش ⛔")
+                    + f" (کلید: {'روشن' if app_cfg.get('paymentsTelegramEnabled', True) else 'خاموش'} | توکن: {tg_tok})"
+                    + "\n💳 درگاه پرداخت بله: " + ("روشن ✅" if bale_eff else "خاموش ⛔")
+                    + f" (کلید: {'روشن' if app_cfg.get('paymentsBaleEnabled', False) else 'خاموش'} | توکن: {bale_tok})")
             txt += "\n\n✏️ برای تغییر نرخ، یکی از دکمه‌های زیر را بزنید:"
             rows = [[btn("🪙 تغییر نرخ تومان/سکه", "adm_store_rate")],
                     [btn("⭐ تغییر سکه به ازای هر استارز", "adm_store_star")],
+                    [btn(f"💳 کلید پرداخت تلگرام: {'روشن' if app_cfg.get('paymentsTelegramEnabled', True) else 'خاموش'}", "adm_pay_tg")],
+                    [btn(f"💳 کلید پرداخت بله: {'روشن' if app_cfg.get('paymentsBaleEnabled', False) else 'خاموش'}", "adm_pay_bale")],
                     [btn("🏠 بازگشت به منوی اصلی", "back_home")]]
             await _say(user, txt, keyboard=kb(rows))
         else:
             await _say(user, txt, keyboard=kb([[btn("🏠 بازگشت به منوی اصلی", "back_home")]]))
         return
 
-    if data == "adm_store_rate" and "economy.configure" in perms:
+    # v2.4.4 fix: these store features were gated on "economy.configure", a
+    # permission NO default role grants (web-panel only) — the owner never saw
+    # the rate editor. They live in the store panel, so gate on "store.manage".
+    if data == "adm_store_rate" and "store.manage" in perms:
         user.state = {"step": "adm_store_rate"}
         await _say(user, "نرخ جدید هر سکه به تومان را بفرستید (فقط عدد، مثل 200).\n"
                          "همهٔ بسته‌ها و مبلغ دلخواه بلافاصله با این نرخ قیمت می‌خورند.")
         return
 
-    if data == "adm_store_star" and "economy.configure" in perms:
+    if data == "adm_store_star" and "store.manage" in perms:
         user.state = {"step": "adm_store_star"}
         await _say(user, "تعداد سکه به ازای هر ⭐ استارز را بفرستید (فقط عدد، مثل 20).")
+        return
+
+    # v2.4.4: payment-gateway switches (app.payments*Enabled). The provider
+    # token alone is not enough — bot.py gates invoices on this toggle, and a
+    # toggle left OFF shows buyers "gateway unavailable" with no admin hint.
+    if data in ("adm_pay_tg", "adm_pay_bale") and "store.manage" in perms:
+        key = "paymentsTelegramEnabled" if data == "adm_pay_tg" else "paymentsBaleEnabled"
+        platform_name = "تلگرام" if data == "adm_pay_tg" else "بله"
+        has_token = bool(settings.telegram_bot_token if data == "adm_pay_tg"
+                         else settings.bale_provider_token)
+        async with session_scope() as s:
+            app_cfg = await service.get_setting(s, "app")
+            new_val = not app_cfg.get(key, key == "paymentsTelegramEnabled")
+            app_cfg[key] = new_val
+            app_cfg["updatedBy"] = f"bot:{user.platform_user_id}"
+            await service.set_setting(s, "app", app_cfg)
+            await service.audit(s, actor_type="bot", admin_id=user.platform_user_id,
+                                admin_name=user.display_name, admin_role=role,
+                                action="store.payments_toggled", module="store",
+                                details=f"{key}={new_val}")
+        state_txt = "روشن ✅" if new_val else "خاموش ⛔"
+        tok_note = "" if has_token else ("\n⚠️ توکن پرداخت این پلتفرم تنظیم نشده — "
+                                         "تا وقتی توکن ست نشود، پرداخت کار نمی‌کند.")
+        await _say(user, f"✅ درگاه پرداخت {platform_name}: {state_txt}"
+                         "\nفروشگاه برای کاربران این پلتفرم بلافاصله به‌روز می‌شود."
+                         + tok_note)
         return
 
     if data == "adm_bans" and "bans.manage" in perms:
@@ -478,7 +521,7 @@ async def admin_text_flow(user: User, text: str) -> bool:
         return True
 
     # v2.4.4: coin-store rate editing from the Telegram admin panel
-    if step == "adm_store_rate" and "economy.configure" in perms:
+    if step == "adm_store_rate" and "store.manage" in perms:
         try:
             val = int(text.strip().replace("٬", "").replace(",", ""))
             if val <= 0:
@@ -505,7 +548,7 @@ async def admin_text_flow(user: User, text: str) -> bool:
             await _say(user, "❌ عدد نامعتبر. فقط عدد بفرستید (مثل 200).")
         return True
 
-    if step == "adm_store_star" and "economy.configure" in perms:
+    if step == "adm_store_star" and "store.manage" in perms:
         try:
             val = int(text.strip())
             if val <= 0:

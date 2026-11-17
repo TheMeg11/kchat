@@ -1812,6 +1812,65 @@ async def test_store_packages_rates_and_custom_invoice(adapters):
 
 
 @pytest.mark.asyncio
+async def test_bale_store_gate_and_admin_payment_toggles(adapters):
+    """v2.4.4 regression (2026-11-17 incident): a set Bale provider token with
+    the app.paymentsBaleEnabled toggle left OFF showed every Bale buyer
+    "gateway unavailable" with no admin-facing hint. The store menu follows
+    the toggle, and the Telegram admin panel exposes the gateway switches."""
+    from app import bot as bot_mod
+    from app.db import BotAdmin
+    tg, bale = adapters
+    old_bale_tok = settings.bale_provider_token
+    settings.bale_provider_token = "WALLET-test"
+    try:
+        await register_via_bot(adapters, "bale", "781", "BaleBuyer2", 24, "male")
+        async with db.session_scope() as s:
+            app_cfg = await service.get_setting(s, "app")
+            assert app_cfg.get("paymentsBaleEnabled", False) is False
+        # default OFF -> the Bale store is empty and shows the friendly gate text
+        await bot_mod.process_update("bale", {"update_id": 800, "callback_query": {
+            "id": "bx0", "from": {"id": 781}, "message": {"chat": {"id": 781}}, "data": "store"}})
+        assert any("درگاه پرداخت" in str(t[1]) for t in bale.sent)
+        assert not [t for t in bale.sent if t[2] and any(
+            str(b.get("callback_data", "")).startswith("buy_") for r in t[2] for b in r)]
+        # owner opens the store panel: gate status + token presence are visible
+        await register_via_bot(adapters, "telegram", "860835914", "OwnerS", 30, "male")
+        async with db.session_scope() as s:
+            s.add(BotAdmin(platform="telegram", platform_user_id="860835914", role="owner"))
+        await bot_mod.process_update("telegram", {"update_id": 801, "callback_query": {
+            "id": "bx1", "from": {"id": 860835914}, "message": {"chat": {"id": 860835914}},
+            "data": "adm_store"}})
+        joined = "".join(str(t[1]) for t in tg.sent)
+        assert "درگاه پرداخت بله" in joined and "توکن" in joined
+        datas1 = {b.get("callback_data") for t in tg.sent if t[2]
+                  for r in t[2] for b in r}
+        assert "adm_pay_bale" in datas1 and "adm_pay_tg" in datas1
+        # tapping the Bale switch turns the gateway ON (persisted)
+        await bot_mod.process_update("telegram", {"update_id": 802, "callback_query": {
+            "id": "bx2", "from": {"id": 860835914}, "message": {"chat": {"id": 860835914}},
+            "data": "adm_pay_bale"}})
+        async with db.session_scope() as s:
+            app_cfg = await service.get_setting(s, "app")
+            assert app_cfg.get("paymentsBaleEnabled") is True
+        # the same buyer now sees the packages + custom amount
+        bale.sent.clear()
+        await bot_mod.process_update("bale", {"update_id": 803, "callback_query": {
+            "id": "bx3", "from": {"id": 781}, "message": {"chat": {"id": 781}}, "data": "store"}})
+        datas2 = {b.get("callback_data") for t in bale.sent if t[2]
+                  for r in t[2] for b in r}
+        assert "custom_coins" in datas2 and "buy_pkg_40" in datas2
+        # the switch also turns the gateway back OFF
+        await bot_mod.process_update("telegram", {"update_id": 804, "callback_query": {
+            "id": "bx4", "from": {"id": 860835914}, "message": {"chat": {"id": 860835914}},
+            "data": "adm_pay_bale"}})
+        async with db.session_scope() as s:
+            app_cfg = await service.get_setting(s, "app")
+            assert app_cfg.get("paymentsBaleEnabled") is False
+    finally:
+        settings.bale_provider_token = old_bale_tok
+
+
+@pytest.mark.asyncio
 async def test_send_throttle_and_429_cooldown():
     """v2.2 (item 5): per-chat spacing, global sliding window and a global
     cooldown after a 429 (retry_after) so the bot never floods the API."""
