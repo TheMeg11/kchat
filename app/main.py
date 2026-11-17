@@ -432,6 +432,10 @@ async def process_broadcasts() -> None:
 
 async def _run_broadcast(bid: int, active: set) -> None:
     from .platform import PlatformError as PE
+    # v2.4.5 FIX: this function referenced bot_mod without importing it —
+    # every broadcast died with NameError on the FIRST target (campaign stuck
+    # "sending", delivered 0), while the owner thought the bot ignored them.
+    from . import bot as bot_mod
     try:
         async with session_scope() as s:
             camp = await s.get(BroadcastCampaign, bid)

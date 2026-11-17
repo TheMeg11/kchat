@@ -141,9 +141,12 @@ async def _perms(role: str) -> list:
         every = set()
         for plist in service.ROLE_DEFAULT_PERMISSIONS.values():
             every.update(plist)
+        # v2.4.5: economy.configure is granted by NO default role (web-panel
+        # only) — the owner's bot-panel economy editor and eco text step were
+        # unreachable. Owner is trusted with every configured permission.
         every.update({"settings.manage", "admins.manage", "privacy.manage",
                       "referrals.view", "daily_rewards.manage", "audit.view",
-                      "monitoring.view"})
+                      "monitoring.view", "economy.configure"})
         perms = sorted(every)
     return perms
 
@@ -457,6 +460,11 @@ async def admin_text_flow(user: User, text: str) -> bool:
     role = await get_role(user)
     if not role:
         return False
+    # v2.4.5 FIX: this function never defined `perms` — every admin text step
+    # gated on it (eco set, store rate/star, broadcast text) raised
+    # UnboundLocalError on the admin's reply, and bot.py swallowed the error,
+    # so the bot silently "did not receive" the text (caught live 21:05).
+    perms = await _perms(role)
 
     if step == "adm_finduser":
         async with session_scope() as s:

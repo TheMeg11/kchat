@@ -1871,6 +1871,88 @@ async def test_bale_store_gate_and_admin_payment_toggles(adapters):
 
 
 @pytest.mark.asyncio
+async def test_admin_text_flows_and_broadcast_runner(adapters):
+    """v2.4.5 regression (live incident 2026-11-17 21:05): admin_text_flow
+    never defined `perms`, so EVERY admin text reply (store rate, stars,
+    broadcast text, eco) died with UnboundLocalError and the bot silently
+    "did not receive" the text; the broadcast runner also referenced an
+    unimported bot_mod, so campaigns died on the first target. All driven
+    here through the REAL update path."""
+    from app import bot as bot_mod, main as main_mod
+    from app.db import BotAdmin, BroadcastCampaign
+    tg, bale = adapters
+    await register_via_bot(adapters, "telegram", "860835914", "OwnerS", 30, "male")
+    async with db.session_scope() as s:
+        s.add(BotAdmin(platform="telegram", platform_user_id="860835914", role="owner"))
+        for pid, plat in (("971", "telegram"), ("972", "telegram"), ("973", "bale")):
+            s.add(User(platform=plat, platform_user_id=pid, display_name=f"U{pid}",
+                       age=25, gender="male", language="fa",
+                       accepted_rules_at=utcnow(), registration_rewarded=True))
+
+    # 1) store rate: callback prompt -> the NUMBER must be consumed (was: crash)
+    await bot_mod.process_update("telegram", {"update_id": 900, "callback_query": {
+        "id": "tx0", "from": {"id": 860835914}, "message": {"chat": {"id": 860835914}},
+        "data": "adm_store_rate"}})
+    await bot_mod.process_update("telegram", {"update_id": 901, "message": {
+        "message_id": 2, "chat": {"id": 860835914}, "from": {"id": 860835914}, "text": "250"}})
+    assert any("نرخ جدید ثبت شد" in str(t[1]) for t in tg.sent)
+    async with db.session_scope() as s:
+        store = await service.get_setting(s, "store")
+        assert store["tomanPerCoin"] == 250
+        u = (await s.execute(select(User).where(
+            User.platform_user_id == "860835914"))).scalar_one()
+        assert u.state is None
+
+    # 2) stars per-coin text step
+    await bot_mod.process_update("telegram", {"update_id": 902, "callback_query": {
+        "id": "tx1", "from": {"id": 860835914}, "message": {"chat": {"id": 860835914}},
+        "data": "adm_store_star"}})
+    await bot_mod.process_update("telegram", {"update_id": 903, "message": {
+        "message_id": 4, "chat": {"id": 860835914}, "from": {"id": 860835914}, "text": "25"}})
+    assert any("استارز = 25 سکه" in str(t[1]) for t in tg.sent)
+    async with db.session_scope() as s:
+        store = await service.get_setting(s, "store")
+        assert store["coinsPerStar"] == 25
+
+    # 3) eco text step (owner gained economy.configure via the * expansion fix)
+    await bot_mod.process_update("telegram", {"update_id": 904, "callback_query": {
+        "id": "tx2", "from": {"id": 860835914}, "message": {"chat": {"id": 860835914}},
+        "data": "adm_eco"}})
+    await bot_mod.process_update("telegram", {"update_id": 905, "message": {
+        "message_id": 5, "chat": {"id": 860835914}, "from": {"id": 860835914},
+        "text": "set eco daily 15"}})
+    assert any("daily = 15 ثبت شد" in str(t[1]) for t in tg.sent)
+    async with db.session_scope() as s:
+        eco = await service.get_setting(s, "economy")
+        assert eco["dailyBonus"] == 15
+
+    # 4) broadcast: text step -> segment pick -> real runner delivery
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 906, "callback_query": {
+        "id": "tx3", "from": {"id": 860835914}, "message": {"chat": {"id": 860835914}},
+        "data": "adm_bcast"}})
+    await bot_mod.process_update("telegram", {"update_id": 907, "message": {
+        "message_id": 6, "chat": {"id": 860835914}, "from": {"id": 860835914},
+        "text": "سلام همگانی"}})
+    assert any("متن ذخیره شد" in str(t[1]) for t in tg.sent)  # was: silent crash
+    await bot_mod.process_update("telegram", {"update_id": 908, "callback_query": {
+        "id": "tx4", "from": {"id": 860835914}, "message": {"chat": {"id": 860835914}},
+        "data": "adm_baud_all"}})
+    async with db.session_scope() as s:
+        camp = (await s.execute(select(BroadcastCampaign).order_by(
+            BroadcastCampaign.id.desc()))).scalars().first()
+        assert camp and camp.message == "سلام همگانی" and camp.status == "sending"
+        bid = camp.id
+    await main_mod._run_broadcast(bid, set())  # was: NameError -> status failed
+    async with db.session_scope() as s:
+        camp = await s.get(BroadcastCampaign, bid)
+        assert camp.status == "completed" and camp.delivered_count >= 3
+    sent_ids = {str(t[0]) for t in tg.sent}
+    assert {"971", "972"}.issubset(sent_ids)
+    assert any("سلام همگانی" in str(t[1]) for t in tg.sent)
+
+
+@pytest.mark.asyncio
 async def test_send_throttle_and_429_cooldown():
     """v2.2 (item 5): per-chat spacing, global sliding window and a global
     cooldown after a 429 (retry_after) so the bot never floods the API."""
