@@ -350,6 +350,14 @@ async def daily_maintenance_jobs() -> None:
                         if gifted:
                             text += "\n\n" + tr(u.language, "birthday_gift_coins", coins=gifted)
                         await adp.send_message(u.platform_user_id, text)
+                except PlatformError as exc:
+                    # v2.4.4: 403 "bot was blocked by the user" used to dump a
+                    # full traceback on EVERY maintenance run — flag the user
+                    # into the bot-blocked isolation list (same mechanism as
+                    # the growth reminders) and move on quietly.
+                    from . import growth as _growth
+                    if not await _growth.mark_bot_blocked(u.id, u.platform, str(exc)):
+                        log.error("birthday greet failed for %s: %s", u.public_id, exc)
                 except Exception:
                     log.exception("birthday greet failed for %s", u.public_id)
     except Exception:
