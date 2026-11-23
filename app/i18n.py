@@ -360,6 +360,15 @@ S = {
                            "en": "✅😊 The restriction on your account was lifted by the administration!\n🌟 Welcome back — you can find chat partners again.",
                            "ru": "✅😊 Ограничение снято администрацией!\n🌟 С возвращением!"},
 
+    # --- v2.5: support answer from the in-bot admin panel ---
+    # --- v2.5: universal cancel for bot text-entry steps ---
+    "flow_cancelled": {"fa": "✅ لغو شد. هر وقت خواستی از منوی اصلی ادامه بده.",
+                       "en": "✅ Cancelled. Continue from the main menu whenever you like.",
+                       "ru": "✅ Отменено. Продолжайте из главного меню."},
+    "admin_support_reply": {"fa": "💬 پاسخ پشتیبانی ({ticket}):\n\n{body}",
+                            "en": "💬 Support reply ({ticket}):\n\n{body}",
+                            "ru": "💬 Ответ поддержки ({ticket}):\n\n{body}"},
+
     # --- E: friends feature ---
     "btn_friends": {"fa": "👥 لیست دوستان", "en": "👥 Friends list", "ru": "👥 Список друзей"},
     "btn_add_friend": {"fa": "➕ افزودن به لیست دوستان", "en": "➕ Add to friends", "ru": "➕ В друзья"},

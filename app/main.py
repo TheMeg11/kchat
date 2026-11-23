@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import secrets as pysecrets
 from contextlib import asynccontextmanager
 
 from sqlalchemy import select
@@ -365,7 +364,7 @@ async def daily_maintenance_jobs() -> None:
 
 
 async def expire_bans() -> None:
-    from sqlalchemy import select, update
+    from sqlalchemy import select
     from .db import Ban
     async with session_scope() as s:
         expired = (await s.execute(select(Ban).where(
@@ -403,12 +402,16 @@ async def enforce_idle_timeout() -> None:
         stale = (await s.execute(select(Chat).where(
             Chat.status == "active", Chat.last_activity_at < cutoff))).scalars()
         for c in stale:
+            cid = c.id
             await service.end_chat(s, c, "idle_timeout")
             for uid in (c.user_a_id, c.user_b_id):
                 u = await s.get(User, uid)
                 if u:
                     await bot_mod.send(u, "chat_idle_timeout")
                     await bot_mod.main_menu(u)
+                    # v2.5: the chat's control panel must not keep offering
+                    # next/end/report after the timeout ended the chat
+                    await bot_mod.retire_controls(u, cid)
 
 
 async def run_match_tick() -> None:
@@ -416,8 +419,31 @@ async def run_match_tick() -> None:
     await bot_mod.run_match_cycle()
 
 
+async def promote_scheduled_broadcasts() -> list[int]:
+    """v2.5: campaigns created with scheduled_for were stored as
+    status="scheduled" and NEVER queued, so they never ran at all. Promote the
+    ones whose time has come."""
+    try:
+        async with session_scope() as s:
+            due = (await s.execute(select(BroadcastCampaign).where(
+                BroadcastCampaign.status == "scheduled",
+                BroadcastCampaign.scheduled_for.isnot(None),
+                BroadcastCampaign.scheduled_for <= utcnow()))).scalars()
+            due_ids = [c.id for c in due]
+            for cid in due_ids:
+                camp = await s.get(BroadcastCampaign, cid)
+                if camp:
+                    camp.status = "sending"
+            if due_ids:
+                RUNTIME.setdefault("broadcast_queue", []).extend(due_ids)
+            return due_ids
+    except Exception:
+        log.exception("scheduled broadcast promotion failed")
+        return []
+
+
 async def process_broadcasts() -> None:
-    from . import bot as bot_mod
+    await promote_scheduled_broadcasts()
     queue: list = RUNTIME.get("broadcast_queue") or []
     if not queue:
         return
@@ -445,13 +471,30 @@ async def _run_broadcast(bid: int, active: set) -> None:
             camp_id, rate = camp.id, max(1, min(camp.rate_limit_per_sec, 25))
         delivered = failed = 0
         failures: dict[str, int] = {}
-        for u in targets:
+        # v2.5 PERF: the old loop opened a DB session (and wrote two counters)
+        # for EVERY recipient — thousands of transactions for a big campaign.
+        # Progress is now flushed every CHECK_EVERY targets and on exit.
+        CHECK_EVERY = 25
+        since_check = 0
+
+        async def _flush(final: bool = False) -> bool:
+            nonlocal since_check
             async with session_scope() as s:
                 camp = await s.get(BroadcastCampaign, camp_id)
-                if not camp or camp.status != "sending":
-                    return
+                if not camp:
+                    return False
+                if not final and camp.status != "sending":
+                    return False       # paused / cancelled mid-run
                 camp.delivered_count = delivered
                 camp.failed_count = failed
+            since_check = 0
+            return True
+
+        for u in targets:
+            if since_check >= CHECK_EVERY:
+                if not await _flush():
+                    return
+            since_check += 1
             adp = bot_mod.adapter(u.platform)
             if not adp:
                 failed += 1
@@ -603,9 +646,12 @@ async def csrf_middleware(request: Request, call_next):
 
 @app.get("/health")
 async def health():
+    maintenance = False
     try:
         async with session_scope() as s:
             await s.execute(__import__("sqlalchemy").text("SELECT 1"))
+            cfg = await service.get_setting(s, "app")
+            maintenance = bool(cfg.get("maintenanceMode", False))
         db_ok = True
     except Exception:
         db_ok = False
@@ -615,7 +661,7 @@ async def health():
             "modes": {"telegram": "webhook" if RUNTIME.get("webhook_set_telegram")
                       else "polling" if RUNTIME.get("adapter_telegram") else "off",
                       "bale": "polling" if RUNTIME.get("adapter_bale") else "off"},
-            "maintenance": False}
+            "maintenance": maintenance}
 
 
 async def _handle_webhook(platform: str, secret: str, request: Request) -> JSONResponse:

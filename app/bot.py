@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Optional
 
 from sqlalchemy import delete, func, select
 
-from . import db, service
+from . import service
 from .config import RUNTIME, settings
 from .db import (AnonThread, Block, Chat, ChatMessage, Friend, MediaType, Payment,
                  QueueEntry, Report, StorePackage, User, session_scope, utcnow)
@@ -20,6 +21,15 @@ from . import growth
 log = logging.getLogger("kanar.bot")
 
 NAME_AGE_CHANGE_COST = 10  # coins, configurable via economy settings
+
+# v2.5 UX: steps that wait for the user to type something — all of them can be
+# abandoned with «لغو» / cancel instead of being stuck in the flow.
+TEXT_ENTRY_STEPS = frozenset({
+    "name", "bio", "photo", "custom_coins", "edit_name", "edit_age",
+    "anon_msg", "anon_reply", "direct_msg_target", "direct_msg_text",
+    "friend_msg", "appeal", "birth_year", "birth_month", "birth_day",
+})
+CANCEL_WORDS = frozenset({"لغو", "cancel", "/cancel"})
 
 
 def kb(*rows):
@@ -41,19 +51,54 @@ def adapter(platform: str):
     return RUNTIME.get(f"adapter_{platform}")
 
 
-async def send(user: User, key: str, keyboard=None, reply_to=None, **kw) -> None:
+async def send(user: User, key: str, keyboard=None, reply_to=None,
+               kind: str = "panel", chat_id: Optional[int] = None, **kw) -> None:
     adp = adapter(user.platform)
     if not adp:
         return
     try:
-        await adp.send_message(user.platform_user_id, tr(user.language, key, **kw),
-                               keyboard=keyboard, reply_to=reply_to)
+        from . import panels
+        await panels.send(adp, user.platform, user.platform_user_id,
+                          tr(user.language, key, **kw), keyboard=keyboard,
+                          reply_to=reply_to, kind=kind, chat_id=chat_id)
     except PlatformError as exc:
         # v2.4: 403-class failures mean the user blocked the bot / deactivated
         # their account — isolate them so reminders & broadcasts never retry.
         if exc.error_code in (400, 403):
             await growth.mark_bot_blocked(user.id, user.platform, str(exc))
         log.warning("send failed to %s/%s: %s", user.platform, user.public_id, exc)
+
+
+async def send_controls(user: User, chat_id: int, key: str = "chat_controls_hint",
+                        text: Optional[str] = None, keyboard=None) -> None:
+    """Send/refresh the ONE chat-control panel of an active chat.
+
+    The panel is tagged with the chat id so panels.retire_chat() can turn it
+    into a search CTA the moment the chat ends (v2.5 stale-keyboard fix)."""
+    adp = adapter(user.platform)
+    if not adp:
+        return
+    kb_ = keyboard if keyboard is not None else chat_controls(user.language)
+    txt = text if text is not None else tr(user.language, key)
+    try:
+        from . import panels
+        await panels.send(adp, user.platform, user.platform_user_id, txt,
+                          keyboard=kb_, kind="chat", chat_id=chat_id)
+    except PlatformError as exc:
+        if exc.error_code in (400, 403):
+            await growth.mark_bot_blocked(user.id, user.platform, str(exc))
+        log.warning("control panel send failed to %s/%s: %s",
+                    user.platform, user.public_id, exc)
+
+
+async def retire_controls(user: User, chat_id: int) -> None:
+    """After a chat ends, replace its control panel with a search CTA."""
+    from . import panels
+    try:
+        await panels.retire_chat(user.platform, user.platform_user_id, chat_id,
+                                 search_cta(user.language))
+    except Exception:
+        log.debug("retire_controls failed for %s", user.public_id, exc_info=True)
 
 
 def search_cta(lang: str):
@@ -146,10 +191,12 @@ async def show_friends(user: User, page: int = 0) -> None:
         kb_rows.append([btn(f"💬 {p.display_name}", f"frdm_{p.id}"),
                         btn(tr(lang, "btn_friend_del"), f"frdel_{p.id}")])
     nav = []
-    if start + FRIENDS_PAGE < count:
-        nav.append(btn("◀️ قبلی", f"frpg_{page + 1}"))
+    # v2.5 FIX: the two labels were swapped — «previous» paged forward and
+    # «next» paged backward.
     if page > 0:
-        nav.append(btn("▶️ بعدی", f"frpg_{page - 1}"))
+        nav.append(btn("◀️ قبلی", f"frpg_{page - 1}"))
+    if start + FRIENDS_PAGE < count:
+        nav.append(btn("▶️ بعدی", f"frpg_{page + 1}"))
     if nav:
         kb_rows.append(nav)
     # v2.4: invite-friend entry inside the friends submenu (referral reward)
@@ -160,7 +207,6 @@ async def show_friends(user: User, page: int = 0) -> None:
 
 async def add_friend_flow(user: User) -> None:
     """Chat-options button: save the current partner into the friends list."""
-    lang = user.language
     async with session_scope() as s:
         u = await s.get(User, user.id)
         chat = await service.active_chat_for(s, u.id)
@@ -834,13 +880,25 @@ async def invite_recently_active(seeker: User) -> None:
 
 
 async def run_match_cycle() -> None:
-    """Try to pair queued users; notify both on success."""
+    """Try to pair queued users; notify both on success.
+
+    v2.5: the match card is the chat's ONE control panel (tagged with the chat
+    id). Relayed messages carry no keyboard at all, and when the chat ends the
+    panel's keyboard is swapped for a «find a new partner» CTA."""
     while True:
         async with session_scope() as s:
             matched = await service.try_match(s)
             if not matched:
                 return
             ua, ub, _charged = matched
+            chat_id = None
+            try:
+                row = await service.active_chat_for(s, ua.id)
+                chat_id = row.id if row else None
+            except Exception:
+                chat_id = None
+            if not chat_id:
+                chat_id = 0
             for me, other in ((ua, ub), (ub, ua)):
                 gender = GENDER_LABEL.get(other.gender or "male", GENDER_LABEL["male"])[me.language]
                 bio = other.bio or ""
@@ -853,14 +911,12 @@ async def run_match_cycle() -> None:
                     if other.photo_file_id and other.platform == me.platform:
                         await adp.send_media(me.platform_user_id, "photo", other.photo_file_id,
                                              caption=card)
-                        await adp.send_message(me.platform_user_id,
-                                               "⬇️💬 دکمه‌های کنترل گفتگو:",
-                                               keyboard=chat_controls(me.language))
+                        await send_controls(me, chat_id or 0,
+                                            text="⬇️💬 دکمه‌های کنترل گفتگو:")
                     else:
                         if other.platform != me.platform:
                             card += "\n" + tr(me.language, "default_avatar")
-                        await adp.send_message(me.platform_user_id, card,
-                                               keyboard=chat_controls(me.language))
+                        await send_controls(me, chat_id or 0, text=card)
                 except PlatformError as exc:
                     log.warning("match notify failed: %s", exc)
 
@@ -869,14 +925,25 @@ async def do_next(user: User) -> None:
     async with session_scope() as s:
         u = await s.get(User, user.id)
         chat = await service.active_chat_for(s, u.id)
-        if chat:
-            partner = await partner_of(s, chat, u)
-            await service.end_chat(s, chat, "next", u.id)
-            if partner:
-                await send(partner, "partner_left", keyboard=search_cta(partner.language))
+        if not chat:
+            # v2.5: this is what a stale «next partner» keyboard used to do —
+            # silently push the user back into the search queue. Tell them
+            # instead, with a fresh CTA.
+            await s.commit()
+            await send(u, "not_in_chat", keyboard=search_cta(u.language))
+            return
+        partner = await partner_of(s, chat, u)
+        ended_id = chat.id
+        await service.end_chat(s, chat, "next", u.id)
+        if partner:
+            await send(partner, "partner_left", keyboard=search_cta(partner.language))
         if not (await s.execute(select(QueueEntry).where(QueueEntry.user_id == u.id))).scalar_one_or_none():
             s.add(QueueEntry(user_id=u.id, age_group=service.age_group(u.age),
                              gender=u.gender, gender_filter="everyone"))
+        # v2.5: retire both users' control panels for this chat
+        await retire_controls(u, ended_id)
+        if partner:
+            await retire_controls(partner, ended_id)
     await send(user, "searching", keyboard=kb(
         [btn(tr(user.language, "btn_stop_search"), "stop_search")]))
     await run_match_cycle()
@@ -891,9 +958,13 @@ async def do_stop(user: User) -> None:
         chat = await service.active_chat_for(s, u.id)
         if chat:
             partner = await partner_of(s, chat, u)
+            ended_id = chat.id
             await service.end_chat(s, chat, "left", u.id)
             if partner:
                 await send(partner, "partner_left", keyboard=search_cta(partner.language))
+            await retire_controls(u, ended_id)
+            if partner:
+                await retire_controls(partner, ended_id)
     if removed:
         await send(user, "search_cancel")
     else:
@@ -929,9 +1000,10 @@ async def do_report(user: User, reason: str, details: str = "") -> None:
         partner = await partner_of(s, chat, u)
         res = await service.create_report(s, chat, u, partner, reason, details or "—")
         if not res["created"]:
-            await send(u, "report_dup", keyboard=chat_controls(u.language))
+            await send_controls(u, chat.id, key="report_dup")
             return
-    await send(user, "report_done", keyboard=chat_controls(user.language))
+        cid = chat.id
+    await send_controls(user, cid, key="report_done")
 
 
 async def do_block(user: User) -> None:
@@ -943,8 +1015,11 @@ async def do_block(user: User) -> None:
             return
         partner = await partner_of(s, chat, u)
         s.add(Block(blocker_id=u.id, blocked_id=partner.id))
+        ended_id = chat.id
         await service.end_chat(s, chat, "left", u.id)
         await send(partner, "blocked_by_partner", keyboard=search_cta(partner.language))
+        await retire_controls(u, ended_id)
+        await retire_controls(partner, ended_id)
     await send(user, "block_done")
     await main_menu(user)
 
@@ -988,10 +1063,8 @@ async def show_profile(user: User) -> None:
     if user.birth_year:
         if user.birth_calendar == "jalali":
             month_name = JALALI_MONTHS[(user.birth_month or 1) - 1].strip()
-            year_label = user.birth_year  # shown in gregorian; convert for fa users
             jy, _jm, _jd = service.gregorian_to_jalali(
                 user.birth_year, user.birth_month or 1, user.birth_day or 1)
-            year_label = jy
             bday = tr(lang, "birthday_set",
                       date=f"{jy} / {month_name} / {user.birth_day} (شمسی 🌙)")
         else:
@@ -1167,7 +1240,7 @@ async def birth_confirm_ok(user: User) -> None:
         return
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        new_age = service.save_birthday(u, calendar, year, month, day)
+        service.save_birthday(u, calendar, year, month, day)
         eco = await service.get_setting(s, "economy")
         reward = eco.get("birthdayReward", 10)
         if not u.birthday_rewarded:
@@ -1293,7 +1366,7 @@ async def apply_edit_name(user: User, name: str) -> None:
         eco = await service.get_setting(s, "economy")
         cost = eco.get("nameChangeCost", NAME_AGE_CHANGE_COST)
         txn = await service.debit(s, u, cost, "name_change", "هزینه تغییر نام",
-                                  idempotency_key=f"namechg:{u.id}:{u.display_name}")
+                                  idempotency_key=f"namechg:{u.id}:{secrets.token_hex(8)}")
         if txn is None:
             await send(u, "no_coins", keyboard=back_kb(u.language))
             return
@@ -1311,9 +1384,8 @@ async def apply_edit_age(user: User, age: int) -> None:
         u = await s.get(User, user.id)
         eco = await service.get_setting(s, "economy")
         cost = eco.get("ageChangeCost", NAME_AGE_CHANGE_COST)
-        old = u.age
         txn = await service.debit(s, u, cost, "age_change", "هزینه تغییر سن",
-                                  idempotency_key=f"agechg:{u.id}:{old}")
+                                  idempotency_key=f"agechg:{u.id}:{secrets.token_hex(8)}")
         if txn is None:
             await send(u, "no_coins", keyboard=back_kb(u.language))
             return
@@ -1617,6 +1689,13 @@ async def handle_message(platform: str, msg: dict) -> None:
             from .bot_admin import admin_text_flow
             if await admin_text_flow(user, text):
                 return
+        # v2.5 UX: every text-entry step can be abandoned with «لغو» / cancel.
+        if step in TEXT_ENTRY_STEPS and text.strip().lower() in CANCEL_WORDS:
+            user.state = None
+            await s.commit()
+            await send(user, "flow_cancelled")
+            await main_menu(user)
+            return
         # --- owner forwards a backup file during restore wait-state ---
         doc = msg.get("document")
         if doc:
@@ -1796,7 +1875,17 @@ async def handle_message(platform: str, msg: dict) -> None:
         # --- in-chat relay ---
         chat = await service.active_chat_for(s, user.id)
         if chat is None:
-            await main_menu(user)
+            # v2.5: a full main-menu resend on every stray message is noisy —
+            # answer with the "not in chat" hint + CTAs instead (admins keep
+            # the menu: they drive the panel with text).
+            is_admin = await _is_admin(user)
+            await s.commit()
+            if is_admin:
+                await main_menu(user)
+            else:
+                await send(user, "not_in_chat", keyboard=kb(
+                    [btn(tr(user.language, "btn_search"), "search"),
+                     btn(tr(user.language, "btn_back"), "back_home")]))
             return
         partner = await partner_of(s, chat, user)
 
@@ -1830,7 +1919,8 @@ async def handle_message(platform: str, msg: dict) -> None:
             mtype = "unsupported"
 
         # admin media type switch
-        mt = await s.get(MediaType, mtype if mtype != "unsupported" else "text")
+        media_key = {"animation": "gif"}.get(mtype, mtype)
+        mt = await s.get(MediaType, media_key if media_key != "unsupported" else "text")
         if mt is not None and not mt.enabled:
             await send(user, "msg_rejected_media")
             return
@@ -1870,9 +1960,10 @@ async def handle_message(platform: str, msg: dict) -> None:
         padp = adapter(partner.platform)
         try:
             if mtype == "text":
-                await padp.send_message(partner.platform_user_id, text,
-                                        keyboard=chat_controls(partner.language),
-                                        reply_to=None)
+                # v2.5: relayed messages carry NO keyboard — the chat's single
+                # control panel (sent at match time) owns the buttons, so stale
+                # keyboards never pile up under every message.
+                await padp.send_message(partner.platform_user_id, text, reply_to=None)
                 delivered = True
             else:
                 delivered = await relay_media(adp, padp, partner, msg, mtype, media, text)
@@ -1990,7 +2081,12 @@ async def handle_callback(platform: str, query: dict) -> None:
             return
         if data == "chat_back":
             user.state = None
-            await send(user, "chat_controls_hint", keyboard=chat_controls(user.language))
+            chat_now = await service.active_chat_for(s, user.id)
+            await s.commit()
+            if chat_now:
+                await send_controls(user, chat_now.id, key="chat_controls_hint")
+            else:
+                await send(user, "not_in_chat", keyboard=search_cta(user.language))
             return
         if data == "accept_rules":
             user.accepted_rules_at = utcnow()
@@ -2245,9 +2341,40 @@ async def handle_callback(platform: str, query: dict) -> None:
             await send(user, "ask_photo")
             return
         if data.startswith("buy_"):
+            # v2.5 payment gate: the store list only offers available packages,
+            # but a stale/old keyboard (or a forged callback) could still call
+            # buy_<id>. Refuse to invoice when the package or the platform
+            # gateway is disabled — previously the invoice was issued anyway.
+            pkg = await s.get(StorePackage, data[4:])
+            if not pkg or not pkg.active:
+                await s.commit()
+                await send(user, "pay_unavailable")
+                return
+            app_cfg = await service.get_setting(s, "app")
+            if user.platform == "telegram":
+                gate = (app_cfg.get("paymentsTelegramEnabled", True)
+                        and bool(settings.telegram_bot_token) and pkg.telegram_enabled)
+            else:
+                gate = (app_cfg.get("paymentsBaleEnabled", False)
+                        and bool(settings.bale_provider_token) and pkg.bale_enabled)
+            if not gate:
+                await s.commit()
+                await send(user, "pay_unavailable")
+                return
             await s.commit()
             await start_purchase(user, data[4:])
             return
+        # v2.5: stale-keyboard guard. A chat-control button pressed after the
+        # chat already ended (old panel not editable, restart, …) must explain
+        # itself instead of silently doing something else (e.g. «next» used to
+        # re-queue the user into the search).
+        if data in ("chat_next", "chat_block", "chat_report", "chat_gift",
+                    "chat_addfriend"):
+            chat_now = await service.active_chat_for(s, user.id)
+            if not chat_now:
+                await s.commit()
+                await send(user, "not_in_chat", keyboard=search_cta(user.language))
+                return
         if data == "chat_next":
             await s.commit()
             await do_next(user)
