@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import re
 import secrets
+from typing import Optional
 
 from sqlalchemy import delete, func, select
 
@@ -53,6 +54,7 @@ SMALL_PAGE = 5
 
 ROLE_LABEL = {"owner": "مالک (Owner)", "senior_admin": "مدیر ارشد",
               "moderator": "ناظر", "support": "پشتیبان"}
+PLATFORM_TITLE = {"telegram": "تلگرام", "bale": "بله"}
 ROLE_ORDER = ("senior_admin", "moderator", "support")
 
 
@@ -248,10 +250,80 @@ async def _stats(user: User) -> None:
 
 
 # ==================================================================== users ===
+async def _lookup_users(q: str) -> list[User]:
+    """Resolve ONE search box to zero or more users (v2.5).
+
+    Accepted forms, in the order an admin is likely to type them:
+      • numeric platform id   123456789      (Telegram or Bale id)
+      • internal database id  123
+      • username              @username / username  (case-insensitive)
+      • public id             U1A2B3C4
+      • platform:id           telegram:123456789 / bale:123456789
+    """
+    q = (q or "").strip()
+    if not q:
+        return []
+    found: list[User] = []
+    seen: set[int] = set()
+
+    def _add(u: Optional[User]) -> None:
+        if u is not None and u.id not in seen:
+            seen.add(u.id)
+            found.append(u)
+
+    async with session_scope() as s:
+        # explicit platform:id form — unambiguous, so stop right there
+        if ":" in q:
+            plat, _, pid = q.partition(":")
+            plat = plat.strip().lower()
+            pid = pid.strip().lstrip("@")
+            if plat in ("telegram", "bale"):
+                _add((await s.execute(select(User).where(
+                    User.platform == plat, User.platform_user_id == pid))).scalar_one_or_none())
+            return found
+
+        # @username (or a bare handle) — usernames are case-insensitive
+        if q.startswith("@"):
+            uname = q[1:].strip().lower()
+            if uname:
+                for u in (await s.execute(select(User).where(
+                        func.lower(func.coalesce(User.username, "")) == uname).limit(10))).scalars():
+                    _add(u)
+            return found
+
+        # pure number: platform id first, then the internal row id
+        if q.isdigit():
+            for u in (await s.execute(select(User).where(
+                    User.platform_user_id == q).limit(10))).scalars():
+                _add(u)
+            try:
+                _add(await s.get(User, int(q)))
+            except (ValueError, OverflowError):
+                pass
+            if found:
+                return found
+
+        # public id (exact, case-insensitive on input)
+        _add((await s.execute(select(User).where(
+            User.public_id == q.upper()))).scalar_one_or_none())
+
+        # last resort: a bare username without the @ prefix
+        uname = q.lower()
+        if uname:
+            for u in (await s.execute(select(User).where(
+                    func.lower(func.coalesce(User.username, "")) == uname).limit(10))).scalars():
+                _add(u)
+    return found
+
+
 async def _user_actions(user: User, role: str, perms: list, target: User) -> None:
     async with session_scope() as s:
         ban = await service.active_ban(s, target)
-        info = (f"👤 {target.public_id} | {target.display_name}\n"
+        info = (f"👤 {target.display_name}\n"
+                f"🆔 شناسه: {target.public_id} | ردیف: {target.id}\n"
+                f"🔢 آی‌دی {PLATFORM_TITLE.get(target.platform, target.platform)}: "
+                f"{target.platform_user_id}\n"
+                f"🔗 یوزرنیم: {'@' + target.username if target.username else '—'}\n"
                 f"پلتفرم: {target.platform} | سن: {target.age} | {target.gender}\n"
                 f"سکه: {target.coin_balance} | وضعیت: {target.status}\n"
                 f"گفتگوها: {target.total_chats} | پیام‌ها: {target.total_messages}\n"
@@ -995,7 +1067,13 @@ async def _dispatch(user: User, role: str, perms: list, data: str, chat_id) -> b
     # -------------------------------------------------------------- users ---
     if data == "adm_finduser" and "users.view" in perms:
         user.state = {"step": "adm_finduser"}
-        await _say(user, "شناسه کاربر را بفرستید (مثل U1A2B3C4 یا platform:id مثل telegram:12345):")
+        await _say(user, "🔎 جستجوی کاربر — کافی است یکی از این‌ها را بفرستید:\n\n"
+                         "🔢 آی‌دی عددی: 123456789\n"
+                         "🔗 یوزرنیم: @username یا username\n"
+                         "🆔 شناسه اختصاصی: U1A2B3C4\n"
+                         "📱 یا دقیق‌تر: telegram:123456789\n\n"
+                         "💡 اگر چند کاربر هم‌نام پیدا شود، لیستشان را می‌دهی تا انتخاب کنی.\n"
+                         "❌ لغو: «لغو»")
         return True
 
     if data == "adm_users" and "users.view" in perms:
@@ -1588,23 +1666,38 @@ async def admin_text_flow(user: User, text: str) -> bool:
         return True
 
     if step == "adm_finduser":
-        async with session_scope() as s:
-            target = None
-            q = text.strip()
-            if ":" in q:
-                plat, _, pid = q.partition(":")
-                r = await s.execute(select(User).where(User.platform == plat.strip(),
-                                                       User.platform_user_id == pid.strip()))
-                target = r.scalar_one_or_none()
-            else:
-                r = await s.execute(select(User).where(User.public_id == q.upper()))
-                target = r.scalar_one_or_none()
-            if not target:
-                await _say(user, "کاربر یافت نشد.")
-                return True
-        # v2.5 FIX: was service.role_permissions(s, role) — the owner's "*" was
-        # never expanded, so the owner saw NO ban/coin buttons on lookup.
-        await _user_actions(user, role, perms, target)
+        user.state = None
+        # v2.5: one box understands a numeric platform id, the internal row id,
+        # @username (with or without the @), the public id and platform:id.
+        targets = await _lookup_users(text)
+        if not targets:
+            await _say(user, "❌ کاربر یافت نشد.\n\n"
+                             "این قالب‌ها را می‌توانی بفرستی:\n"
+                             "🔢 123456789 (آی‌دی عددی)\n"
+                             "🔗 @username یا username\n"
+                             "🆔 U1A2B3C4 (شناسه اختصاصی)\n"
+                             "📱 telegram:123456789",
+                       keyboard=kb([[btn("🔎 جستجوی دوباره", "adm_finduser"),
+                                    ], [btn("🏠 بازگشت به منوی اصلی", "back_home")]]))
+            return True
+        if len(targets) == 1:
+            # v2.5 FIX: was service.role_permissions(s, role) — the owner's "*"
+            # was never expanded, so the owner saw NO ban/coin buttons.
+            await _user_actions(user, role, perms, targets[0])
+            return True
+        # more than one candidate: let the admin pick the exact one
+        lines = []
+        rows = []
+        for t in targets[:10]:
+            lines.append(f"• {t.display_name[:24]} | 🆔 {t.public_id} | "
+                         f"🔢 {t.platform_user_id} | "
+                         f"{'@' + t.username if t.username else 'بدون یوزرنیم'}")
+            rows.append([btn(f"👤 {t.display_name[:20]} — {t.public_id}",
+                             f"admuser_{t.id}")])
+        rows.append([btn("🔎 جستجوی دوباره", "adm_finduser")])
+        rows.append([btn("🏠 بازگشت به منوی اصلی", "back_home")])
+        await _say(user, f"🔎 {len(targets)} کاربر پیدا شد — یکی را انتخاب کن:\n\n"
+                         + "\n".join(lines), keyboard=kb(*rows))
         return True
 
     if step == "adm_eco_set" and "economy.configure" in perms:
