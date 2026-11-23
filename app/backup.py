@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import gzip
-import io
 import json
 import logging
 import secrets

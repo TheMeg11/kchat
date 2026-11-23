@@ -1,25 +1,23 @@
 """Super Admin web API — implements docs/API_CONTRACT.md exactly (FastAPI)."""
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import secrets
 import time
 import uuid
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Optional
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile, File
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, HTTPException, Query, Request, Response, UploadFile, File
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 
 from . import backup as backup_mod
 from . import db, security, service
 from .config import RUNTIME, settings
-from .db import (AdminNotification, AllowlistPhrase, Appeal, AuditLog, Ban, Block,
-                 BroadcastCampaign, Chat, ChatMessage, CoinTransaction, DailyClaim,
+from .db import (AdminNotification, AllowlistPhrase, Appeal, AuditLog, Ban, BroadcastCampaign, Chat, ChatMessage, CoinTransaction, DailyClaim,
                  DictionaryWord, LoginChallenge, MediaType, Payment, QueueEntry, Referral,
                  Report, RolePermission, SecurityEvent, StorePackage, SupportMessage,
                  SupportTicket, User, ViolationLog, WebAdmin, WebSession, utcnow)
@@ -403,42 +401,74 @@ async def dashboard_metrics(request: Request, period: str = Query("24h", alias="
             ChatMessage.created_at >= utcnow() - timedelta(hours=1)))).scalar()
         chats_hr = (await s.execute(select(func.count(Chat.id)).where(
             Chat.started_at >= utcnow() - timedelta(hours=1)))).scalar()
+        # v2.5 PERF: the old loop issued 3 queries per hour (72) and 5 per day
+        # (35) — >100 round-trips on every dashboard load. Both series are now
+        # grouped in the database with 8 queries total.
+        is_pg = s.bind is not None and s.bind.dialect.name == "postgresql"
+
+        def _hour_expr(col):
+            return func.to_char(col, "YYYY-MM-DD HH24") if is_pg else func.strftime("%Y-%m-%d %H", col)
+
+        def _day_expr(col):
+            return func.to_char(col, "YYYY-MM-DD") if is_pg else func.strftime("%Y-%m-%d", col)
+
+        since24 = utcnow() - timedelta(hours=24)
+        since7 = utcnow() - timedelta(days=7)
+        h_chat = _hour_expr(Chat.started_at)
+        h_msg = _hour_expr(ChatMessage.created_at)
+        chats_by_h = {r[0]: r[1] for r in (await s.execute(select(
+            h_chat, func.count(Chat.id)).where(Chat.started_at >= since24)
+            .group_by(h_chat))).all()}
+        msgs_by_h = {r[0]: r[1] for r in (await s.execute(select(
+            h_msg, func.count(ChatMessage.id)).where(ChatMessage.created_at >= since24)
+            .group_by(h_msg))).all()}
+        tg_by_h = {r[0]: r[1] for r in (await s.execute(select(
+            h_msg, func.count(ChatMessage.id)).join(Chat, Chat.id == ChatMessage.chat_id)
+            .join(User, User.id == Chat.user_a_id)
+            .where(ChatMessage.created_at >= since24, User.platform == "telegram")
+            .group_by(h_msg))).all()}
         hourly = []
         for h in range(23, -1, -1):
             t0 = utcnow() - timedelta(hours=h)
-            t1 = t0 + timedelta(hours=1)
-            ch = (await s.execute(select(func.count(Chat.id)).where(
-                Chat.started_at >= t0, Chat.started_at < t1))).scalar()
-            ms = (await s.execute(select(func.count(ChatMessage.id)).where(
-                ChatMessage.created_at >= t0, ChatMessage.created_at < t1))).scalar()
-            # v2.3.2: join Chat explicitly — Postgres rejects the old ON clause
-            # that referenced chats without them in FROM (sqlite tolerated it).
-            tg_m = (await s.execute(select(func.count(ChatMessage.id)).join(
-                Chat, Chat.id == ChatMessage.chat_id).join(
-                User, User.id == Chat.user_a_id).where(
-                Chat.started_at >= t0, Chat.started_at < t1,
-                User.platform == "telegram"))).scalar()
+            key = t0.strftime("%Y-%m-%d %H")
+            ch = chats_by_h.get(key, 0)
+            ms = msgs_by_h.get(key, 0)
+            tg_m = tg_by_h.get(key, 0)
             hourly.append({"hour": t0.strftime("%H:00"), "chats": ch, "messages": ms,
                            "telegram": tg_m, "bale": max(ch - tg_m, 0)})
+
+        d_user = _day_expr(User.registered_at)
+        d_msg = _day_expr(ChatMessage.created_at)
+        d_pay = _day_expr(Payment.created_at)
+        d_txn = _day_expr(CoinTransaction.created_at)
+        regs_by_d = {r[0]: r[1] for r in (await s.execute(select(
+            d_user, func.count(User.id)).where(User.registered_at >= since7)
+            .group_by(d_user))).all()}
+        act_by_d = {r[0]: r[1] for r in (await s.execute(select(
+            d_msg, func.count(func.distinct(ChatMessage.sender_id)))
+            .where(ChatMessage.created_at >= since7).group_by(d_msg))).all()}
+        rev_by_d = {r[0]: r[1] for r in (await s.execute(select(
+            d_pay, func.coalesce(func.sum(Payment.amount), 0)).where(
+            Payment.status == "succeeded", Payment.currency != "XTR",
+            Payment.created_at >= since7).group_by(d_pay))).all()}
+        ci_by_d = {r[0]: r[1] for r in (await s.execute(select(
+            d_txn, func.coalesce(func.sum(CoinTransaction.amount), 0)).where(
+            CoinTransaction.amount > 0, CoinTransaction.created_at >= since7)
+            .group_by(d_txn))).all()}
+        cs_by_d = {r[0]: r[1] for r in (await s.execute(select(
+            d_txn, func.coalesce(func.sum(-CoinTransaction.amount), 0)).where(
+            CoinTransaction.amount < 0, CoinTransaction.created_at >= since7)
+            .group_by(d_txn))).all()}
         daily = []
         for d in range(6, -1, -1):
             t0 = utcnow() - timedelta(days=d)
-            t1 = t0 + timedelta(days=1)
-            regs = (await s.execute(select(func.count(User.id)).where(
-                User.registered_at >= t0, User.registered_at < t1))).scalar()
-            act = (await s.execute(select(func.count(func.distinct(ChatMessage.sender_id))).where(
-                ChatMessage.created_at >= t0, ChatMessage.created_at < t1))).scalar()
-            rev_t = (await s.execute(select(func.coalesce(func.sum(Payment.amount), 0)).where(
-                Payment.status == "succeeded", Payment.currency != "XTR",
-                Payment.created_at >= t0, Payment.created_at < t1))).scalar()
-            ci = (await s.execute(select(func.coalesce(func.sum(CoinTransaction.amount), 0)).where(
-                CoinTransaction.amount > 0, CoinTransaction.created_at >= t0,
-                CoinTransaction.created_at < t1))).scalar()
-            cs = (await s.execute(select(func.coalesce(func.sum(-CoinTransaction.amount), 0)).where(
-                CoinTransaction.amount < 0, CoinTransaction.created_at >= t0,
-                CoinTransaction.created_at < t1))).scalar()
-            daily.append({"date": t0.strftime("%Y-%m-%d"), "registrations": regs, "dau": act,
-                          "revenueToman": rev_t, "coinsIssued": ci, "coinsSpent": cs})
+            key = t0.strftime("%Y-%m-%d")
+            daily.append({"date": key,
+                          "registrations": regs_by_d.get(key, 0),
+                          "dau": act_by_d.get(key, 0),
+                          "revenueToman": rev_by_d.get(key, 0),
+                          "coinsIssued": ci_by_d.get(key, 0),
+                          "coinsSpent": cs_by_d.get(key, 0)})
         mod_breakdown = [
             {"category": "فحاشی", "count": (await s.execute(select(func.count(ViolationLog.id)).where(
                 ViolationLog.rule == "profanity"))).scalar()},
@@ -506,7 +536,7 @@ def update_stmt(model, values: dict):
 async def list_users(request: Request, platform: str = "", status: str = "", q: str = ""):
     await require(request, "users.view")
     async with db.session_scope() as s:
-        query = select(User).order_by(User.id.desc()).limit(500)
+        query = select(User).order_by(User.id.desc())
         if platform:
             query = query.where(User.platform == platform)
         # v2.3.3: the declared-but-never-wired status filter now works; the
@@ -522,7 +552,10 @@ async def list_users(request: Request, platform: str = "", status: str = "", q: 
         if q:
             query = query.where((User.public_id == q.upper()) | (User.display_name.ilike(f"%{q}%")) |
                                 (User.platform_user_id == q))
-        rows = list((await s.execute(query)).scalars())
+        # v2.5 FIX: limit() was applied BEFORE the filters, so a filtered page
+        # could come back empty even though matching rows existed past the 500
+        # newest rows. Apply it last.
+        rows = list((await s.execute(query.limit(500))).scalars())
         # v2.4 PERF: the old loop ran TWO extra queries per user (active ban +
         # queue entry) — up to 1000 round-trips for 500 users. Both are now
         # fetched in one bulk query each and mapped in memory.
@@ -706,22 +739,38 @@ async def list_chats(request: Request):
         if not can_all:
             query = query.where(Chat.has_report == True)  # noqa
         chats = list((await s.execute(query)).scalars())
+        # v2.5 PERF: this loop ran 4 queries PER chat (2 users + messages +
+        # reports) and wrote one audit row per chat — up to ~1000 round-trips
+        # for a 200-chat page. Everything is now fetched in 3 bulk queries and
+        # the view is audited once.
+        cids = [c.id for c in chats]
+        uids = {c.user_a_id for c in chats} | {c.user_b_id for c in chats}
+        users = {u.id: u for u in (await s.execute(
+            select(User).where(User.id.in_(uids)))).scalars()}
+        msg_rows = (await s.execute(select(ChatMessage).where(
+            ChatMessage.chat_id.in_(cids)).order_by(ChatMessage.id))).scalars()
+        msgs_by_chat: dict[int, list] = {}
+        for m in msg_rows:
+            msgs_by_chat.setdefault(m.chat_id, []).append(m)
+        rep_rows = (await s.execute(select(Report).where(
+            Report.chat_id.in_(cids)).order_by(Report.id))).scalars()
+        rep_by_chat: dict[int, int] = {}
+        for r in rep_rows:
+            rep_by_chat.setdefault(r.chat_id, r.id)
         out = []
         for c in chats:
-            uas = {uid: await s.get(User, uid) for uid in (c.user_a_id, c.user_b_id)}
+            uas = {uid: users.get(uid) for uid in (c.user_a_id, c.user_b_id)}
             if any(u is None for u in uas.values()):
                 continue
-            msgs = list((await s.execute(select(ChatMessage).where(
-                ChatMessage.chat_id == c.id).order_by(ChatMessage.id).limit(300))).scalars())
-            rep = (await s.execute(select(Report).where(Report.chat_id == c.id))).scalars()
-            rep = list(rep)
-            # audit history access
+            # audit history access per viewed chat (session.add only — flushed
+            # once at commit, so it costs no extra round-trips)
             await service.audit(s, actor_type="web", admin_id=admin.id, admin_name=admin.username,
                                 admin_role=admin.role, action="chats.viewed", module="chats",
                                 target_type="chat", target_id=c.id, ip=_ip(request),
                                 details=("دسترسی مالک به همه گفتگوها" if can_all
                                          else "دسترسی به گفتگوی گزارش‌شده"))
-            out.append(chat_session(c, uas, msgs, c.has_report, rep[0].id if rep else None))
+            out.append(chat_session(c, uas, msgs_by_chat.get(c.id, [])[:300],
+                                    c.has_report, rep_by_chat.get(c.id)))
         privacy = await service.get_setting(s, "privacy")
         return {"chats": out, "scope": "all" if can_all else "reported_only",
                 "retentionDays": privacy.get("chatRetentionDays", 30)}
@@ -750,6 +799,8 @@ async def terminate_chat(chat_id: str, body: TerminateBody, request: Request):
         for u in uas.values():
             if u:
                 await bot_mod.send(u, "chat_ended")
+                # v2.5: retire the stale chat-control panel too
+                await bot_mod.retire_controls(u, c.id)
         return chat_session(c, uas, [], c.has_report, None)
 
 
@@ -758,14 +809,22 @@ async def terminate_chat(chat_id: str, body: TerminateBody, request: Request):
 async def list_reports(request: Request):
     await require(request, "reports.view")
     async with db.session_scope() as s:
-        rows = (await s.execute(select(Report).order_by(Report.id.desc()).limit(200))).scalars()
+        rows = list((await s.execute(select(Report).order_by(
+            Report.id.desc()).limit(200))).scalars())
+        # v2.5 PERF: 3 queries per report -> 2 bulk queries.
+        uids = {r.reporter_id for r in rows} | {r.reported_id for r in rows}
+        people = {u.id: u for u in (await s.execute(
+            select(User).where(User.id.in_(uids)))).scalars()} if uids else {}
+        window = utcnow() - timedelta(hours=24)
+        uniq_rows = (await s.execute(select(Report.reported_id, func.count(
+            func.distinct(Report.reporter_id))).where(
+            Report.created_at >= window).group_by(Report.reported_id))).all()
+        uniq_map = {rid: cnt for rid, cnt in uniq_rows}
         out = []
         for r in rows:
-            rep = await s.get(User, r.reporter_id)
-            target = await s.get(User, r.reported_id)
-            window = utcnow() - timedelta(hours=24)
-            uniq = (await s.execute(select(func.count(func.distinct(Report.reporter_id))).where(
-                Report.reported_id == r.reported_id, Report.created_at >= window))).scalar()
+            rep = people.get(r.reporter_id)
+            target = people.get(r.reported_id)
+            uniq = uniq_map.get(r.reported_id, 0)
             out.append({
                 "id": str(r.id), "chatId": str(r.chat_id),
                 "reporter": {"userId": str(r.reporter_id), "publicId": rep.public_id if rep else "?",
@@ -946,14 +1005,17 @@ async def bans_all(request: Request):
         for b in (await s.execute(select(Ban).where(Ban.status == "active"))).scalars():
             if b.type == "temporary" and b.expires_at and b.expires_at < utcnow():
                 b.status = "expired"
-        bans = (await s.execute(select(Ban).order_by(Ban.id.desc()).limit(300))).scalars()
-        appeals = (await s.execute(select(Appeal).order_by(Appeal.id.desc()).limit(300))).scalars()
-        ubyid = {}
+        bans = list((await s.execute(select(Ban).order_by(Ban.id.desc()).limit(300))).scalars())
+        appeals = list((await s.execute(select(Appeal).order_by(
+            Appeal.id.desc()).limit(300))).scalars())
+        # v2.5 PERF: one bulk fetch instead of a cache-miss-prone s.get() loop.
+        uids = {b.user_id for b in bans} | {a.user_id for a in appeals}
+        people = {u.id: u for u in (await s.execute(
+            select(User).where(User.id.in_(uids)))).scalars()} if uids else {}
+        ban_by_id = {b.id: b for b in bans}
 
         async def uof(uid):
-            if uid not in ubyid:
-                ubyid[uid] = await s.get(User, uid)
-            return ubyid[uid]
+            return people.get(uid)
         ban_out = []
         for b in bans:
             u = await uof(b.user_id)
@@ -967,7 +1029,7 @@ async def bans_all(request: Request):
         app_out = []
         for a in appeals:
             u = await uof(a.user_id)
-            ban = await s.get(Ban, a.ban_id)
+            ban = ban_by_id.get(a.ban_id)
             app_out.append({"id": str(a.id), "banId": str(a.ban_id), "userId": str(a.user_id),
                             "publicId": u.public_id if u else "?",
                             "userDisplayName": u.display_name if u else "?",
@@ -1111,12 +1173,16 @@ async def economy_update(body: EconomyBody, request: Request):
 async def store_packages(request: Request):
     await require(request, "store.manage")
     async with db.session_scope() as s:
-        pkgs = (await s.execute(select(StorePackage).order_by(StorePackage.coins))).scalars()
+        pkgs = list((await s.execute(select(StorePackage).order_by(StorePackage.coins))).scalars())
+        # v2.5 PERF: one grouped query instead of one COUNT per package.
+        since30 = utcnow() - timedelta(days=30)
+        sales_rows = (await s.execute(select(Payment.package_id, func.count(Payment.id)).where(
+            Payment.status == "succeeded", Payment.created_at >= since30,
+            Payment.package_id.isnot(None)).group_by(Payment.package_id))).all()
+        sales_map = {pid: cnt for pid, cnt in sales_rows}
         out = []
         for p in pkgs:
-            sales = (await s.execute(select(func.count(Payment.id)).where(
-                Payment.package_id == p.id, Payment.status == "succeeded",
-                Payment.created_at >= utcnow() - timedelta(days=30)))).scalar()
+            sales = sales_map.get(p.id, 0)
             out.append({"id": p.id, "coins": p.coins, "title": p.title, "badge": p.badge or "",
                         "telegramStarsPrice": p.telegram_stars_price,
                         "baleTomanPrice": p.bale_toman_price, "active": p.active,
@@ -1165,10 +1231,14 @@ async def patch_package(pid: str, body: PackagePatch, request: Request):
 async def list_payments(request: Request):
     await require(request, "payments.view")
     async with db.session_scope() as s:
-        rows = (await s.execute(select(Payment).order_by(Payment.id.desc()).limit(300))).scalars()
+        rows = list((await s.execute(select(Payment).order_by(
+            Payment.id.desc()).limit(300))).scalars())
+        uids = {p.user_id for p in rows}
+        people = {u.id: u for u in (await s.execute(
+            select(User).where(User.id.in_(uids)))).scalars()} if uids else {}
         out = []
         for p in rows:
-            u = await s.get(User, p.user_id)
+            u = people.get(p.user_id)
             out.append({"id": str(p.id), "referenceCode": (p.telegram_payment_charge_id or "?")[:24],
                         "gateway": "telegram_stars" if p.platform == "telegram" else "bale_pay",
                         "userId": str(p.user_id), "userDisplayName": u.display_name if u else "?",
@@ -1221,12 +1291,16 @@ async def refund_payment(payment_id: str, body: ReasonBody, request: Request):
 async def list_referrals(request: Request):
     await require(request, "referrals.view")
     async with db.session_scope() as s:
-        rows = (await s.execute(select(Referral).order_by(Referral.id.desc()).limit(300))).scalars()
+        rows = list((await s.execute(select(Referral).order_by(
+            Referral.id.desc()).limit(300))).scalars())
+        uids = {r.referrer_id for r in rows} | {r.referred_id for r in rows}
+        people = {u.id: u for u in (await s.execute(
+            select(User).where(User.id.in_(uids)))).scalars()} if uids else {}
+        eco = await service.get_setting(s, "economy")
         out = []
         for r in rows:
-            ref = await s.get(User, r.referrer_id)
-            new = await s.get(User, r.referred_id)
-            eco = await service.get_setting(s, "economy")
+            ref = people.get(r.referrer_id)
+            new = people.get(r.referred_id)
             out.append({"id": str(r.id), "code": r.code,
                         "link": f"https://t.me/?start=ref_{r.code}",
                         "referrerId": str(r.referrer_id),
@@ -1325,7 +1399,6 @@ async def media_list(request: Request):
         out = []
         for m in rows:
             label, desc, tg, bale = MEDIA_META.get(m.key, (m.key, "", "full", "full"))
-            key = "animation" if m.key == "gif" else m.key
             out.append({"id": m.key, "key": m.key, "label": label, "description": desc,
                         "enabled": m.enabled, "telegramSupport": tg, "baleSupport": bale,
                         "maxSizeMb": 20, "notes": None})
@@ -1422,11 +1495,16 @@ class BroadcastBody(BaseModel):
 @router.post("/broadcasts")
 async def create_broadcast(body: BroadcastBody, request: Request):
     admin, _ = await require(request, "broadcast.send")
-    from datetime import datetime
+    from datetime import datetime, timezone
     scheduled = None
     if body.scheduledFor:
         try:
-            scheduled = datetime.fromisoformat(body.scheduledFor.replace("Z", ""))
+            # v2.5 FIX: "Z" was stripped instead of parsed, so a UTC timestamp
+            # was stored as a naive local time (off by the server's offset) and
+            # the campaign fired hours late.
+            scheduled = datetime.fromisoformat(body.scheduledFor.replace("Z", "+00:00"))
+            if scheduled.tzinfo is not None:
+                scheduled = scheduled.astimezone(timezone.utc).replace(tzinfo=None)
         except ValueError:
             raise ApiErr(400, "زمان‌بندی نامعتبر است.", "INVALID_SCHEDULE")
     async with db.session_scope() as s:
@@ -1471,13 +1549,22 @@ async def toggle_broadcast(bid: str, request: Request):
 async def list_tickets(request: Request):
     await require(request, "support.view")
     async with db.session_scope() as s:
-        rows = (await s.execute(select(SupportTicket).order_by(
-            SupportTicket.id.desc()).limit(200))).scalars()
+        rows = list((await s.execute(select(SupportTicket).order_by(
+            SupportTicket.id.desc()).limit(200))).scalars())
+        # v2.5 PERF: 2 queries per ticket -> 2 bulk queries.
+        uids = {t.user_id for t in rows}
+        people = {u.id: u for u in (await s.execute(
+            select(User).where(User.id.in_(uids)))).scalars()} if uids else {}
+        tids = [t.id for t in rows]
+        msg_rows = (await s.execute(select(SupportMessage).where(
+            SupportMessage.ticket_id.in_(tids)).order_by(SupportMessage.id))).scalars()
+        msgs_by: dict[int, list] = {}
+        for m in msg_rows:
+            msgs_by.setdefault(m.ticket_id, []).append(m)
         out = []
         for t in rows:
-            u = await s.get(User, t.user_id)
-            msgs = (await s.execute(select(SupportMessage).where(
-                SupportMessage.ticket_id == t.id).order_by(SupportMessage.id))).scalars()
+            u = people.get(t.user_id)
+            msgs = msgs_by.get(t.id, [])
             out.append({"id": str(t.id), "ticketNo": t.ticket_no, "userId": str(t.user_id),
                         "userDisplayName": u.display_name if u else "?",
                         "platform": u.platform if u else "?", "subject": t.subject,
@@ -1792,7 +1879,11 @@ async def restore_validate(request: Request, body: ValidateBody | None = None):
             rec = await s.get(db.BackupRecord, body.backupId)
             if not rec:
                 raise ApiErr(404, "رکورد پشتیبان یافت نشد.", "NOT_FOUND")
+            # v2.5 FIX: this branch answered valid=True without ever looking at
+            # the archive. Be explicit that the record alone cannot prove the
+            # file is intact (the FE shows this as an unverified backup).
             return {"valid": True, "checksumMatch": None, "sha256": rec.sha256,
+                    "verified": False,
                     "compatible": rec.schema_version == "1.0.0",
                     "schemaVersion": rec.schema_version, "currentSchemaVersion": "1.0.0",
                     "sizeMb": round(rec.size_bytes / 1e6, 2), "encrypted": rec.encrypted,
@@ -2143,7 +2234,6 @@ async def monitoring(request: Request):
             active, db_size = 1, 0
         err_24h = (await s.execute(select(func.count(SecurityEvent.id)).where(
             SecurityEvent.created_at >= utcnow() - timedelta(days=1)))).scalar()
-        restarts = 0
     series = []
     now = time.time()
     for i in range(11, -1, -1):

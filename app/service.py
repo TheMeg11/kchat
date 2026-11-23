@@ -1,16 +1,16 @@
 """Core business logic: settings, economy, matching, moderation, reports."""
 from __future__ import annotations
 
-import asyncio
+import copy
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import delete, func, select, update
 
 from . import db
 from .db import (AdminNotification, AllowlistPhrase, Appeal, AppSetting, AuditLog,
-                 Ban, Block, BroadcastCampaign, Chat, ChatMessage, CoinTransaction,
+                 Ban, Block, Chat, ChatMessage, CoinTransaction,
                  DailyClaim, DictionaryWord, MediaType, Payment, ProcessedUpdate,
                  QueueEntry, RecentPair, Referral, Report, RolePermission, StorePackage,
                  SupportMessage, SupportTicket, User, ViolationLog, utcnow)
@@ -107,14 +107,17 @@ async def get_setting(session, key: str) -> Any:
         # v2.3.4: hand out a COPY — the live DEFAULT_SETTINGS dict must never
         # leak to callers (a caller mutating the returned config corrupted the
         # process-wide defaults, e.g. maintenanceMode sticking on).
+        # v2.5: DEEP copy — a shallow dict() still shared nested lists/dicts
+        # (profanityEscalationHours, platforms.*, …), so editing them in place
+        # mutated the module-level defaults.
         base = DEFAULT_SETTINGS.get(key)
-        return dict(base) if isinstance(base, dict) else base
+        return copy.deepcopy(base)
     base = DEFAULT_SETTINGS.get(key)
     if isinstance(base, dict) and isinstance(row.value, dict):
-        merged = dict(base)
-        merged.update(row.value)
+        merged = copy.deepcopy(base)
+        merged.update(copy.deepcopy(row.value))
         return merged
-    return row.value
+    return copy.deepcopy(row.value)
 
 
 async def set_setting(session, key: str, value: Any) -> None:
@@ -153,8 +156,11 @@ async def notify(session, title: str, body: str, severity="info", route="/") -> 
 
 # --------------------------------------------------------------- economy ----
 async def credit(session, user: User, amount: int, type_: str, description: str = "",
-                 reference_id: str = "", idempotency_key: str = "") -> CoinTransaction:
-    assert amount > 0
+                 reference_id: str = "", idempotency_key: str = "") -> Optional[CoinTransaction]:
+    """Add coins to a wallet. amount == 0 is a no-op (returns None) so callers
+    like a zero-value daily bonus or a 0-coin admin grant never crash."""
+    if amount <= 0:
+        return None
     if idempotency_key:
         existing = await session.execute(
             select(CoinTransaction).where(CoinTransaction.idempotency_key == idempotency_key))
@@ -348,10 +354,8 @@ def compute_age_from_birthday(by: int, bm: int, bd: int) -> int:
 
 async def update_dynamic_ages(session) -> int:
     """Refresh ages from stored birthdays (called daily)."""
-    import datetime as _dt
     res = await session.execute(select(User).where(User.birth_year.isnot(None)))
     changed = 0
-    today = _dt.date.today()
     for u in res.scalars():
         new_age = compute_age_from_birthday(u.birth_year, u.birth_month, u.birth_day)
         if new_age != u.age:
@@ -558,14 +562,15 @@ async def allowlist(session):
     return [p.phrase for p in res.scalars()]
 
 
-async def check_message(session, text: str) -> tuple[bool, Optional[str]]:
+async def check_message(session, body: str) -> tuple[bool, Optional[str]]:
+    """Moderate an outbound message body (profanity + contact info)."""
     from . import moderation as mod
-    if not text:
+    if not body:
         return True, None
-    if not mod.check_profanity(text, await dictionary(session), await allowlist(session)).ok:
+    if not mod.check_profanity(body, await dictionary(session), await allowlist(session)).ok:
         return False, "profanity"
     cfg = await get_setting(session, "moderation")
-    if not mod.check_contact(text, cfg).ok:
+    if not mod.check_contact(body, cfg).ok:
         return False, "contact"
     return True, None
 
@@ -658,7 +663,14 @@ async def purge_expired(session) -> dict:
     days = cfg.get("chatRetentionDays", 30)
     cutoff = utcnow() - timedelta(days=days)
     m = (await session.execute(delete(ChatMessage).where(ChatMessage.created_at < cutoff))).rowcount
-    c = (await session.execute(delete(Chat).where(Chat.status != "active", Chat.ended_at < cutoff))).rowcount
+    # v2.5 FK-SAFE: chats cannot be deleted while chat_messages/reports still
+    # point at them (Postgres raised IntegrityError; SQLite silently kept
+    # orphans). Delete the children of the expired chats first.
+    old_chats = select(Chat.id).where(Chat.status != "active", Chat.ended_at < cutoff)
+    await session.execute(delete(ChatMessage).where(ChatMessage.chat_id.in_(old_chats)))
+    await session.execute(delete(Report).where(Report.chat_id.in_(old_chats)))
+    c = (await session.execute(delete(Chat).where(
+        Chat.status != "active", Chat.ended_at < cutoff))).rowcount
     u = (await session.execute(delete(ProcessedUpdate).where(
         ProcessedUpdate.created_at < utcnow() - timedelta(hours=48)))).rowcount
     v = (await session.execute(delete(ViolationLog).where(
@@ -676,25 +688,57 @@ async def purge_expired(session) -> dict:
 
 
 async def delete_account(session, user: User) -> None:
+    """Erase a user's personal data and account (GDPR-style).
+
+    v2.5 FK-SAFE: every table that points at this user (or at one of their
+    chats) is cleared first, in dependency order. The previous version deleted
+    chats while messages/reports/appeals still referenced them — Postgres
+    rejected the whole transaction, so «delete my account» silently failed on
+    production while looking fine on SQLite.
+    """
     uid = user.id
-    for tbl in (ChatMessage,):  # messages
-        await session.execute(delete(tbl).where(tbl.sender_id == uid))
+    my_chats = select(Chat.id).where((Chat.user_a_id == uid) | (Chat.user_b_id == uid))
+    # 1) threads / friends / blocks / recent pairs that mention the user
+    await session.execute(delete(db.AnonThread).where(
+        (db.AnonThread.owner_id == uid) | (db.AnonThread.sender_id == uid)))
+    await session.execute(delete(db.Friend).where(
+        (db.Friend.user_id == uid) | (db.Friend.friend_id == uid)))
+    await session.execute(delete(Block).where(
+        (Block.blocker_id == uid) | (Block.blocked_id == uid)))
+    await session.execute(delete(RecentPair).where(
+        (RecentPair.user_a_id == uid) | (RecentPair.user_b_id == uid)))
+    # 2) support tickets + their messages
+    my_tickets = select(SupportTicket.id).where(SupportTicket.user_id == uid)
+    await session.execute(delete(SupportMessage).where(SupportMessage.ticket_id.in_(my_tickets)))
+    await session.execute(delete(SupportTicket).where(SupportTicket.user_id == uid))
+    # 3) moderation trail
+    await session.execute(delete(ViolationLog).where(ViolationLog.user_id == uid))
+    my_bans = select(Ban.id).where(Ban.user_id == uid)
+    await session.execute(delete(Appeal).where(
+        (Appeal.user_id == uid) | (Appeal.ban_id.in_(my_bans))))
+    await session.execute(delete(Ban).where(Ban.user_id == uid))
+    # 4) reports (as reporter, as reported, or filed inside one of their chats)
+    await session.execute(delete(Report).where(
+        (Report.reporter_id == uid) | (Report.reported_id == uid)
+        | (Report.chat_id.in_(my_chats))))
+    # 5) chat content, then the chats themselves
+    await session.execute(delete(ChatMessage).where(
+        (ChatMessage.sender_id == uid) | (ChatMessage.chat_id.in_(my_chats))))
     for chat in (await session.execute(select(Chat).where(
             (Chat.user_a_id == uid) | (Chat.user_b_id == uid)))).scalars():
         await end_chat(session, chat, "terminated", uid)
         await session.delete(chat)
+    # 6) wallet / queue / referral ledger
     for model in (QueueEntry, DailyClaim, CoinTransaction, Payment):
         await session.execute(delete(model).where(model.user_id == uid))
-    await session.execute(delete(Block).where((Block.blocker_id == uid) | (Block.blocked_id == uid)))
-    await session.execute(delete(RecentPair).where(
-        (RecentPair.user_a_id == uid) | (RecentPair.user_b_id == uid)))
-    await session.execute(delete(Report).where(
-        (Report.reporter_id == uid) | (Report.reported_id == uid)))
-    for model in (Appeal, Referral):
-        col = Appeal.user_id if model is Appeal else Referral.referred_id
-        await session.execute(delete(model).where(col == uid))
-        if model is Referral:
-            await session.execute(delete(Referral).where(Referral.referrer_id == uid))
+    await session.execute(delete(Referral).where(
+        (Referral.referrer_id == uid) | (Referral.referred_id == uid)))
+    # 7) self-references from OTHER users must not dangle
+    await session.execute(update(User).where(User.referred_by_id == uid)
+                          .values(referred_by_id=None))
+    await session.execute(update(User).where(User.linked_user_id == uid)
+                          .values(linked_user_id=None))
+    # 8) scrub the row itself (kept for audit/ledger integrity)
     user.display_name = "Deleted User"
     user.username = None
     user.bio = None
@@ -703,6 +747,12 @@ async def delete_account(session, user: User) -> None:
     user.status = "deleted"
     user.deleted_at = utcnow()
     user.state = None
+    user.anon_link_code = None
+    user.link_code = None
+    user.birth_year = None
+    user.birth_month = None
+    user.birth_day = None
+    user.birth_calendar = None
 
 
 # ------------------------------------------------------------ broadcast ----

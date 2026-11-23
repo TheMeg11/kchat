@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import (JSON, BigInteger, Boolean, DateTime, Float, ForeignKey,
+from sqlalchemy import (JSON, BigInteger, Boolean, DateTime, ForeignKey,
                         Index, Integer, String, Text, UniqueConstraint)
 from sqlalchemy.ext.asyncio import (AsyncSession, async_sessionmaker,
                                     create_async_engine)

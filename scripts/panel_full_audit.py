@@ -2,6 +2,7 @@
 """v2.3.4 full panel endpoint audit — hits EVERY admin API route against a
 locally seeded app, asserts 2xx/expected-4xx, prints a per-section verdict."""
 import asyncio, os, sys
+from pathlib import Path
 
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:////tmp/live_e2e3.db"
 os.environ["ENCRYPTION_KEY"] = "e2e-encryption-key-0123456789abcdef"
@@ -9,7 +10,7 @@ os.environ["BACKUP_PASSWORD"] = "E2eBackupPass-1234567890"
 os.environ["WEBHOOK_SECRET"] = "e2e-wh"
 os.environ["ADMIN_PANEL_USERNAME"] = "probe.admin"
 os.environ["ADMIN_PANEL_PASSWORD"] = "ProbePass123!x"
-sys.path.insert(0, "/home/z/my-project/work/kchat")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import httpx
 from app import db

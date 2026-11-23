@@ -51,6 +51,11 @@ class FakeAdapter:
     def __init__(self, platform="telegram"):
         self.platform = platform
         self.sent: list[tuple] = []
+        self.edits: list[tuple] = []      # (chat_id, message_id, keyboard)
+
+    async def edit_reply_markup(self, chat_id, message_id, keyboard=None):
+        self.edits.append((chat_id, message_id, keyboard))
+        return {"message_id": message_id, "ok": True}
 
     async def send_message(self, chat_id, text, keyboard=None, reply_to=None):
         self.sent.append((chat_id, text, keyboard))
@@ -60,10 +65,6 @@ class FakeAdapter:
                          bytes_data=None, filename="file", reply_to=None, extra=None):
         self.sent.append((chat_id, f"[{msg_type}]", None))
         return {"message_id": len(self.sent)}
-
-    async def call(self, method, payload=None, files=None):
-        self.sent.append((payload.get("chat_id") if payload else None, method, None))
-        return {"ok": True, message_id: 1} if False else {"message_id": 1, "result": True}
 
     async def download_file(self, file_id, max_bytes):
         return b"fakedata" * 10
@@ -3025,3 +3026,525 @@ async def test_package_patch_persists_camelcase_fields():
         assert p.bale_toman_price == 8000, "PATCH must persist the column, not an attr"
         # restore the seed value so other tests keep their expectations
         p.bale_toman_price = 20000
+
+
+# ================================================== v2.5 regression tests ===
+@pytest.mark.asyncio
+async def test_single_active_keyboard_and_retired_chat_controls(adapters):
+    """v2.5: relayed messages carry NO keyboard; the match card is the chat's
+    one control panel; ending the chat swaps that panel for a search CTA; a
+    stale «next» button explains itself instead of re-queueing the user."""
+    from app import bot as bot_mod
+    tg, bale = adapters
+    await register_via_bot(adapters, "telegram", "9401", "PanelA", 25, "male")
+    await register_via_bot(adapters, "bale", "9402", "PanelB", 25, "female")
+    tg.sent.clear()
+    bale.sent.clear()
+    tg.edits.clear()
+    bale.edits.clear()
+    for i, (plat, pid) in enumerate((("telegram", 9401), ("bale", 9402))):
+        await bot_mod.process_update(plat, {"update_id": 301000 + i, "callback_query": {
+            "id": f"p{i}", "from": {"id": pid}, "message": {"chat": {"id": pid}},
+            "data": "gf_everyone"}})
+    # the match card is the ONE message carrying chat controls
+    tg_controls = [t for t in tg.sent if t[2] and any(
+        b.get("callback_data") == "chat_end" for r in t[2] for b in r)]
+    assert tg_controls, "match card must carry the chat control panel"
+    # a relayed message must NOT carry any keyboard
+    await bot_mod.process_update("telegram", {"update_id": 301010, "message": {
+        "message_id": 5, "chat": {"id": 9401}, "from": {"id": 9401}, "text": "hi there"}})
+    relayed = [t for t in bale.sent if t[1] == "hi there"]
+    assert relayed and all(t[2] is None for t in relayed), "relayed messages must have no keyboard"
+    # ending the chat retires BOTH users' control panels into a search CTA
+    bale.edits.clear()
+    await bot_mod.process_update("telegram", {"update_id": 301020, "callback_query": {
+        "id": "pe", "from": {"id": 9401}, "message": {"chat": {"id": 9401}},
+        "data": "chat_end"}})
+    assert bale.edits, "the partner's stale control panel must be edited away"
+    # the newest panel the partner sees must be a fresh search CTA
+    last_kb = [t[2] for t in bale.sent if t[2]][-1]
+    assert any(b.get("callback_data") == "search" for r in last_kb for b in r), \
+        "retired panel must be replaced by a search CTA"
+    # a stale «next partner» press must NOT re-queue the user
+    async with db.session_scope() as s:
+        assert (await s.execute(select(QueueEntry))).first() is None
+    bale.sent.clear()
+    await bot_mod.process_update("bale", {"update_id": 301030, "callback_query": {
+        "id": "pn", "from": {"id": 9402}, "message": {"chat": {"id": 9402}},
+        "data": "chat_next"}})
+    joined = "".join(str(t[1]) for t in bale.sent)
+    assert "در هیچ گفتگویی" in joined
+    async with db.session_scope() as s:
+        assert (await s.execute(select(QueueEntry))).first() is None, \
+            "stale next must not silently enqueue"
+
+
+@pytest.mark.asyncio
+async def test_admin_panel_is_categorized_and_complete(adapters):
+    """v2.5: the in-bot admin panel exposes every category and the lookup
+    action buttons work for the owner (the old role_permissions() bug)."""
+    from app import bot as bot_mod
+    from app.db import BotAdmin
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "860835914", "OwnerFull", 30, "male")
+    target = await mk_user(platform="telegram", pid="9403", name="LookupTarget", coins=7)
+    async with db.session_scope() as s:
+        s.add(BotAdmin(platform="telegram", platform_user_id="860835914", role="owner"))
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 302000, "message": {
+        "message_id": 1, "chat": {"id": 860835914}, "from": {"id": 860835914},
+        "text": "/admin"}})
+    kb0 = [t[2] for t in tg.sent if t[2]][0]
+    datas0 = {b.get("callback_data") for r in kb0 for b in r}
+    for need in ("adm_users", "adm_finduser", "adm_referrals", "adm_payments",
+                 "adm_reports", "adm_bans", "adm_appeals", "admmod", "admmedia",
+                 "adm_tickets", "adm_eco", "adm_store", "adm_bcast", "admbcasts",
+                 "adm_backup", "adm_restore", "adm_settings", "adm_platforms",
+                 "adm_logs", "adm_monitor", "adm_admins", "adm_stats",
+                 "adm_backup_now", "adm_maint"):
+        assert need in datas0, f"missing admin category {need}"
+    # lookup -> action buttons (owner "*" expansion bug)
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 302001, "callback_query": {
+        "id": "af", "from": {"id": 860835914}, "message": {"chat": {"id": 860835914}},
+        "data": "adm_finduser"}})
+    async with db.session_scope() as s:
+        t = await s.get(User, target.id)
+        pub = t.public_id
+    await bot_mod.process_update("telegram", {"update_id": 302002, "message": {
+        "message_id": 2, "chat": {"id": 860835914}, "from": {"id": 860835914},
+        "text": pub}})
+    datas1 = {b.get("callback_data") for t_ in tg.sent if t_[2] for r in t_[2] for b in r}
+    assert any(d.startswith("admub_") for d in datas1), "owner must see ban buttons"
+    assert any(d.startswith("admuc_") for d in datas1), "owner must see coin buttons"
+
+
+@pytest.mark.asyncio
+async def test_admin_panel_reports_bans_appeals_tickets(adapters):
+    """v2.5: the in-bot panel can resolve reports, revoke bans, review appeals
+    and answer/close support tickets — all previously web-only."""
+    from app import bot as bot_mod
+    from app.db import (Appeal, BotAdmin, Report, Ban, SupportMessage,
+                        SupportTicket)
+    tg, bale = adapters
+    await register_via_bot(adapters, "telegram", "860835914", "OwnerOps", 30, "male")
+    offender = await mk_user(platform="bale", pid="9404", name="Offender", coins=0)
+    async with db.session_scope() as s:
+        s.add(BotAdmin(platform="telegram", platform_user_id="860835914", role="owner"))
+        rep = Report(chat_id=None, reporter_id=offender.id, reported_id=offender.id,
+                     reason="spam", details="spam report")
+        s.add(rep)
+        await s.flush()
+        rid = rep.id
+        ban = Ban(user_id=offender.id, type="temporary", source="manual_admin",
+                  reason="test ban", status="active", issued_by="test")
+        s.add(ban)
+        await s.flush()
+        bid = ban.id
+        ap = Appeal(ban_id=bid, user_id=offender.id, message="please unban")
+        s.add(ap)
+        await s.flush()
+        aid = ap.id
+        tk = SupportTicket(user_id=offender.id, subject="help me", category="other",
+                           ticket_no=f"TKT-{int(time.time() * 1000) % 100000:05d}")
+        s.add(tk)
+        await s.flush()
+        s.add(SupportMessage(ticket_id=tk.id, sender_type="user",
+                             sender_name="Offender", body="problem"))
+        tid = tk.id
+
+    def cb(upd_id, data):
+        return bot_mod.process_update("telegram", {"update_id": upd_id, "callback_query": {
+            "id": f"c{upd_id}", "from": {"id": 860835914},
+            "message": {"chat": {"id": 860835914}}, "data": data}})
+
+    # report detail -> resolve (temporary ban)
+    await cb(303000, f"admrep_{rid}")
+    assert any("بررسی" in str(t[1]) or "گزارش #" in str(t[1]) for t in tg.sent)
+    await cb(303001, f"admrep_{rid}_tban")
+    async with db.session_scope() as s:
+        r = await s.get(Report, rid)
+        assert r.status == "action_taken"
+    # ban list -> revoke
+    await cb(303002, "adm_bans")
+    await cb(303003, f"admban_{bid}_revoke")
+    async with db.session_scope() as s:
+        b = await s.get(Ban, bid)
+        assert b.status == "revoked"
+    # appeal list -> approve (already revoked ban, still marks the appeal)
+    await cb(303004, "adm_appeals")
+    await cb(303005, f"admapp_{aid}_approve")
+    async with db.session_scope() as s:
+        a = await s.get(Appeal, aid)
+        assert a.status == "approved"
+    # ticket detail -> reply from the bot -> close
+    bale.sent.clear()
+    await cb(303006, "adm_tickets")
+    await cb(303007, f"admtkt_{tid}")
+    await cb(303008, f"admtkt_{tid}_reply")
+    await bot_mod.process_update("telegram", {"update_id": 303009, "message": {
+        "message_id": 3, "chat": {"id": 860835914}, "from": {"id": 860835914},
+        "text": "پاسخ پشتیبانی: درست شد"}})
+    async with db.session_scope() as s:
+        msgs = list((await s.execute(select(SupportMessage).where(
+            SupportMessage.ticket_id == tid))).scalars())
+        assert any(m.sender_type == "admin" and "درست شد" in m.body for m in msgs)
+    pv = [t for t in bale.sent if t[0] == "9404"]
+    assert pv and "پاسخ پشتیبانی" in str(pv[0][1]), "the user must receive the answer"
+    await cb(303010, f"admtkt_{tid}_close")
+    async with db.session_scope() as s:
+        t = await s.get(SupportTicket, tid)
+        assert t.status == "closed"
+
+
+@pytest.mark.asyncio
+async def test_admin_panel_moderation_and_settings(adapters):
+    """v2.5: dictionary / allowlist / media / app / platform toggles are all
+    reachable and persist from the in-bot panel."""
+    from app import bot as bot_mod
+    from app.db import (AllowlistPhrase, BotAdmin, DictionaryWord, MediaType)
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "860835914", "OwnerCfg", 30, "male")
+    async with db.session_scope() as s:
+        s.add(BotAdmin(platform="telegram", platform_user_id="860835914", role="owner"))
+
+    def cb(upd_id, data):
+        return bot_mod.process_update("telegram", {"update_id": upd_id, "callback_query": {
+            "id": f"m{upd_id}", "from": {"id": 860835914},
+            "message": {"chat": {"id": 860835914}}, "data": data}})
+
+    def txt(upd_id, body):
+        return bot_mod.process_update("telegram", {"update_id": upd_id, "message": {
+            "message_id": upd_id % 100, "chat": {"id": 860835914},
+            "from": {"id": 860835914}, "text": body}})
+
+    # dictionary add
+    await cb(304000, "admmod")
+    await cb(304001, "admdictadd")
+    await txt(304002, "testbadword high block_and_warn")
+    async with db.session_scope() as s:
+        w = (await s.execute(select(DictionaryWord).where(
+            DictionaryWord.word == "testbadword"))).scalar_one_or_none()
+        assert w is not None and w.severity == "high"
+        wid = w.id
+    await cb(304003, f"admdictdel_{wid}")
+    async with db.session_scope() as s:
+        assert (await s.execute(select(DictionaryWord).where(
+            DictionaryWord.id == wid))).scalar_one_or_none() is None
+    # allowlist add + delete
+    await cb(304004, "admallow")
+    await cb(304005, "admallowadd")
+    await txt(304006, "testallowphrase")
+    async with db.session_scope() as s:
+        p_ = (await s.execute(select(AllowlistPhrase).where(
+            AllowlistPhrase.phrase == "testallowphrase"))).scalar_one_or_none()
+        assert p_ is not None
+        pid = p_.id
+    await cb(304007, f"admallowdel_{pid}")
+    async with db.session_scope() as s:
+        assert (await s.execute(select(AllowlistPhrase).where(
+            AllowlistPhrase.id == pid))).scalar_one_or_none() is None
+    # media toggle
+    await cb(304008, "admmedia")
+    await cb(304009, "admmedia_voice")
+    async with db.session_scope() as s:
+        m = await s.get(MediaType, "voice")
+        assert m.enabled is False
+    await cb(304010, "admmedia_voice")     # restore
+    # app toggle
+    await cb(304011, "adm_settings")
+    await cb(304012, "admset_allowNewRegistrations")
+    async with db.session_scope() as s:
+        cfg = await service.get_setting(s, "app")
+        assert cfg["allowNewRegistrations"] is False
+    await cb(304013, "admset_allowNewRegistrations")   # restore
+    # platform toggle
+    await cb(304014, "adm_platforms")
+    await cb(304015, "admpl_telegram_pollingFallback")
+    async with db.session_scope() as s:
+        pcfg = await service.get_setting(s, "platforms")
+        assert pcfg["telegram"]["pollingFallback"] is False
+    await cb(304016, "admpl_telegram_pollingFallback")  # restore
+
+
+@pytest.mark.asyncio
+async def test_admin_panel_cancel_and_expired_button(adapters):
+    """v2.5 UX: every admin text step can be cancelled with «لغو», and an
+    unknown/stale admin button answers with a fresh menu instead of silence."""
+    from app import bot as bot_mod
+    from app.db import BotAdmin
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "860835914", "OwnerUx", 30, "male")
+    async with db.session_scope() as s:
+        s.add(BotAdmin(platform="telegram", platform_user_id="860835914", role="owner"))
+
+    def cb(upd_id, data):
+        return bot_mod.process_update("telegram", {"update_id": upd_id, "callback_query": {
+            "id": f"u{upd_id}", "from": {"id": 860835914},
+            "message": {"chat": {"id": 860835914}}, "data": data}})
+
+    await cb(305000, "adm_store")
+    await cb(305001, "adm_store_rate")
+    await bot_mod.process_update("telegram", {"update_id": 305002, "message": {
+        "message_id": 2, "chat": {"id": 860835914}, "from": {"id": 860835914},
+        "text": "لغو"}})
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(
+            User.platform_user_id == "860835914"))).scalar_one()
+        assert u.state is None
+    assert any("لغو شد" in str(t[1]) for t in tg.sent)
+    # unknown admin callback -> fresh menu with an "expired" note
+    tg.sent.clear()
+    await cb(305003, "adm_does_not_exist")
+    joined = "".join(str(t[1]) for t in tg.sent)
+    assert "منقضی" in joined
+    datas = {b.get("callback_data") for t_ in tg.sent if t_[2] for r in t_[2] for b in r}
+    assert "adm_stats" in datas
+
+
+@pytest.mark.asyncio
+async def test_scheduled_broadcast_is_promoted(adapters):
+    """v2.5: a campaign with status=scheduled and a due scheduled_for is picked
+    up by the scheduler and delivered (it used to stay scheduled forever)."""
+    from app import main as main_mod
+    from app.db import BroadcastCampaign
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "9405", "SchedRecv", 25, "male")
+    async with db.session_scope() as s:
+        camp = BroadcastCampaign(title="scheduled", message="زمان‌بندی‌شده",
+                                 audience="all", audience_label="همه",
+                                 rate_limit_per_sec=20, status="scheduled",
+                                 scheduled_for=utcnow() - timedelta(minutes=1),
+                                 target_count=1, created_by="test")
+        s.add(camp)
+        await s.flush()
+        bid = camp.id
+    RUNTIME["broadcast_queue"] = []
+    tg.sent.clear()
+    promoted = await main_mod.promote_scheduled_broadcasts()
+    assert promoted == [bid], "due scheduled campaign must be promoted"
+    async with db.session_scope() as s:
+        c = await s.get(BroadcastCampaign, bid)
+        assert c.status == "sending"
+        assert bid in (RUNTIME.get("broadcast_queue") or [])
+    await main_mod._run_broadcast(bid, set())
+    async with db.session_scope() as s:
+        c = await s.get(BroadcastCampaign, bid)
+        assert c.status == "completed" and c.delivered_count >= 1
+    assert any("زمان‌بندی‌شده" in str(t[1]) for t in tg.sent)
+
+
+@pytest.mark.asyncio
+async def test_delete_account_is_fk_safe_and_scrubs_data(adapters):
+    """v2.5: account deletion clears every referencing row in dependency order
+    (Postgres used to reject the transaction) and removes personal data."""
+    from app.db import (Appeal, AnonThread, Ban, Friend, Report, SupportMessage,
+                        SupportTicket, ViolationLog)
+    tg, _ = adapters
+    a = await mk_user(platform="telegram", pid="9406", name="ToDelete", coins=50)
+    async with db.session_scope() as s:
+        _a = await s.get(User, a.id)
+        _a.bio = "secret bio"
+    b = await mk_user(platform="telegram", pid="9407", name="Partner", coins=10)
+    async with db.session_scope() as s:
+        chat = Chat(user_a_id=a.id, user_b_id=b.id, age_group="18-60")
+        s.add(chat)
+        await s.flush()
+        s.add(ChatMessage(chat_id=chat.id, sender_id=b.id, msg_type="text", text="from b"))
+        s.add(ChatMessage(chat_id=chat.id, sender_id=a.id, msg_type="text", text="from a"))
+        s.add(Report(chat_id=chat.id, reporter_id=b.id, reported_id=a.id,
+                     reason="spam", details="x"))
+        s.add(Block(blocker_id=b.id, blocked_id=a.id))
+        s.add(Friend(user_id=a.id, friend_id=b.id))
+        s.add(AnonThread(owner_id=b.id, sender_id=a.id))
+        ban = Ban(user_id=a.id, type="permanent", source="manual_admin",
+                  reason="x", status="active", issued_by="test")
+        s.add(ban)
+        await s.flush()
+        s.add(Appeal(ban_id=ban.id, user_id=a.id, message="appeal"))
+        s.add(ViolationLog(user_id=a.id, rule="profanity", snippet="x"))
+        tk = SupportTicket(user_id=a.id, subject="help",
+                           ticket_no=f"TKT-{(int(time.time() * 1000) + 7) % 100000:05d}")
+        s.add(tk)
+        await s.flush()
+        s.add(SupportMessage(ticket_id=tk.id, sender_type="user",
+                             sender_name="ToDelete", body="hello"))
+        aid = a.id
+    async with db.session_scope() as s:
+        u = await s.get(User, aid)
+        await service.delete_account(s, u)
+    async with db.session_scope() as s:
+        u = await s.get(User, aid)
+        assert u.status == "deleted" and u.bio is None and u.display_name == "Deleted User"
+        assert (await s.execute(select(Chat).where(
+            (Chat.user_a_id == aid) | (Chat.user_b_id == aid)))).first() is None
+        assert (await s.execute(select(Report).where(
+            Report.reported_id == aid))).first() is None
+        assert (await s.execute(select(Friend).where(
+            Friend.user_id == aid))).first() is None
+        assert (await s.execute(select(AnonThread).where(
+            AnonThread.sender_id == aid))).first() is None
+        assert (await s.execute(select(Appeal).where(
+            Appeal.user_id == aid))).first() is None
+        assert (await s.execute(select(ViolationLog).where(
+            ViolationLog.user_id == aid))).first() is None
+        assert (await s.execute(select(SupportTicket).where(
+            SupportTicket.user_id == aid))).first() is None
+        # the partner survives
+        pb = await s.get(User, b.id)
+        assert pb.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_purge_expired_deletes_chat_children_first(adapters):
+    """v2.5: expired chats are removed together with their messages/reports
+    (Postgres rejected the parent delete while children existed)."""
+    from app.db import Report
+    a = await mk_user(platform="telegram", pid="9408", name="PurgeA")
+    b = await mk_user(platform="telegram", pid="9409", name="PurgeB")
+    async with db.session_scope() as s:
+        chat = Chat(user_a_id=a.id, user_b_id=b.id, age_group="18-60",
+                    status="ended", end_reason="left",
+                    started_at=utcnow() - timedelta(days=60),
+                    ended_at=utcnow() - timedelta(days=60))
+        s.add(chat)
+        await s.flush()
+        cid = chat.id
+        s.add(ChatMessage(chat_id=cid, sender_id=a.id, msg_type="text", text="old",
+                          created_at=utcnow() - timedelta(days=60)))
+        s.add(Report(chat_id=cid, reporter_id=a.id, reported_id=b.id,
+                     reason="spam", details="old"))
+    async with db.session_scope() as s:
+        stats = await service.purge_expired(s)
+    assert stats["chats"] == 1
+    async with db.session_scope() as s:
+        assert await s.get(Chat, cid) is None
+        assert (await s.execute(select(ChatMessage).where(
+            ChatMessage.chat_id == cid))).first() is None
+        assert (await s.execute(select(Report).where(
+            Report.chat_id == cid))).first() is None
+
+
+@pytest.mark.asyncio
+async def test_credit_zero_is_a_noop(adapters):
+    """v2.5: credit(..., 0) used to trip an assertion; zero-value bonuses and
+    0-coin admin grants must be harmless."""
+    u = await mk_user(platform="telegram", pid="9410", name="Zero", coins=3)
+    async with db.session_scope() as s:
+        tgt = await s.get(User, u.id)
+        assert await service.credit(s, tgt, 0, "daily_bonus", "zero") is None
+        assert tgt.coin_balance == 3
+
+
+@pytest.mark.asyncio
+async def test_store_payment_gate_blocks_forged_buy(adapters):
+    """v2.5: a stale keyboard or forged buy_<id> callback must not produce an
+    invoice when the platform gateway is disabled."""
+    from app import bot as bot_mod
+    tg, bale = adapters
+    await register_via_bot(adapters, "bale", "9411", "BaleBuyer2", 25, "male")
+    bale.sent.clear()
+    await bot_mod.process_update("bale", {"update_id": 306000, "callback_query": {
+        "id": "g1", "from": {"id": 9411}, "message": {"chat": {"id": 9411}},
+        "data": "buy_pkg_20"}})
+    assert not [t for t in bale.sent if t[1] == "invoice"], "no invoice when gateway is off"
+    assert any("درگاه" in str(t[1]) or "فعال نیست" in str(t[1]) for t in bale.sent)
+
+
+@pytest.mark.asyncio
+async def test_health_reports_real_maintenance_state(adapters):
+    """v2.5: /health used to hardcode maintenance=False."""
+    import httpx
+    from app.main import app
+    try:
+        async with db.session_scope() as s:
+            cfg = await service.get_setting(s, "app")
+            cfg["maintenanceMode"] = True
+            await service.set_setting(s, "app", cfg)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as cli:
+            r = await cli.get("/health")
+            assert r.status_code == 200
+            assert r.json()["maintenance"] is True
+    finally:
+        async with db.session_scope() as s:
+            cfg = await service.get_setting(s, "app")
+            cfg["maintenanceMode"] = False
+            await service.set_setting(s, "app", cfg)
+
+
+@pytest.mark.asyncio
+async def test_admin_lookup_coins_and_ban_actions(adapters):
+    """v2.5: inline admuc_/admub_ actions still work end-to-end."""
+    from app import bot as bot_mod
+    from app.db import BotAdmin
+    tg, bale = adapters
+    await register_via_bot(adapters, "telegram", "860835914", "OwnerAct", 30, "male")
+    target = await mk_user(platform="bale", pid="9412", name="ActTarget", coins=5)
+    async with db.session_scope() as s:
+        s.add(BotAdmin(platform="telegram", platform_user_id="860835914", role="owner"))
+
+    def cb(upd_id, data):
+        return bot_mod.process_update("telegram", {"update_id": upd_id, "callback_query": {
+            "id": f"a{upd_id}", "from": {"id": 860835914},
+            "message": {"chat": {"id": 860835914}}, "data": data}})
+
+    await cb(307000, f"admuc_{target.id}_100")
+    async with db.session_scope() as s:
+        t = await s.get(User, target.id)
+        assert t.coin_balance == 105
+    await cb(307001, f"admub_{target.id}_24")
+    async with db.session_scope() as s:
+        t = await s.get(User, target.id)
+        assert t.status == "banned"
+    await cb(307002, f"admub_{target.id}_unban")
+    async with db.session_scope() as s:
+        t = await s.get(User, target.id)
+        assert t.status == "active"
+    pv = [t for t in bale.sent if t[0] == "9412"]
+    assert pv, "the target user must be notified in their PV"
+
+
+@pytest.mark.asyncio
+async def test_user_text_flow_cancel(adapters):
+    """v2.5 UX: every user text-entry step can be abandoned with «لغو»."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "9413", "Canceller", 25, "male")
+    await bot_mod.process_update("telegram", {"update_id": 308000, "callback_query": {
+        "id": "cn0", "from": {"id": 9413}, "message": {"chat": {"id": 9413}},
+        "data": "profile"}})
+    await bot_mod.process_update("telegram", {"update_id": 308001, "callback_query": {
+        "id": "cn1", "from": {"id": 9413}, "message": {"chat": {"id": 9413}},
+        "data": "edit_bio"}})
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "9413"))).scalar_one()
+        assert u.state and u.state.get("step") == "bio"
+    tg.sent.clear()
+    await bot_mod.process_update("telegram", {"update_id": 308002, "message": {
+        "message_id": 2, "chat": {"id": 9413}, "from": {"id": 9413}, "text": "لغو"}})
+    async with db.session_scope() as s:
+        u = (await s.execute(select(User).where(User.platform_user_id == "9413"))).scalar_one()
+        assert u.state is None
+    assert any("لغو شد" in str(t[1]) for t in tg.sent)
+
+
+@pytest.mark.asyncio
+async def test_only_one_live_keyboard_per_chat(adapters):
+    """v2.5: sending a new panel strips the keyboard of the previous panel
+    message, so a chat never accumulates rows of dead buttons."""
+    from app import bot as bot_mod
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "9414", "PanelUser", 25, "male")
+    tg.sent.clear()
+    tg.edits.clear()
+    for i in range(3):
+        await bot_mod.process_update("telegram", {"update_id": 309000 + i, "callback_query": {
+            "id": f"pp{i}", "from": {"id": 9414}, "message": {"chat": {"id": 9414}},
+            "data": "back_home"}})
+    keyboards = [t for t in tg.sent if t[2]]
+    assert len(keyboards) == 3
+    # each new panel removed the previous panel's keyboard (the registration
+    # flow also leaves one panel behind, hence >= 2)
+    assert len(tg.edits) >= 2
+    assert all(kb is None for _c, _m, kb in tg.edits)

@@ -25,7 +25,7 @@ import logging
 import time
 from datetime import timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from . import db, service
 from .config import RUNTIME, settings
@@ -198,7 +198,6 @@ async def rescue_incomplete_signups() -> dict:
                 break
         for u in targets:
             key = f"rescue_reminder_{min(u.reminder_stage + 1, 3)}"
-            eco = await service.get_setting(s, "economy")
             text = tr(u.language, key)
             s.add(db.AdminNotification(  # panel trace of rescue activity
                 title=f"یادآوری ثبت‌نام ← {u.public_id}",

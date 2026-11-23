@@ -173,6 +173,23 @@ class BaseAdapter:
             payload["reply_markup"] = {"inline_keyboard": keyboard}
         return await self.call("editMessageText", payload)
 
+    async def edit_reply_markup(self, chat_id: int | str, message_id: int,
+                                keyboard: Optional[list[list[dict]]] = None) -> Any:
+        """Replace (or, with keyboard=None, remove) the inline keyboard of a
+        message. Both platforms document this method (Bale: editMessageReplyMarkup
+        with chat_id/message_id/reply_markup)."""
+        await self._throttle(chat_id)
+        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
+        if keyboard:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
+        return await self.call("editMessageReplyMarkup", payload)
+
+    async def delete_message(self, chat_id: int | str, message_id: int) -> Any:
+        """Delete a message. Telegram/Bale both allow bots to delete their own
+        outgoing messages in private chats (Bale: message must be < 48h old)."""
+        await self._throttle(chat_id)
+        return await self.call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
     async def answer_callback(self, callback_query_id: str, text: str = "",
                               alert: bool = False) -> Any:
         payload = {"callback_query_id": callback_query_id}
@@ -382,6 +399,9 @@ class TelegramAdapter(BaseAdapter):
 
 class BaleAdapter(BaseAdapter):
     platform = "bale"
+    # docs.bale.ai documents a 20 messages/second ceiling (Telegram ~30).
+    # Staying at the documented cap avoids 429 storms on large broadcasts.
+    rate_per_sec: float = 20.0
 
     def __init__(self, token: str, provider_token: str = ""):
         super().__init__(token)

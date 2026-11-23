@@ -7,7 +7,7 @@ Persian digits and transliteration tokens (matched via Finglish dictionary).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 # v2.2: the vocabulary lives in its own file (app/profanity.py)

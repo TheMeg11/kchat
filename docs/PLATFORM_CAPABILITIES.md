@@ -12,6 +12,7 @@
 - Uploads: 10 MB photos / 50 MB files (multipart), 5/20 MB by URL, `getFile` 20 MB, link 1h. `file_unique_id` exists.
 - Payments: wallet payments only; provider token from Bale @BotFather ("پرداخت در بازوها"); `sendInvoice` with `provider_token` and Rial amounts; `pre_checkout_query` (answer ≤10s); `successful_payment` with `telegram_payment_charge_id`; `inquireTransaction` for status; **no refund API documented** → refunds manual via wallet panel (implemented as disabled with explanatory error).
 - Rate limits: ~2/s per chat guidance, 20/s & 120/min caps documented; 429 with `retry_after`.
+- Message editing: `editMessageText`, `editMessageCaption`, **`editMessageReplyMarkup`** (chat_id, message_id, reply_markup) and **`deleteMessage`** (own outgoing messages in private/groups, message must be < 48h old) are documented. The bot uses `editMessageReplyMarkup` to retire stale inline keyboards — never `deleteMessage`, so the user's chat history is never touched.
 
 ## Cross-platform relay policy
 Allowed only where BOTH platforms document support: text, photo, voice, video, document, audio, animation, location, contact. Sticker/video-note/poll are Telegram-only (Bale methods undocumented) → blocked in cross-platform chats. Media transferred by bounded streaming download (≤20 MB, the lower documented getFile cap) then multipart upload; never stored at rest; file_ids never reused across platforms.
