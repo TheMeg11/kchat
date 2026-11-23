@@ -3548,3 +3548,70 @@ async def test_only_one_live_keyboard_per_chat(adapters):
     # flow also leaves one panel behind, hence >= 2)
     assert len(tg.edits) >= 2
     assert all(kb is None for _c, _m, kb in tg.edits)
+
+
+@pytest.mark.asyncio
+async def test_admin_user_search_by_id_and_username(adapters):
+    """v2.5: one search box finds a user by numeric platform id, internal row
+    id, @username (case-insensitive, with or without the @), public id or
+    platform:id — and disambiguates when several users share a username."""
+    from app import bot as bot_mod
+    from app.db import BotAdmin
+    tg, _ = adapters
+    await register_via_bot(adapters, "telegram", "860835914", "OwnerFind", 30, "male")
+    num = await mk_user(platform="telegram", pid="111222333", name="NumUser", coins=5)
+    handled = await mk_user(platform="bale", pid="444555666", name="HandleUser", coins=7)
+    twin_a = await mk_user(platform="bale", pid="777888999", name="TwinA", coins=1)
+    twin_b = await mk_user(platform="telegram", pid="000111222", name="TwinB", coins=2)
+    async with db.session_scope() as s:
+        s.add(BotAdmin(platform="telegram", platform_user_id="860835914", role="owner"))
+        for u, uname in ((handled, "MyHandle"), (twin_a, "twin"), (twin_b, "TWIN")):
+            row = await s.get(User, u.id)
+            row.username = uname
+        pub = (await s.get(User, num.id)).public_id
+
+    seq = [311000]
+
+    def upd(**kw):
+        seq[0] += 1
+        return {"update_id": seq[0], **kw}
+
+    def cb(data):
+        return bot_mod.process_update("telegram", upd(callback_query={
+            "id": f"f{seq[0]}", "from": {"id": 860835914},
+            "message": {"chat": {"id": 860835914}}, "data": data}))
+
+    def txt(body):
+        return bot_mod.process_update("telegram", upd(message={
+            "message_id": seq[0] % 1000, "chat": {"id": 860835914},
+            "from": {"id": 860835914}, "text": body}))
+
+    async def search(body):
+        await cb("adm_finduser")
+        tg.sent.clear()
+        await txt(body)
+        return "".join(str(t[1]) for t in tg.sent)
+
+    # numeric platform id
+    out = await search("111222333")
+    assert "NumUser" in out and "111222333" in out
+    # @username and bare username are case-insensitive
+    assert "HandleUser" in await search("@MyHandle")
+    assert "HandleUser" in await search("myhandle")
+    # public id
+    assert "NumUser" in await search(pub)
+    # platform:id
+    assert "HandleUser" in await search("bale:444555666")
+    # ambiguous username -> picker with one button per candidate
+    tg.sent.clear()
+    out = await search("twin")
+    assert "2 کاربر پیدا شد" in out
+    datas = {b.get("callback_data") for t_ in tg.sent if t_[2]
+             for r in t_[2] for b in r}
+    assert f"admuser_{twin_a.id}" in datas and f"admuser_{twin_b.id}" in datas
+    # picking one opens the action card
+    tg.sent.clear()
+    await cb(f"admuser_{twin_a.id}")
+    assert "TwinA" in "".join(str(t[1]) for t in tg.sent)
+    # unknown -> helpful not-found message
+    assert "یافت نشد" in await search("999999999")
