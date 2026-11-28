@@ -85,6 +85,10 @@ class BaseAdapter:
             wait = 0.0
             async with self._throttle_lock:
                 now = time.monotonic()
+                if len(self._last_per_chat) > 10000:
+                    self._last_per_chat = {k:v for k,v in self._last_per_chat.items() if now-v < 60}
+                if len(self._locks) > 10000:
+                    self._locks = {k:v for k,v in self._locks.items() if v.locked() or getattr(v, "_waiters", None)}
                 wait = self._cooldown_until - now
                 while self._send_history and now - self._send_history[0] > 1.0:
                     self._send_history.popleft()
@@ -307,16 +311,18 @@ class BaseAdapter:
                 health["last_ok"] = time.time()
                 health["last_error"] = ""
                 for upd in result or []:
-                    offset = max(offset, int(upd.get("update_id", 0)) + 1)
                     try:
                         await asyncio.wait_for(handler(upd), timeout=self.UPDATE_TIMEOUT)
+                        offset = max(offset, int(upd.get("update_id", 0)) + 1)
                     except asyncio.TimeoutError:
                         log.error("update handler TIMEOUT after %ss (polling %s, "
                                   "update_id=%s) — skipping to keep the poller alive",
                                   self.UPDATE_TIMEOUT, self.platform,
                                   upd.get("update_id"))
+                        break
                     except Exception:
                         log.exception("update handler failed (polling %s)", self.platform)
+                        break
             except asyncio.CancelledError:
                 raise
             except PlatformError as exc:
@@ -435,8 +441,7 @@ class BaleAdapter(BaseAdapter):
         token = provider_token or self.provider_token
         body = {"chat_id": chat_id, "title": title[:32], "description": description[:255],
                 "payload": payload, "provider_token": token, "prices": prices}
-        log.info("bale sendInvoice chat=%s payload=%s prices=%s token=%s…",
-                 chat_id, payload[:48], prices, str(token)[:12])
+        log.info("bale invoice request sent")
         res = await self.call("sendInvoice", body)
         log.info("bale sendInvoice OK: message_id=%s (wallet pre_checkout must follow "
                  "when the user taps pay)", (res or {}).get("result", {}).get("message_id"))

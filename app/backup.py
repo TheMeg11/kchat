@@ -1,11 +1,6 @@
-"""Compressed database backup, Telegram delivery, restore & rollback engine.
-
-v2.4.3 product change: the super-admin backup is COMPRESSED (gzip) but NOT
-ENCRYPTED — restore needs zero credentials. The old encrypted flow failed in
-practice twice (BACKUP_PASSWORD rotated between the backup and the restore,
-and caption-password parsing is fragile), so a plain .json.gz is delivered.
-Legacy AES-encrypted .enc archives remain fully restorable: validate/execute
-auto-detect the format by magic bytes (KNRB1 = encrypted, gzip = plain)."""
+"""Bounded encrypted logical backups, authenticated validation and atomic restore.
+Legacy plain gzip archives can be imported by an authenticated owner.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -19,55 +14,72 @@ from typing import Any, Optional
 from sqlalchemy import delete, select, text
 
 from . import db, security, service
+from .config import settings, RUNTIME
 from .db import BackupRecord, session_scope, utcnow
 
 log = logging.getLogger("kanar.backup")
 
-PART_SIZE = 40 * 1024 * 1024  # stay under Telegram's 50MB multipart cap
+PART_SIZE = 18 * 1024 * 1024  # retrievable via getFile (20 MiB download cap)
 
 # Tables (in FK-safe export order) included in every backup.
-BACKUP_TABLES = [
-    "users", "queue_entries", "chats", "chat_messages", "blocks", "recent_pairs",
-    "reports", "bans", "appeals", "coin_transactions", "payments", "store_packages",
-    "referrals", "daily_claims", "app_settings", "media_types", "role_permissions",
-    "bot_admins", "web_admins", "web_sessions", "login_challenges", "recovery_codes",
-    "audit_logs", "security_events", "admin_notifications", "broadcasts",
-    "support_tickets", "support_messages", "backups", "processed_updates",
-    "violations", "moderation_dictionary", "moderation_allowlist",
-]
-
+# Operational inbox and browser sessions are not historical business data.
+# Keep queued receipts through restore; never resurrect old authenticated sessions.
+EXCLUDED_TABLES = {"update_inbox", "web_sessions", "login_challenges"}
+BACKUP_TABLES = [t.name for t in db.Base.metadata.sorted_tables if t.name not in EXCLUDED_TABLES]
 MODEL_BY_TABLE = {t.name: t for t in db.Base.metadata.sorted_tables}
 
 
+async def _export(session, compressed=False) -> bytes:
+    """Stream rows to a bounded spool, no all-table Python object graph.
+
+    Gzip output is generated incrementally; AES-GCM is bounded by backup_max_bytes.
+    Export fails explicitly rather than OOMing or silently omitting any rows.
+    """
+    import tempfile
+    def encode(value):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                          default=lambda x: x.isoformat()).encode()
+    counts = {}
+    for name in BACKUP_TABLES:
+        counts[name] = (await session.execute(select(func_count(MODEL_BY_TABLE[name].c[next(iter(MODEL_BY_TABLE[name].primary_key.columns)).name])))).scalar_one()
+    manifest = {"format":"kanar-db-backup", "version":1, "schema_version":"1.0.0",
+        "created_at":utcnow().isoformat(), "table_order":BACKUP_TABLES, "row_counts":counts}
+    with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as spool:
+        stream = gzip.GzipFile(fileobj=spool, mode="wb", compresslevel=6) if compressed else spool
+        expanded = 0
+        def write(chunk):
+            nonlocal expanded
+            expanded += len(chunk)
+            if expanded > settings.restore_expanded_max_bytes:
+                raise ValueError("BACKUP_EXPANDED_LIMIT")
+            stream.write(chunk)
+            if spool.tell() > settings.backup_max_bytes:
+                raise ValueError("BACKUP_SIZE_LIMIT")
+        write(b'{"manifest":' + encode(manifest) + b',"data":{')
+        for ti, name in enumerate(BACKUP_TABLES):
+            write((b"," if ti else b"") + encode(name) + b":[")
+            result = await session.stream(select(MODEL_BY_TABLE[name]).execution_options(yield_per=250))
+            first = True
+            try:
+                async for rows in result.mappings().partitions(250):
+                    # Only one batch of rows is live at once.
+                    for row in rows:
+                        write((b"" if first else b",") + encode(dict(row)))
+                        first = False
+            finally:
+                await result.close()
+            write(b"]")
+        write(b"}}")
+        if compressed:
+            stream.close()
+        if spool.tell() > settings.backup_max_bytes:
+            raise ValueError("BACKUP_SIZE_LIMIT")
+        spool.seek(0)
+        return spool.read()
+
+
 async def dump_database(session) -> bytes:
-    """Full logical dump (all tables incl. chat text + financial records) as JSON."""
-    data: dict[str, Any] = {}
-    for tname in BACKUP_TABLES:
-        table = MODEL_BY_TABLE.get(tname)
-        if table is None:
-            data[tname] = []
-            continue
-        rows = (await session.execute(select(table))).mappings().all()
-        out = []
-        for r in rows:
-            row = {}
-            for k, v in r.items():
-                if isinstance(v, (db.datetime,)):
-                    row[k] = v.isoformat()
-                else:
-                    row[k] = v
-            out.append(row)
-        data[tname] = out
-    manifest = {
-        "format": "kanar-db-backup", "version": 1,
-        "schema_version": service.__dict__.get("SCHEMA_VERSION", "1.0.0")
-        if hasattr(service, "SCHEMA_VERSION") else "1.0.0",
-        "app": "kanar-anonymous-chat", "created_at": utcnow().isoformat(),
-        "table_order": BACKUP_TABLES, "row_counts": {k: len(v) for k, v in data.items()},
-    }
-    blob = json.dumps({"manifest": manifest, "data": data}, ensure_ascii=False,
-                      separators=(",", ":")).encode()
-    return blob
+    return await _export(session)
 
 
 def _coerce(table, row: dict) -> dict:
@@ -135,8 +147,12 @@ async def _restore_into(session, payload: dict) -> dict:
     order = payload.get("manifest", {}).get("table_order") or BACKUP_TABLES
     loaded: dict[str, int] = {}
     for table in reversed(db.Base.metadata.sorted_tables):
+        if table.name == "update_inbox":
+            continue
         await session.execute(delete(table))
     for tname in order:
+        if tname in EXCLUDED_TABLES:
+            continue
         table = MODEL_BY_TABLE.get(tname)
         if table is None:
             continue
@@ -180,32 +196,31 @@ async def _restore_into(session, payload: dict) -> dict:
 
 
 async def create_backup(session, trigger: str, created_by: str = "system") -> BackupRecord:
-    """Dump -> gzip (v2.4.3: no encryption) -> SHA-256 -> record."""
-    import gzip
+    if not settings.backup_password or len(settings.backup_password) < 16:
+        raise ValueError("BACKUP_PASSWORD must contain at least 16 characters")
     stamp = utcnow().strftime("%Y%m%d_%H%M%S")
-    bid = f"BKP-{stamp}-{secrets.token_hex(2)}"
-    rec = BackupRecord(id=bid, filename=f"kanar_db_{stamp}.json.gz",
-                       trigger=trigger, schema_version="1.0.0", created_by=created_by)
-    raw = await dump_database(session)
-    blob = gzip.compress(raw, compresslevel=6)
-    rec.encrypted = False
-    rec.cipher = "gzip only (no encryption)"
-    rec.size_bytes = len(blob)
-    rec.sha256 = security.sha256_hex(blob)
+    rec = BackupRecord(id=f"BKP-{stamp}-{secrets.token_hex(3)}",
+        filename=f"hamchat_db_{stamp}.json.gz.enc", trigger=trigger,
+        schema_version="1.0.0", created_by=created_by)
+    if session.bind.dialect.name == "postgresql" and not session.in_transaction():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+    comp = await _export(session, compressed=True)
+    blob, checksum = await asyncio.to_thread(security.encrypt_backup, comp, settings.backup_password)
+    rec.encrypted, rec.cipher = True, "AES-256-GCM / scrypt"
+    rec.size_bytes, rec.sha256 = len(blob), checksum
     session.add(rec)
-    return rec, blob  # type: ignore[return-value]
+    return rec, blob
 
 
 async def deliver_backup(bot, rec: BackupRecord, blob: bytes, owner_id: int) -> bool:
     """Send the backup to the owner via the PRODUCT bot, chunked if needed.
 
-    v2.4.3: the file is plain gzip — no restore password anymore. Forwarding
-    the file back to the bot (caption intact) is all it takes to restore."""
+    New files are AES-GCM encrypted. Keys are never placed in captions."""
     from .platform import PlatformError
     try:
-        parts = [blob[i:i + PART_SIZE] for i in range(0, len(blob), PART_SIZE)] or [b""]
+        parts = (blob[i:i + PART_SIZE] for i in range(0, len(blob), PART_SIZE))
         sent_ids = []
-        total = len(parts)
+        total = max(1, (len(blob) + PART_SIZE - 1) // PART_SIZE)
         for idx, part in enumerate(parts, 1):
             suffix = f".part{idx:02d}of{total:02d}" if total > 1 else ""
             fname = rec.filename + suffix
@@ -214,7 +229,7 @@ async def deliver_backup(bot, rec: BackupRecord, blob: bytes, owner_id: int) -> 
                     f"📦 پشتیبان پایگاه‌داده هم‌چت\nشناسه: <code>{rec.id}</code>\n"
                     f"حجم: {rec.size_bytes / 1e6:.2f} MB | SHA-256: <code>{rec.sha256[:16]}…</code>\n"
                     f"بخش {idx} از {total}\n"
-                    "🔒 gzip بدون رمزنگاری — نیازی به رمز بازیابی نیست."
+                    "🔒 رمزگذاری‌شده با AES-256-GCM؛ کلید را جداگانه و امن نگهداری کنید."
                     + ("\n(برای بازیابی، همه بخش‌ها را به ترتیب فوروارد کن)" if total > 1 else "")
                     + "\n↩️ برای بازگردانی، همین فایل را با همین کپشن به ربات فوروارد کن."),
                 "parse_mode": "HTML",
@@ -232,33 +247,27 @@ async def deliver_backup(bot, rec: BackupRecord, blob: bytes, owner_id: int) -> 
 
 
 async def run_backup_job(bot, trigger: str, created_by: str = "system") -> Optional[BackupRecord]:
-    """DB-locked backup job: prevents duplicates, safe across restarts."""
-    async with session_scope() as session:
-        lock = await session.execute(
-            text("SELECT pg_try_advisory_lock(hashtext('kanar_backup'))") if False else
-            select(db.AppSetting).where(db.AppSetting.key == "_backup_running"))
-        flag = lock.scalar_one_or_none()
-        if flag is not None and flag.value:  # stale lock older than 1h is cleared below
-            started = flag.value.get("started_at")
-            import datetime as _dt
-            try:
-                started_dt = _dt.datetime.fromisoformat(started)
-            except Exception:
-                started_dt = None
-            if started_dt and utcnow() - started_dt < timedelta(hours=1):
-                return None
-        await service.set_setting(session, "_backup_running",
-                                  {"started_at": utcnow().isoformat()})
-        await session.commit()
+    if RUNTIME.get("backup_in_progress") or RUNTIME.get("restore_in_progress"):
+        return None
+    RUNTIME["backup_in_progress"] = True
+    lock_conn = None
     try:
+        if db.get_engine().dialect.name == "postgresql":
+            lock_conn = await db.get_engine().connect()
+            locked = (await lock_conn.execute(text("SELECT pg_try_advisory_lock(71389201)"))).scalar_one()
+            if not locked:
+                await lock_conn.close()
+                lock_conn = None
+                return None
         async with session_scope() as session:
             result = await create_backup(session, trigger, created_by)
             if isinstance(result, tuple):
                 rec, blob = result
             else:
                 return result
-            from .config import settings
-            ok = await deliver_backup(bot, rec, blob, settings.backup_owner_telegram_id)
+        ok = await deliver_backup(bot, rec, blob, settings.backup_owner_telegram_id)
+        async with session_scope() as session:
+            rec = await session.merge(rec)
             if not ok:
                 await service.notify(session, "خطای ارسال پشتیبان",
                                      f"پشتیبان {rec.id} ساخته شد اما ارسال ناموفق بود.",
@@ -275,18 +284,36 @@ async def run_backup_job(bot, trigger: str, created_by: str = "system") -> Optio
             await service.set_setting(session, "backup", cfg)
             return rec
     finally:
-        async with session_scope() as session:
-            await service.set_setting(session, "_backup_running", None)
+        RUNTIME["backup_in_progress"] = False
+        if lock_conn is not None:
+            try:
+                await lock_conn.execute(text("SELECT pg_advisory_unlock(71389201)"))
+            finally:
+                await lock_conn.close()
 
 
 # ---------------------------------------------------------------- restore ----
 GZIP_MAGIC = b"\x1f\x8b"
 
 
+def _decode_json(comp):
+    import io
+    with gzip.GzipFile(fileobj=io.BytesIO(comp)) as gz:
+        raw = gz.read(settings.restore_expanded_max_bytes + 1)
+    if len(raw) > settings.restore_expanded_max_bytes:
+        raise ValueError("EXPANDED_SIZE_LIMIT")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+        raise ValueError("BAD_MANIFEST")
+    return payload
+
+
 def _load_payload(blob: bytes, password: str) -> tuple[dict, bool]:
     """Auto-detect the archive format and return (payload, encrypted).
 
     Raises ValueError with a user-safe message on any failure."""
+    if len(blob) > settings.restore_max_bytes:
+        raise ValueError("ARCHIVE_SIZE_LIMIT")
     if blob[:5] == security.BACKUP_MAGIC:
         if not password:
             raise ValueError("ENCRYPTED_NO_PASSWORD")
@@ -294,16 +321,16 @@ def _load_payload(blob: bytes, password: str) -> tuple[dict, bool]:
             comp = security.decrypt_backup(blob, password)
         except ValueError as exc:
             raise ValueError(f"AUTH_FAILED: {exc}") from exc
-        return json.loads(gzip.decompress(comp)), True
+        return _decode_json(comp), True
     if blob[:2] == GZIP_MAGIC:
-        return json.loads(gzip.decompress(blob)), False
+        return _decode_json(blob), False
     raise ValueError("BAD_FORMAT: not a kanar backup archive")
 
 
 def validate_blob(blob: bytes, expected_sha256: str = "", password: str = "") -> dict:
     """Manifest/format/checksum/encryption validation without touching the DB.
 
-    v2.4.3: auto-detects plain gzip (new) vs AES-encrypted (legacy)."""
+    Auto-detects AES-encrypted archives and legacy plaintext gzip."""
     result: dict[str, Any] = {"valid": False, "encrypted": True, "warnings": [],
                               "sha256": security.sha256_hex(blob), "checksumMatch": None,
                               "schemaVersion": "", "currentSchemaVersion": "1.0.0",
@@ -314,7 +341,7 @@ def validate_blob(blob: bytes, expected_sha256: str = "", password: str = "") ->
         result["encrypted"] = True
         if not password:
             result["warnings"].append("این فایل رمزنگاری‌شده است؛ رمز بازیابی لازم است "
-                                      "(فایل‌های جدید gzip بدون رمز هستند).")
+                                      "(کلید BACKUP_PASSWORD زمان تهیه پشتیبان لازم است).")
             return result
     elif blob[:2] == GZIP_MAGIC:
         result["encrypted"] = False
@@ -337,77 +364,74 @@ def validate_blob(blob: bytes, expected_sha256: str = "", password: str = "") ->
     result["compatible"] = result["schemaVersion"] == result["currentSchemaVersion"]
     if not result["compatible"]:
         result["warnings"].append("نسخه اسکیمای آرشیو با نسخه فعلی متفاوت است.")
-    result["valid"] = True
+    result["valid"] = result["compatible"] and result["checksumMatch"] is not False
     result["warnings"].append("تمامی نشست‌های فعال در طول بازیابی قطع می‌شوند.")
     result["warnings"].append("پیش از شروع، یک اسنپ‌شات اضطراری برای بازگشت ایجاد می‌شود.")
     return result
 
 
 async def execute_restore(blob: bytes, password: str = "") -> dict:
-    """Emergency backup -> restore -> verify -> auto-rollback on failure.
-
-    v2.4.3 fixes applied here:
-    - accepts BOTH plain .json.gz (new) and legacy .enc archives;
-    - the emergency rollback snapshot is plain gzip (no BACKUP_PASSWORD needed);
-    - the snapshot record used trigger='restore_rollback_snapshot' (25 chars)
-      which OVERFLOWED backups.trigger varchar(16) — every restore died with
-      StringDataRightTruncationError before touching any data (incident
-      2026-11-14 22:58 & 23:02). Short trigger + column widened to 32 at boot."""
-    import gzip
-    t0 = asyncio.get_event_loop().time()
-    emergency_id = None
+    if RUNTIME.get("restore_in_progress") or RUNTIME.get("backup_in_progress"):
+        raise ValueError("RESTORE_BUSY")
+    RUNTIME["restore_in_progress"] = True
+    lock_conn = None
+    t0 = asyncio.get_running_loop().time()
     try:
-        payload, _enc = _load_payload(blob, password)
-    except ValueError as exc:
-        raise ValueError(f"AUTH_FAILED: {exc}") from exc
-
-    # 1) emergency snapshot of the CURRENT database (plain gzip, not delivered)
-    async with session_scope() as session:
-        raw = await dump_database(session)
-        import gzip as gz
-        em_blob = gz.compress(raw)
-        em_sha = security.sha256_hex(em_blob)
-        emergency_id = f"RBK-{utcnow().strftime('%Y%m%d%H%M%S')}"
-        session.add(BackupRecord(id=emergency_id, filename=f"emergency_{emergency_id}.json.gz",
-                                 trigger="restore_rb", status="success",
-                                 encrypted=False, cipher="gzip only (no encryption)",
-                                 size_bytes=len(em_blob), sha256=em_sha,
-                                 delivery_status="local", delivery_target="rollback snapshot"))
-        # 2) maintenance ON before destructive replacement
-        app_cfg = await service.get_setting(session, "app")
-        app_cfg["maintenanceMode"] = True
-        await service.set_setting(session, "app", app_cfg)
-
-    try:
-        async with session_scope() as session:
-            stats = await _restore_into(session, payload)
-        # 3) post-restore verification query
-        async with session_scope() as session:
-            n_users = (await session.execute(select(func_count(db.User.id)))).scalar()
-        # 3.5) v2.1 FIX: turn maintenance back OFF on success — previously it stayed
-        # ON forever ("until owner confirms") which froze the bot for everyone.
-        async with session_scope() as session:
-            app_cfg = await service.get_setting(session, "app")
-            app_cfg["maintenanceMode"] = False
-            await service.set_setting(session, "app", app_cfg)
-        result = {"status": "succeeded", "rollbackSnapshotId": emergency_id,
-                  "maintenanceEnabled": False,
-                  "durationSec": round(asyncio.get_event_loop().time() - t0, 1),
-                  "message": (f"بازیابی کامل شد: {stats['tables']} جدول، {stats['rows']} ردیف، "
-                              f"{n_users} کاربر. اسنپ‌شات بازگشت: {emergency_id}. "
-                              "حالت تعمیر پس از بازیابی موفق، خودکار خاموش شد.")}
-        return result
-    except Exception as exc:
-        log.exception("restore failed, rolling back")
-        # 4) rollback to emergency snapshot
-        async with session_scope() as session:
-            payload_back = {"manifest": {"table_order": BACKUP_TABLES, "schema_version": "1.0.0"},
-                            "data": json.loads(gzip.decompress(em_blob))["data"]}
-            await _restore_into(session, payload_back)
-        return {"status": "rolled_back", "rollbackSnapshotId": emergency_id,
-                "maintenanceEnabled": True,
-                "durationSec": round(asyncio.get_event_loop().time() - t0, 1),
-                "message": f"بازیابی ناموفق بود ({exc}) و به اسنپ‌شات اضطراری بازگشت شد."}
+        if db.get_engine().dialect.name == "postgresql":
+            lock_conn = await db.get_engine().connect()
+            if not (await lock_conn.execute(text("SELECT pg_try_advisory_lock(71389201)"))).scalar_one():
+                raise ValueError("RESTORE_BUSY")
+        # Drain in-flight domain updates; the calling bot update is excluded.
+        from .inbox import active_update
+        own = int(active_update.get())
+        for _ in range(100):
+            if RUNTIME.get("inbox_active", 0) <= own and RUNTIME.get("admin_writes", 0) <= 1:
+                break
+            await asyncio.sleep(.1)
+        else:
+            raise ValueError("RESTORE_DRAIN_TIMEOUT")
+        payload, _ = await asyncio.to_thread(_load_payload, blob, password)
+        if payload.get("manifest", {}).get("schema_version") != "1.0.0":
+            raise ValueError("INCOMPATIBLE_SCHEMA")
+        async with session_scope() as s:
+            rec, snapshot = await create_backup(s, "restore_rb", "system")
+            emergency_id = rec.id
+        bot = RUNTIME.get("adapter_telegram")
+        if bot:
+            if not await deliver_backup(bot, rec, snapshot, settings.backup_owner_telegram_id):
+                raise ValueError("ROLLBACK_SNAPSHOT_DELIVERY_FAILED")
+        elif settings.production:
+            raise ValueError("ROLLBACK_SNAPSHOT_DELIVERY_UNAVAILABLE")
+        snapshot_record = {column.name:getattr(rec,column.name) for column in db.BackupRecord.__table__.columns}
+        del snapshot
+        # Replacement is ONE transaction. Any failure rolls back the original DB.
+        try:
+            async with session_scope() as s:
+                stats = await _restore_into(s, payload)
+                cfg = await service.get_setting(s, "app")
+                cfg["maintenanceMode"] = False
+                await service.set_setting(s, "app", cfg)
+                # No archived browser session/challenge is ever reactivated.
+                await s.execute(delete(db.WebSession))
+                await s.execute(delete(db.LoginChallenge))
+                snapshot_record["delivery_status"] = rec.delivery_status if bot else "local"
+                s.add(BackupRecord(**snapshot_record))
+            service.invalidate_cache()
+            return {"status":"succeeded", "rollbackSnapshotId":emergency_id,
+                "maintenanceEnabled":False, "durationSec":round(asyncio.get_running_loop().time()-t0, 1),
+                "message":f"بازیابی کامل شد: {stats['tables']} جدول، {stats['rows']} ردیف. برای امنیت دوباره وارد شوید."}
+        except Exception:
+            log.exception("restore transaction rolled back; original data retained")
+            return {"status":"rolled_back", "rollbackSnapshotId":emergency_id,
+                "maintenanceEnabled":False, "durationSec":round(asyncio.get_running_loop().time()-t0, 1),
+                "message":"بازیابی ناموفق بود؛ تراکنش لغو شد و داده‌های قبلی حفظ شدند."}
+    finally:
+        RUNTIME["restore_in_progress"] = False
+        if lock_conn is not None:
+            try:
+                await lock_conn.execute(text("SELECT pg_advisory_unlock(71389201)"))
+            finally:
+                await lock_conn.close()
 
 
 def func_count(col):

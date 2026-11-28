@@ -23,6 +23,8 @@ Categories
 from __future__ import annotations
 
 import logging
+import time
+import asyncio
 import re
 import secrets
 from typing import Optional
@@ -43,6 +45,13 @@ log = logging.getLogger("kanar.botadmin")
 # v2.3 one-click flow: owner forwards the backup file with the restore password
 # in its caption; the bot validates instantly and replaces data on one confirm.
 RESTORE_WAIT: dict[str, dict] = {}
+
+def cleanup_restore_wait():
+    now=time.monotonic()
+    for key,entry in list(RESTORE_WAIT.items()):
+        if entry.get("expires",0) <= now:
+            RESTORE_WAIT.pop(key,None)
+
 
 _CAP_PWD_RE = re.compile(r"(?:رمز\s*(?:بازیابی|نگاری)?|password)\s*[:：]\s*([^\s]{4,})", re.I)
 _CAP_PART_RE = re.compile(r"بخش\s*(\d+)\s*از\s*(\d+)")
@@ -428,7 +437,7 @@ async def _payments_list(user: User, page: int = 0) -> None:
         cur = "⭐" if p.currency == "XTR" else "ریال"
         lines.append(f"• #{p.id} {u.public_id if u else '?'} | {p.coins} سکه | "
                      f"{p.amount:,} {cur} | {p.status}")
-        if p.status == "succeeded" and p.platform == "telegram":
+        if p.status in ("succeeded","refund_pending") and p.platform == "telegram":
             rows.append([btn(f"💳 استرداد #{p.id}", f"admpay_{p.id}_refund")])
     for r in _nav("adm_payments", page, _pages(total)):
         rows.append(r)
@@ -839,7 +848,6 @@ async def _bcast_action(user: User, role: str, cid: int, action: str) -> None:
             msg = "⏸ کمپین متوقف شد."
         elif action == "resume" and c.status == "paused":
             c.status = "sending"
-            RUNTIME.setdefault("broadcast_queue", []).append(c.id)
             msg = "▶️ کمپین ادامه می‌یابد."
         elif action == "cancel":
             c.status = "cancelled"
@@ -1351,20 +1359,19 @@ async def _dispatch(user: User, role: str, perms: list, data: str, chat_id) -> b
             await _say(user, "مخاطب نامعتبر است.")
             return True
         async with session_scope() as s:
-            targets = await service.broadcast_targets(s, audience)
+            target_count = await service.broadcast_target_count(s, audience)
             camp = db.BroadcastCampaign(title=f"bot-{secrets.token_hex(2)}",
                                         message=st["text"][:4000], audience=audience,
                                         audience_label=service.AUDIENCE_LABELS.get(audience, audience),
                                         rate_limit_per_sec=20, status="sending",
-                                        target_count=len(targets),
+                                        target_count=target_count,
                                         created_by=f"bot:{user.platform_user_id}")
             s.add(camp)
             await s.flush()
             camp_id = camp.id
         user.state = None
-        RUNTIME.setdefault("broadcast_queue", []).append(camp_id)
         await _say(user, f"📢 کمپین #{camp_id} برای «{service.AUDIENCE_LABELS.get(audience, audience)}» "
-                         f"به {len(targets)} کاربر آغاز شد.",
+                         f"به {target_count} کاربر آغاز شد.",
                    keyboard=kb([[btn("📋 کمپین‌ها", "admbcasts")],
                                 [btn("🏠 بازگشت به منوی اصلی", "back_home")]]))
         return True
@@ -1388,25 +1395,30 @@ async def _dispatch(user: User, role: str, perms: list, data: str, chat_id) -> b
             await _say(user, "⚠️ پشتیبان‌گیری دیگری در حال اجراست.")
         return True
     if data == "adm_restore" and role == "owner":
-        RESTORE_WAIT[str(chat_id)] = {"parts": {}, "password": None, "expected": None}
+        cleanup_restore_wait()
+        if len(RESTORE_WAIT) >= 4 and f"{user.platform}:{chat_id}" not in RESTORE_WAIT:
+            await _say(user,"چهار بازیابی در انتظار است؛ ابتدا یک مورد را لغو کنید یا صبر کنید منقضی شود.")
+            return True
+        RESTORE_WAIT[f"{user.platform}:{chat_id}"] = {"parts": {}, "password": None, "expected": None, "expires":time.monotonic()+600}
         await _say(user, "♻️ حالت بازیابی فعال شد.\n\n"
                          "فایل پشتیبانی که ربات برایت فرستاده را همین‌جا فوروارد کن.\n"
-                         "📦 پشتیبان‌های جدید gzip فشرده‌اند و رمزنگاری ندارند — فقط فایل را فوروارد کن.\n"
-                         "🔑 فقط فایل‌های قدیمی (.enc) رمز می‌خواهند؛ رمز را در کپشن بنویس:\n"
+                         "🔒 پشتیبان‌های جدید رمزگذاری شده‌اند؛ کلید BACKUP_PASSWORD زمان تهیه فایل لازم است.\n"
+                         "🔑 کلید فعلی سرور خودکار استفاده می‌شود؛ برای فایل با کلید قدیمی، فقط در گفتگوی خصوصی با ربات وارد کنید:\n"
                          "«رمز بازیابی: ...»\n\n"
                          "پشتیبان بلافاصله اعتبارسنجی می‌شود و با یک کلیک جایگزین می‌شود.\n"
                          "⚠️ بازیابی کامل، همه داده‌های فعلی را با نسخه پشتیبان جایگزین می‌کند.",
                    keyboard=kb([[btn("❌ لغو", "adm_restore_cancel")]]))
         return True
     if data == "adm_restore_cancel":
-        RESTORE_WAIT.pop(str(chat_id), None)
+        RESTORE_WAIT.pop(f"{user.platform}:{chat_id}", None)
         await _say(user, "لغو شد.")
         return True
     if data == "adm_restore_go" and role == "owner":
-        st = RESTORE_WAIT.get(str(chat_id)) or {}
+        cleanup_restore_wait()
+        st = RESTORE_WAIT.get(f"{user.platform}:{chat_id}") or {}
         blob = st.get("blob") or b""
         password = st.get("password") or settings.backup_password
-        RESTORE_WAIT.pop(str(chat_id), None)
+        RESTORE_WAIT.pop(f"{user.platform}:{chat_id}", None)
         if not blob:
             await _say(user, "هیچ فایلی دریافت نشد. ابتدا فایل پشتیبان را فوروارد کن "
                              "(از منوی مدیریت ← ♻️ بازیابی از فایل).")
@@ -1612,39 +1624,17 @@ async def _revoke_ban(user: User, role: str, ban_id: int) -> None:
 
 
 async def _refund_payment(user: User, role: str, pid: int) -> None:
+    from . import orders
+    try:
+        await orders.refund(pid,f"bot:{user.platform}:{user.platform_user_id}")
+    except orders.RefundError as exc:
+        await _say(user,str(exc))
+        return
     async with session_scope() as s:
-        p = await s.get(Payment, pid)
-        if not p:
-            await _say(user, "تراکنش یافت نشد.")
-            return
-        if p.status != "succeeded":
-            await _say(user, "فقط تراکنش‌های موفق قابل استردادند.")
-            return
-        if p.platform != "telegram":
-            await _say(user, "استرداد بله از Bot API پشتیبانی نمی‌شود؛ از کیف‌پول بله انجام شود.")
-            return
-        adp = RUNTIME.get("adapter_telegram")
-        u = await s.get(User, p.user_id)
-        if not adp or not u or not p.telegram_payment_charge_id:
-            await _say(user, "بازوی تلگرام یا شناسه تراکنش در دسترس نیست.")
-            return
-        try:
-            await adp.refund_payment(int(u.platform_user_id), p.telegram_payment_charge_id)
-        except PlatformError as exc:
-            await _say(user, f"⚠️ خطای Telegram در استرداد: {exc}")
-            return
-        p.status = "refunded"
-        p.refunded_at = utcnow()
-        p.refunded_by = f"bot:{user.platform_user_id}"
-        await service.debit(s, u, min(p.coins, u.coin_balance), "admin_deduct",
-                            "برداشت سکه خرید استردادشده")
-        await service.audit(s, actor_type="bot", admin_id=user.platform_user_id,
-                            admin_name=user.display_name, admin_role=role,
-                            action="payment.refunded", module="payments",
-                            target_type="payment", target_id=p.id,
-                            details=p.telegram_payment_charge_id)
-    await _say(user, "✅ استرداد انجام شد.",
-               keyboard=kb([[btn("◀️ بازگشت به پرداخت‌ها", "adm_payments")]]))
+        await service.audit(s,actor_type="bot",admin_id=user.platform_user_id,admin_name=user.display_name,
+            admin_role=role,action="payment.refunded",module="payments",target_type="payment",target_id=pid)
+    await _say(user,"✅ استرداد انجام شد.",keyboard=kb([[btn("◀️ بازگشت به پرداخت‌ها","adm_payments")]]))
+
 
 
 # ================================================================ text flow ===
@@ -2015,14 +2005,23 @@ async def admin_text_flow(user: User, text: str) -> bool:
 async def admin_document(user: User, file_bytes: bytes,
                          caption: str = "", filename: str = "") -> bool:
     """Owner forwards a backup file during restore wait-state (v2.3 one-click)."""
-    chat_key = str(user.platform_user_id)
-    st = RESTORE_WAIT.get(chat_key) or RESTORE_WAIT.get(str(user.id))
+    cleanup_restore_wait()
+    chat_key = f"{user.platform}:{user.platform_user_id}"
+    st = RESTORE_WAIT.get(chat_key)
     if st is None:
         return False
     role = await get_role(user)
     if role != "owner":
         return False
+    if not file_bytes or len(file_bytes) + sum(map(len, st["parts"].values())) > settings.restore_max_bytes or len(st["parts"]) >= 8:
+        RESTORE_WAIT.pop(chat_key,None)
+        await _say(user,"حجم یا تعداد بخش‌ها بیش از حد مجاز است؛ برای فایل بزرگ‌تر از پنل وب استفاده کنید.")
+        return True
+    st.pop("blob",None)
     pwd, idx, total = _parse_restore_caption(caption, filename)
+    if total and not 1 <= total <= 8:
+        RESTORE_WAIT.pop(chat_key,None)
+        return True
     if pwd:
         st["password"] = pwd
     if total:
@@ -2037,7 +2036,7 @@ async def admin_document(user: User, file_bytes: bytes,
         return True
     blob = b"".join(st["parts"][i] for i in sorted(st["parts"]))
     password = st.get("password") or settings.backup_password
-    v = backup_mod.validate_blob(blob, password=password)
+    v = await asyncio.to_thread(backup_mod.validate_blob, blob, "", password)
     if not v["valid"]:
         if not expected:
             await _say(user, f"📄 فایل {received} دریافت شد ({len(file_bytes) / 1e6:.1f} MB) "
@@ -2049,9 +2048,10 @@ async def admin_document(user: User, file_bytes: bytes,
         RESTORE_WAIT.pop(chat_key, None)
         return True
     st["blob"] = blob
+    st["parts"].clear()
     await _say(user,
                f"✅ پشتیبان معتبر است — حجم {v['sizeMb']} MB | اسکیما {v['schemaVersion']} "
-               f"| چک‌سام SHA-256 تایید شد.\n"
+               f"| قالب و اعتبار آرشیو بررسی شد.\n"
                "⚠️ با تأیید، همه داده‌های فعلی با این نسخه جایگزین می‌شود "
                "(اسنپ‌شات اضطراری هم گرفته می‌شود).",
                keyboard=kb([[btn("♻️ جایگزینی با این پشتیبان", "adm_restore_go")],

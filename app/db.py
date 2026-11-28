@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy import (JSON, BigInteger, Boolean, DateTime, ForeignKey,
-                        Index, Integer, String, Text, UniqueConstraint)
+                        Index, Integer, String, Text, UniqueConstraint, CheckConstraint)
 from sqlalchemy.ext.asyncio import (AsyncSession, async_sessionmaker,
                                     create_async_engine)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -81,7 +81,9 @@ class User(Base):
     bot_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
     reminder_stage: Mapped[int] = mapped_column(Integer, default=0)
     last_reminder_at: Mapped[Optional[datetime]] = mapped_column(DateTime(), default=None)
-    __table_args__ = (UniqueConstraint("platform", "platform_user_id", name="uq_user_platform"),)
+    __table_args__ = (UniqueConstraint("platform", "platform_user_id", name="uq_user_platform"),
+                      CheckConstraint("coin_balance >= 0", name="ck_user_nonnegative_balance"),
+                      Index("ix_users_status_seen", "status", "last_seen_at"))
 
 
 class QueueEntry(Base):
@@ -114,6 +116,7 @@ class Chat(Base):
 
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
+    source_key: Mapped[Optional[str]] = mapped_column(String(128), unique=True, default=None)
     id: Mapped[int] = mapped_column(primary_key=True)
     chat_id: Mapped[int] = mapped_column(ForeignKey("chats.id"), index=True)
     sender_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
@@ -402,6 +405,7 @@ class BroadcastCampaign(Base):
     status: Mapped[str] = mapped_column(String(16), default="sending")
     scheduled_for: Mapped[Optional[datetime]] = mapped_column(DateTime(), default=None)
     target_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_user_id: Mapped[int] = mapped_column(Integer, default=0)
     delivered_count: Mapped[int] = mapped_column(Integer, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, default=0)
     failure_summary: Mapped[list] = mapped_column(JSON, default=list)
@@ -506,6 +510,41 @@ class AllowlistPhrase(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow)
 
 
+class InvoiceOrder(Base):
+    """Immutable price snapshot, committed BEFORE sending an invoice."""
+    __tablename__ = "invoice_orders"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(16))
+    payer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    recipient_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    package_id: Mapped[Optional[str]] = mapped_column(String(64), default=None)
+    coins: Mapped[int] = mapped_column(Integer)
+    amount: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(8))
+    created_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime())
+    paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(), default=None)
+    __table_args__ = (CheckConstraint("coins > 0 AND amount > 0", name="ck_order_positive"),)
+
+
+class UpdateInbox(Base):
+    __tablename__ = "update_inbox"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    platform: Mapped[str] = mapped_column(String(16))
+    update_id: Mapped[int] = mapped_column(BigInteger())
+    actor: Mapped[str] = mapped_column(String(64))
+    partition: Mapped[int] = mapped_column(Integer)
+    payload: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(16), default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow)
+    error: Mapped[str] = mapped_column(String(64), default="")
+    __table_args__ = (UniqueConstraint("platform", "update_id", name="uq_inbox_update"),
+                     Index("ix_inbox_ready", "partition", "status", "available_at", "id"),
+                     Index("ix_inbox_actor", "platform", "actor", "status", "id"))
+
+
 # ------------------------------------------------------------- engine ----
 _engine = None
 SessionLocal: Optional[async_sessionmaker] = None
@@ -513,6 +552,8 @@ SessionLocal: Optional[async_sessionmaker] = None
 
 def init_engine(url: str):
     global _engine, SessionLocal
+    from .service import invalidate_cache
+    invalidate_cache()
     # Railway provides postgres:// / postgresql:// URLs; normalize for asyncpg.
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
@@ -525,7 +566,8 @@ def init_engine(url: str):
         # bot went completely deaf. No query may hang longer than these caps;
         # the timeouts turn a silent infinite hang into a logged, retried error.
         _engine = create_async_engine(
-            url, pool_size=5, max_overflow=5, pool_pre_ping=True,
+            url, pool_size=__import__("app.config", fromlist=["settings"]).settings.db_pool_size,
+            max_overflow=__import__("app.config", fromlist=["settings"]).settings.db_max_overflow, pool_pre_ping=True,
             connect_args={"server_settings": {
                 "statement_timeout": "30000",                 # ms
                 "lock_timeout": "10000",                      # ms
@@ -585,6 +627,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
                            "sqlite": "INTEGER NOT NULL DEFAULT 0"},
         "last_reminder_at": {"postgresql": "TIMESTAMP", "sqlite": "DATETIME"},
     },
+    "chat_messages": {"source_key": {"postgresql":"VARCHAR(128)", "sqlite":"VARCHAR(128)"}},
+    "broadcasts": {"last_user_id": {"postgresql":"INTEGER NOT NULL DEFAULT 0", "sqlite":"INTEGER NOT NULL DEFAULT 0"}},
     "queue_entries": {
         "notified_at": {"postgresql": "TIMESTAMP", "sqlite": "DATETIME"},
     },
@@ -646,3 +690,26 @@ async def ensure_widened_columns(engine) -> list[str]:
                     f"ALTER TABLE {table} ALTER COLUMN {col} TYPE VARCHAR({width})"))
                 widened.append(f"{table}.{col}: varchar({row[0]}) -> varchar({width})")
     return widened
+
+
+# Capture changes BEFORE autoflush empties new/dirty/deleted. This also covers
+# explicit commit() calls inside bot flows, not only session_scope's final commit.
+from sqlalchemy import event as _event
+from sqlalchemy.orm import Session as _SyncSession
+
+
+@_event.listens_for(_SyncSession, "before_flush")
+def _remember_config_changes(session, *_):
+    if any(isinstance(obj, (AppSetting, DictionaryWord, AllowlistPhrase))
+           for obj in [*session.new, *session.dirty, *session.deleted]):
+        session.info["invalidate_config"] = True
+
+
+@_event.listens_for(_SyncSession, "after_commit")
+@_event.listens_for(_SyncSession, "after_rollback")
+def _invalidate_committed_config(session):
+    changed = session.info.pop("invalidate_config", False)
+    changed = session.info.pop("settings_changed", False) or changed
+    if changed:
+        from .service import invalidate_cache
+        invalidate_cache()

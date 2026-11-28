@@ -36,6 +36,11 @@ TEST_DB = "/tmp/kanar_test.db"
 async def clean_db():
     if Path(TEST_DB).exists():
         Path(TEST_DB).unlink()
+    from app.limits import login_limiter, message_limiter
+    login_limiter.entries.clear()
+    message_limiter.entries.clear()
+    RUNTIME.pop("restore_in_progress", None)
+    RUNTIME.pop("backup_in_progress", None)
     db.init_engine(f"sqlite+aiosqlite:///{TEST_DB}")
     await db.create_all(db.get_engine())
     async with db.session_scope() as s:
@@ -529,9 +534,13 @@ async def test_payments_idempotent_credit(adapters):
         u = (await s.execute(select(User).where(User.platform_user_id == "901"))).scalar_one()
         uid = u.id
     from app import bot as bot_mod
+    async with db.session_scope() as s:
+        from app import orders
+        u = await s.get(User, uid)
+        payload = await orders.create(s, u, 100, 5, package_id="pkg_100")
     sp_msg = {"message_id": 5, "chat": {"id": 901}, "from": {"id": 901},
-              "successful_payment": {"currency": "XTR", "total_amount": 50,
-                                     "invoice_payload": f"pkg:pkg_100:{uid}",
+              "successful_payment": {"currency": "XTR", "total_amount": 5,
+                                     "invoice_payload": payload,
                                      "telegram_payment_charge_id": "chg_test_1",
                                      "provider_payment_charge_id": "prov_1"}}
     await bot_mod.handle_successful_payment("telegram", sp_msg)
@@ -627,7 +636,7 @@ async def test_account_deletion_via_service(adapters):
     async with db.session_scope() as s:
         u = (await s.execute(select(User).where(User.platform_user_id == "931"))).scalar_one()
         await service.delete_account(s, u)
-        u = (await s.execute(select(User).where(User.platform_user_id == "931"))).scalar_one()
+        u = await s.get(User, u.id)
         assert u.status == "deleted" and u.coin_balance == 0 and u.bio is None
         assert u.display_name == "Deleted User"
         msgs = list((await s.execute(select(ChatMessage))).scalars())
@@ -946,7 +955,7 @@ async def test_appeal_only_permanent(adapters):
 
 # ------------------------------------------------------ backup & restore ----
 @pytest.mark.asyncio
-async def test_backup_plain_validate_restore_rollback(adapters):
+async def test_backup_encrypted_validate_restore_rollback(adapters):
     """v2.4.3: backups are COMPRESSED gzip but NOT encrypted — restore needs no
     password. Legacy AES .enc archives stay restorable via auto-detection."""
     from app import backup as bk
@@ -959,17 +968,16 @@ async def test_backup_plain_validate_restore_rollback(adapters):
         out = await bk.create_backup(s, "manual", "test")
         assert isinstance(out, tuple)
         rec, blob = out
-        assert rec.encrypted is False
-        assert rec.filename.endswith(".json.gz")
-        assert not rec.filename.endswith(".enc")
+        assert rec.encrypted is True
+        assert rec.filename.endswith(".json.gz.enc")
         assert rec.sha256 == security.sha256_hex(blob)
-        assert blob[:2] == b"\x1f\x8b"  # gzip magic — plain, decryptable by anyone
+        assert blob[:5] == security.BACKUP_MAGIC
     # NO password needed: validates and restores with an empty password arg
-    v = bk.validate_blob(blob)
+    v = bk.validate_blob(blob, password=settings.backup_password)
     assert v["valid"] is True and v["compatible"] is True
-    assert v["encrypted"] is False
+    assert v["encrypted"] is True
     # wrong password must still fail for ENCRYPTED archives (legacy path)
-    enc_blob, _ = security.encrypt_backup(blob, settings.backup_password)
+    enc_blob = blob
     v_wrong = bk.validate_blob(enc_blob, password="WRONG")
     assert v_wrong["valid"] is False
     v_nopwd = bk.validate_blob(enc_blob, password="")
@@ -986,7 +994,7 @@ async def test_backup_plain_validate_restore_rollback(adapters):
         ua = (await s.execute(select(User).where(User.platform_user_id == "961"))).scalar_one()
         ua.bio = "changed after backup"
         await s.execute(delete(User).where(User.platform_user_id == "962"))
-    result = await bk.execute_restore(blob, "")
+    result = await bk.execute_restore(blob, settings.backup_password)
     assert result["status"] == "succeeded"
     async with db.session_scope() as s:
         ua = (await s.execute(select(User).where(User.platform_user_id == "961"))).scalar_one()
@@ -995,7 +1003,7 @@ async def test_backup_plain_validate_restore_rollback(adapters):
         assert ub is not None
     # rollback path: corrupt payload with valid gzip -> consistency/rollback
     import gzip, json as _json
-    payload = _json.loads(gzip.decompress(blob))
+    payload = _json.loads(gzip.decompress(security.decrypt_backup(blob, settings.backup_password)))
     payload["data"]["coin_transactions"].append({"id": 999999, "user_id": 123456,
                                                  "amount": 5, "balance_after": 5,
                                                  "type": "x", "description": "",
@@ -1285,7 +1293,7 @@ async def test_webadmin_initial_password_flow():
         r = await cli.post("/api/admin/v1/auth/change-initial-password",
                            json={"challengeId": ch, "currentPassword": "TempPass123!",
                                  "newPassword": "short"})
-        assert r.status_code == 400
+        assert r.status_code == 422
         # proper change -> directly authenticated (v2.3: no TOTP enrollment)
         r = await cli.post("/api/admin/v1/auth/change-initial-password",
                            json={"challengeId": ch, "currentPassword": "TempPass123!",
@@ -1535,7 +1543,7 @@ async def test_dynamic_main_menu(adapters):
         "id": "dm2", "from": {"id": 993}, "message": {"chat": {"id": 993}}, "data": "back_home"}})
     kb1 = [t_[2] for t_ in tg.sent if t_[2]][0]
     datas1 = {b.get("callback_data") for r in kb1 for b in r}
-    assert "chat_next" in datas1 and "chat_end" in datas1 and "search" not in datas1
+    assert {"chat_next", "chat_end"} <= {d.split(":")[-1] for d in datas1} and "search" not in datas1
 
 
 @pytest.mark.asyncio
@@ -1766,7 +1774,8 @@ async def test_store_packages_rates_and_custom_invoice(adapters):
         await bot_mod.process_update("telegram", {"update_id": 732, "message": {
             "message_id": 5, "chat": {"id": 761}, "from": {"id": 761}, "text": "50"}})
         invoices = [t for t in tg.sent if t[1] == "invoice"]
-        assert invoices and invoices[0][2] == f"custom:50:{uid}"
+        assert invoices and invoices[0][2].startswith("order:")
+        custom_payload = invoices[0][2]
         # out-of-range values are refused
         await bot_mod.process_update("telegram", {"update_id": 733, "callback_query": {
             "id": "cc3", "from": {"id": 761}, "message": {"chat": {"id": 761}}, "data": "custom_coins"}})
@@ -1778,7 +1787,7 @@ async def test_store_packages_rates_and_custom_invoice(adapters):
     # paying the custom invoice credits exactly 50 coins (idempotent)
     sp_msg = {"message_id": 7, "chat": {"id": 761}, "from": {"id": 761},
               "successful_payment": {"currency": "XTR", "total_amount": 3,
-                                     "invoice_payload": f"custom:50:{uid}",
+                                     "invoice_payload": custom_payload,
                                      "telegram_payment_charge_id": "chg_custom_1"}}
     await bot_mod.handle_successful_payment("telegram", sp_msg)
     await bot_mod.handle_successful_payment("telegram", sp_msg)  # duplicate ignored
@@ -1786,7 +1795,7 @@ async def test_store_packages_rates_and_custom_invoice(adapters):
         u = await s.get(User, uid)
         assert u.coin_balance == 30 + 50
         pay = (await s.execute(select(Payment).where(
-            Payment.package_id == "custom"))).scalar_one()
+            Payment.package_id.is_(None)))).scalar_one()
         assert pay.coins == 50
     # rates are changeable via settings — the price follows immediately
     async with db.session_scope() as s:
@@ -1802,13 +1811,13 @@ async def test_store_packages_rates_and_custom_invoice(adapters):
         bu = (await s.execute(select(User).where(User.platform_user_id == "771"))).scalar_one()
     await bot_mod.start_purchase(bu, "pkg_20")
     binv = [t for t in bale.sent if t[1] == "invoice"]
-    assert binv and binv[0][2] == f"pkg:pkg_20:{bu.id}"
+    assert binv and binv[0][2].startswith("order:")
     assert binv[0][3] == [{"label": "20 coins", "amount": 120000}]
     # ...and the Telegram side derives Stars from coinsPerStar (20/20 -> 1 star)
     async with db.session_scope() as s:
         tu = await s.get(User, uid)
     await bot_mod.start_purchase(tu, "pkg_20")
-    tinv = [t for t in tg.sent if t[1] == "invoice" and t[2] == f"pkg:pkg_20:{uid}"]
+    tinv = [t for t in tg.sent if t[1] == "invoice"][-1:]
     assert tinv and tinv[0][3] == [{"label": "20 coins", "amount": 1}]
 
 
@@ -2166,7 +2175,7 @@ async def test_restore_one_click_forward_with_caption(adapters):
     await bot_mod.process_update("telegram", {"update_id": 700500, "callback_query": {
         "id": "r0", "from": {"id": int(owner_pid)},
         "message": {"chat": {"id": int(owner_pid)}}, "data": "adm_restore"}})
-    assert owner_pid in ba.RESTORE_WAIT
+    assert f"telegram:{owner_pid}" in ba.RESTORE_WAIT
     # forward the file with the caption the bot itself attaches (v2.4.3:
     # plain gzip backups carry NO restore password line — and the caption must
     # not accidentally match the "رمز ...:" caption-password pattern)
@@ -2179,7 +2188,7 @@ async def test_restore_one_click_forward_with_caption(adapters):
     handled = await ba.admin_document(owner, blob, caption=caption,
                                       filename=f"{rec.filename}")
     assert handled is True
-    st = ba.RESTORE_WAIT[owner_pid]
+    st = ba.RESTORE_WAIT[f"telegram:{owner_pid}"]
     assert st.get("blob"), "blob must be validated and staged instantly"
     assert st["password"] is None  # plain gzip — no password in caption
     tg_sent = RUNTIME["adapter_telegram"].sent
@@ -2192,7 +2201,7 @@ async def test_restore_one_click_forward_with_caption(adapters):
     async with db.session_scope() as s:
         u1 = (await s.execute(select(User).where(User.platform_user_id == "978"))).scalar_one()
         assert u1.bio == "precious"
-    assert owner_pid not in ba.RESTORE_WAIT
+    assert f"telegram:{owner_pid}" not in ba.RESTORE_WAIT
 
 
 @pytest.mark.asyncio
@@ -2304,37 +2313,23 @@ async def test_totp_stubs_removed_cleanly():
 
 @pytest.mark.asyncio
 async def test_env_admin_credentials_reconcile(monkeypatch):
-    """ADMIN_PANEL_USERNAME/PASSWORD rename+reset the owner admin at startup
-    (Railway variables); a too-short password is ignored."""
+    """Environment credentials bootstrap once; deploy must not reset passwords."""
     from app.main import ensure_webadmin
-    monkeypatch.setattr(settings, "admin_panel_username", "envowner")
-    monkeypatch.setattr(settings, "admin_panel_password", "EnvOwnerPass123!")
-    async with db.session_scope() as s:
-        await s.execute(delete(WebAdmin).where(WebAdmin.username == "envowner"))
-        s.add(WebAdmin(username="legacy.admin", full_name="Legacy", email="",
-                       password_hash=security.hash_password("LegacyPass123!x"),
-                       role="owner", must_change_password=True, status="active"))
+    monkeypatch.setattr(settings,"admin_panel_username","envowner")
+    monkeypatch.setattr(settings,"admin_panel_password","EnvOwnerPass123!")
     await ensure_webadmin()
     async with db.session_scope() as s:
-        a = (await s.execute(select(WebAdmin).where(
-            WebAdmin.username == "envowner"))).scalar_one()
-        assert security.verify_password(a.password_hash, "EnvOwnerPass123!")
-        assert a.must_change_password is False and a.role == "owner"
-        assert (await s.execute(select(WebAdmin).where(
-            WebAdmin.username == "legacy.admin"))).scalar_one_or_none() is None
-        await s.delete(a)
-    # short password ignored -> previous password still valid
-    async with db.session_scope() as s:
-        s.add(WebAdmin(username="envowner", full_name="Keep", email="",
-                       password_hash=security.hash_password("KeepPass123!x"),
-                       role="owner", must_change_password=True, status="active"))
-    monkeypatch.setattr(settings, "admin_panel_password", "short")
+        owner = (await s.execute(select(WebAdmin))).scalar_one()
+        assert owner.username == "envowner" and owner.must_change_password
+        owner.password_hash = security.hash_password("ChangedPassword123!")
+        owner.must_change_password = False
     await ensure_webadmin()
     async with db.session_scope() as s:
-        a = (await s.execute(select(WebAdmin).where(
-            WebAdmin.username == "envowner"))).scalar_one()
-        assert security.verify_password(a.password_hash, "KeepPass123!x")
-        await s.execute(delete(WebAdmin).where(WebAdmin.username == "envowner"))
+        owner = (await s.execute(select(WebAdmin))).scalar_one()
+        assert security.verify_password(owner.password_hash,"ChangedPassword123!")
+    monkeypatch.setattr(settings,"admin_panel_password", "")
+    with pytest.raises(RuntimeError):
+        await ensure_webadmin()
 
 
 # ---------------------------------------------------- v2.3.3 incomplete ----
@@ -2945,7 +2940,7 @@ async def test_restore_deletes_children_before_parents_fk_safe(adapters):
 
     event.listen(engine.sync_engine, "connect", _fk_on)
     try:
-        result = await bk.execute_restore(blob, "")
+        result = await bk.execute_restore(blob, settings.backup_password)
         assert result["status"] == "succeeded", result
     finally:
         event.remove(engine.sync_engine, "connect", _fk_on)
@@ -2975,7 +2970,7 @@ async def test_restore_handles_selfref_fk_row_order(adapters):
     # craft a payload where the REFERRING row (996) comes BEFORE the referee
     # row (995) — the exact shape that killed the single-phase INSERT
     import gzip, json as _json
-    payload = _json.loads(gzip.decompress(blob))
+    payload = _json.loads(gzip.decompress(security.decrypt_backup(blob, settings.backup_password)))
     users = payload["data"]["users"]
     users.sort(key=lambda u: (u.get("platform_user_id") != "996",))
     bad_blob = gzip.compress(_json.dumps(payload, ensure_ascii=False).encode())
@@ -3048,7 +3043,7 @@ async def test_single_active_keyboard_and_retired_chat_controls(adapters):
             "data": "gf_everyone"}})
     # the match card is the ONE message carrying chat controls
     tg_controls = [t for t in tg.sent if t[2] and any(
-        b.get("callback_data") == "chat_end" for r in t[2] for b in r)]
+        b.get("callback_data", "").split(":")[-1] == "chat_end" for r in t[2] for b in r)]
     assert tg_controls, "match card must carry the chat control panel"
     # a relayed message must NOT carry any keyboard
     await bot_mod.process_update("telegram", {"update_id": 301010, "message": {
@@ -3319,14 +3314,12 @@ async def test_scheduled_broadcast_is_promoted(adapters):
         s.add(camp)
         await s.flush()
         bid = camp.id
-    RUNTIME["broadcast_queue"] = []
     tg.sent.clear()
     promoted = await main_mod.promote_scheduled_broadcasts()
     assert promoted == [bid], "due scheduled campaign must be promoted"
     async with db.session_scope() as s:
         c = await s.get(BroadcastCampaign, bid)
         assert c.status == "sending"
-        assert bid in (RUNTIME.get("broadcast_queue") or [])
     await main_mod._run_broadcast(bid, set())
     async with db.session_scope() as s:
         c = await s.get(BroadcastCampaign, bid)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import re
 import secrets
 import time
@@ -11,8 +12,8 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, UploadFile, File
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from sqlalchemy import delete, func, select
+from pydantic import BaseModel, Field
+from sqlalchemy import delete, func, select, or_, update
 
 from . import backup as backup_mod
 from . import db, security, service
@@ -35,7 +36,8 @@ class ApiErr(HTTPException):
 
 SESSION_COOKIE = "kanar_admin_session"
 CSRF_HEADER = "X-CSRF-Token"
-_login_attempts: dict[str, list[float]] = {}
+from .limits import login_limiter
+_login_attempts = login_limiter.entries
 
 
 def now_iso(dt) -> str:
@@ -105,23 +107,27 @@ def chat_session(c: Chat, uas: dict[int, User], msgs: list[ChatMessage], has_rep
 
 # ---------------------------------------------------------------- auth ----
 async def current_admin(request: Request) -> tuple[WebAdmin, WebSession]:
+    if getattr(request.state, "admin_session", None) is not None:
+        return request.state.admin, request.state.admin_session
     sid = request.cookies.get(SESSION_COOKIE)
     if not sid:
         raise ApiErr(401, "نشست فعالی یافت نشد.", "UNAUTHENTICATED")
     async with db.session_scope() as s:
         sess = await s.get(WebSession, sid)
-        if not sess or sess.revoked:
+        if not sess or sess.revoked or sess.created_at <= utcnow() - timedelta(days=settings.session_days):
             raise ApiErr(401, "نشست منقضی شده است.", "UNAUTHENTICATED")
         admin = await s.get(WebAdmin, sess.admin_id)
         if not admin or admin.status != "active":
             raise ApiErr(401, "حساب مدیر غیرفعال است.", "ADMIN_SUSPENDED")
-        sess.last_active_at = utcnow()
+        if sess.last_active_at < utcnow() - timedelta(minutes=5):
+            sess.last_active_at = utcnow()
+        request.state.admin_session = sess
+        request.state.admin = admin
         return admin, sess
 
 
 async def require(request: Request, perm: str) -> tuple[WebAdmin, WebSession]:
     admin, sess = await current_admin(request)
-    perms = await service.role_permissions(None, admin.role) if False else None
     from .db import session_scope
     async with session_scope() as s:
         perms = await service.role_permissions(s, admin.role)
@@ -143,36 +149,41 @@ def admin_out(a: WebAdmin, perms: list) -> dict:
     return {"id": str(a.id), "username": a.username, "fullName": a.full_name,
             "email": a.email, "role": a.role, "roleLabel": labels.get(a.role, a.role),
             "permissions": ["*"] if a.role == "owner" else perms,
-            "totpEnabled": a.totp_enabled, "mustChangePassword": a.must_change_password,
+            "totpEnabled": False, "mustChangePassword": a.must_change_password,
             "status": a.status, "lastLoginAt": iso(a.last_login_at),
             "lastLoginIp": a.last_login_ip or "—", "createdAt": iso(a.created_at)}
 
 
 def _ip(request: Request) -> str:
-    return (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() or \
-        (request.client.host if request.client else "?")
+    from .limits import client_ip
+    return client_ip(request)
 
 
-def _rate_limited(ip: str) -> bool:
-    now = time.time()
-    lst = [t for t in _login_attempts.get(ip, []) if now - t < 300]
-    _login_attempts[ip] = lst
-    return len(lst) >= 6
+def _rate_limited(key: str) -> bool:
+    from .limits import login_limiter
+    return not login_limiter.available(key, 6, 300)
 
 
-def _record_fail(ip: str):
-    _login_attempts.setdefault(ip, []).append(time.time())
+def _record_fail(key: str):
+    from .limits import login_limiter
+    login_limiter.hit(key, 300)
+
+
+async def _security_event(**kw):
+    # Separate transaction: expected HTTP errors roll back the caller's session.
+    async with db.session_scope() as s:
+        s.add(SecurityEvent(**kw))
 
 
 class LoginBody(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=512)
 
 
 class ChangePwdBody(BaseModel):
-    challengeId: str
-    currentPassword: str
-    newPassword: str
+    challengeId: str = Field(max_length=64)
+    currentPassword: str = Field(max_length=512)
+    newPassword: str = Field(min_length=10, max_length=512)
 
 
 async def _new_session(admin_id: int, request: Request) -> str:
@@ -193,7 +204,8 @@ def _set_session_cookie(response: Response, sid: str):
     # v2.4: 30-day trusted-device cookie — the admin's device/browser survives
     # deploys (sessions live in Postgres; the CSRF token is now stateless too).
     response.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="lax",
-                        secure=bool(os.getenv("RAILWAY_ENVIRONMENT")), max_age=30 * 24 * 3600,
+                        secure=settings.cookie_secure or settings.production or settings.public_url.startswith("https://"),
+                        max_age=settings.session_days * 24 * 3600,
                         path="/")
 
 
@@ -203,8 +215,8 @@ async def _authed_response(admin: WebAdmin, request: Request,
     perms = []
     async with db.session_scope() as s:
         perms = await service.role_permissions(s, admin.role)
-        admin.last_login_at = utcnow()
-        admin.last_login_ip = _ip(request)
+        await s.execute(update(WebAdmin).where(WebAdmin.id == admin.id).values(
+            last_login_at=utcnow(), last_login_ip=_ip(request)))
         s.add(SecurityEvent(type="login_success", severity="info", admin_username=admin.username,
                             ip_address=_ip(request),
                             user_agent=request.headers.get("user-agent", "")[:250],
@@ -225,25 +237,27 @@ def _check_csrf(request: Request, sess: WebSession):
         return
     token = request.headers.get(CSRF_HEADER)
     expected = security.csrf_token(sess.id, settings.webhook_secret)
-    if not token or token != expected:
+    if not token or not secrets.compare_digest(token.encode(), expected.encode()):
         raise ApiErr(403, "توکن CSRF نامعتبر است. صفحه را رفرش کنید.", "CSRF")
 
 
 @router.post("/auth/login")
 async def login(body: LoginBody, request: Request):
     ip = _ip(request)
-    if _rate_limited(ip):
+    account_key = "account:" + body.username.strip().lower()
+    if _rate_limited(ip) or _rate_limited(account_key):
         raise ApiErr(429, "تلاش‌های ناموفق زیاد؛ ۵ دقیقه صبر کنید.", "RATE_LIMITED")
     async with db.session_scope() as s:
         res = await s.execute(select(WebAdmin).where(
             WebAdmin.username == body.username.strip().lower()))
         admin = res.scalar_one_or_none()
-        if not admin or not security.verify_password(admin.password_hash, body.password):
+        if not admin or not await security.password_work(security.verify_password, admin.password_hash, body.password):
             _record_fail(ip)
-            s.add(SecurityEvent(type="login_failed", severity="warning",
+            _record_fail(account_key)
+            await _security_event(type="login_failed", severity="warning",
                                 admin_username=body.username[:40], ip_address=ip,
                                 user_agent=request.headers.get("user-agent", "")[:250],
-                                message="تلاش ورود ناموفق"))
+                                message="تلاش ورود ناموفق")
             raise ApiErr(401, "نام کاربری یا رمز عبور نامعتبر است.", "INVALID_CREDENTIALS")
         if admin.status != "active":
             raise ApiErr(403, "حساب کاربری این مدیر مسدود شده است.", "ADMIN_SUSPENDED")
@@ -261,21 +275,54 @@ async def login(body: LoginBody, request: Request):
 async def change_initial_password(body: ChangePwdBody, request: Request):
     if len(body.newPassword) < 10:
         raise ApiErr(400, "رمز جدید باید حداقل ۱۰ کاراکتر باشد.", "WEAK_PASSWORD")
+    key = "challenge:" + _ip(request)
+    if _rate_limited(key):
+        raise ApiErr(429, "تلاش‌های زیاد؛ چند دقیقه صبر کنید.", "RATE_LIMITED")
+    _record_fail(key)
     async with db.session_scope() as s:
-        ch = await s.get(LoginChallenge, body.challengeId)
+        ch = (await s.execute(select(LoginChallenge).where(
+            LoginChallenge.id == body.challengeId).with_for_update())).scalar_one_or_none()
         if not ch or ch.expires_at < utcnow() or ch.stage != "password":
             raise ApiErr(400, "چالش نامعتبر یا منقضی است.", "INVALID_CHALLENGE")
         admin = await s.get(WebAdmin, ch.admin_id)
-        if not security.verify_password(admin.password_hash, body.currentPassword):
+        if not admin or admin.status != "active" or not await security.password_work(security.verify_password, admin.password_hash, body.currentPassword):
             raise ApiErr(400, "رمز فعلی نادرست است.", "INVALID_CREDENTIALS")
-        admin.password_hash = security.hash_password(body.newPassword)
+        admin.password_hash = await security.password_work(security.hash_password, body.newPassword)
         admin.must_change_password = False
         await s.delete(ch)
+        await s.execute(update(WebSession).where(WebSession.admin_id == admin.id).values(revoked=True))
         s.add(SecurityEvent(type="password_changed", severity="info",
                             admin_username=admin.username, ip_address=_ip(request),
                             user_agent="", message="تغییر رمز اولیه انجام شد"))
-        # v2.3: no TOTP enrollment — go straight to the authenticated session
-        return await _authed_response(admin, request)
+    return await _authed_response(admin, request)
+
+
+class PasswordBody(BaseModel):
+    currentPassword: str = Field(min_length=1, max_length=512)
+    newPassword: str = Field(min_length=10, max_length=512)
+
+
+@router.post("/auth/change-password")
+async def change_password(body: PasswordBody, request: Request):
+    admin, _ = await current_admin(request)
+    key = f"password:{admin.id}"
+    if _rate_limited(key):
+        raise ApiErr(429,"تلاش‌های زیاد؛ چند دقیقه صبر کنید.","RATE_LIMITED")
+    _record_fail(key)
+    if not await security.password_work(security.verify_password,admin.password_hash,body.currentPassword):
+        raise ApiErr(403,"رمز فعلی صحیح نیست.","INVALID_CREDENTIALS")
+    password_hash = await security.password_work(security.hash_password,body.newPassword)
+    async with db.session_scope() as s:
+        # Serialize password rotations so a stale password can't win a race.
+        current = (await s.execute(select(WebAdmin).where(WebAdmin.id==admin.id).with_for_update())).scalar_one()
+        if current.password_hash != admin.password_hash:
+            raise ApiErr(409,"رمز تغییر کرده است؛ دوباره تلاش کنید.","PASSWORD_CHANGED")
+        current.password_hash = password_hash
+        current.must_change_password = False
+        await s.execute(update(WebSession).where(WebSession.admin_id==admin.id).values(revoked=True))
+        s.add(SecurityEvent(type="password_changed",severity="info",admin_username=admin.username,
+            ip_address=_ip(request),user_agent="",message="رمز تغییر کرد و نشست‌های قبلی باطل شدند"))
+    return await _authed_response(current,request)
 
 
 @router.get("/auth/me")
@@ -312,8 +359,9 @@ async def logout(request: Request, response: Response):
             sess = await s.get(WebSession, sid)
             if sess:
                 sess.revoked = True
+    response = Response(status_code=204)
     response.delete_cookie(SESSION_COOKIE, path="/")
-    return Response(status_code=204)
+    return response
 
 
 @router.get("/auth/sessions")
@@ -533,11 +581,15 @@ def update_stmt(model, values: dict):
 
 # --------------------------------------------------------------- users ----
 @router.get("/users")
-async def list_users(request: Request, platform: str = "", status: str = "", q: str = ""):
+async def list_users(request: Request, response: Response, platform: str = "", status: str = "",
+                     q: str = Query("", max_length=128), page: int = Query(1, ge=1),
+                     pageSize: int = Query(50, ge=1, le=100), ageGroup: str = "", gender: str = ""):
+    from .search import normalize_query, contains_literal, normalized_column
+    q = normalize_query(q)
     await require(request, "users.view")
     async with db.session_scope() as s:
         query = select(User).order_by(User.id.desc())
-        if platform:
+        if platform and platform != "all":
             query = query.where(User.platform == platform)
         # v2.3.3: the declared-but-never-wired status filter now works; the
         # special value "incomplete" selects users with age 0 (registration
@@ -547,15 +599,34 @@ async def list_users(request: Request, platform: str = "", status: str = "", q: 
             query = query.where(User.age == 0)
         elif status == "blocked_bot":
             query = query.where(User.bot_blocked == True)  # noqa
-        elif status:
+        elif status in ("temp_banned", "perm_banned"):
+            query = query.where(User.status == "banned", User.id.in_(select(Ban.user_id).where(
+                Ban.status == "active", Ban.type == ("permanent" if status == "perm_banned" else "temporary"))))
+        elif status and status != "all":
             query = query.where(User.status == status)
+        if ageGroup == "incomplete":
+            query = query.where(User.age == 0)
+        elif ageGroup == "13-17":
+            query = query.where(User.age.between(13, 17))
+        elif ageGroup == "18-60":
+            query = query.where(User.age >= 18)
+        if gender in ("male", "female"):
+            query = query.where(User.gender == gender)
         if q:
-            query = query.where((User.public_id == q.upper()) | (User.display_name.ilike(f"%{q}%")) |
-                                (User.platform_user_id == q))
+            exact = or_(func.lower(User.public_id) == q, User.platform_user_id == q,
+                        normalized_column(User.username) == q)
+            if q.isascii() and q.isdigit() and len(q) < 19:
+                exact = or_(exact, User.id == int(q))
+            query = query.where(or_(exact, *[contains_literal(col, q) for col in
+                (User.display_name, User.username, User.city)]))
+            query = query.order_by(None).order_by(exact.desc(), User.id.desc())
         # v2.5 FIX: limit() was applied BEFORE the filters, so a filtered page
         # could come back empty even though matching rows existed past the 500
         # newest rows. Apply it last.
-        rows = list((await s.execute(query.limit(500))).scalars())
+        total = (await s.execute(select(func.count()).select_from(query.order_by(None).subquery()))).scalar_one()
+        response.headers["X-Total-Count"] = str(total)
+        response.headers["X-Has-More"] = str(page * pageSize < total).lower()
+        rows = list((await s.execute(query.offset((page - 1) * pageSize).limit(pageSize))).scalars())
         # v2.4 PERF: the old loop ran TWO extra queries per user (active ban +
         # queue entry) — up to 1000 round-trips for 500 users. Both are now
         # fetched in one bulk query each and mapped in memory.
@@ -730,12 +801,16 @@ async def _get_user(s, user_id: str) -> User:
 
 # --------------------------------------------------------------- chats ----
 @router.get("/chats")
-async def list_chats(request: Request):
+async def list_chats(request: Request, userId: int | None = None, page: int = Query(1, ge=1)):
     admin, _ = await current_admin(request)
     async with db.session_scope() as s:
         perms = await service.role_permissions(s, admin.role)
+        if not any(service.has_perm(admin.role, perms, p) for p in ("chats.view_all", "chats.view_reported")):
+            raise ApiErr(403, "مجوز مشاهده گفتگو را ندارید.", "FORBIDDEN")
         can_all = admin.role == "owner" and service.has_perm(admin.role, perms, "chats.view_all")
-        query = select(Chat).order_by(Chat.id.desc()).limit(200)
+        query = select(Chat).order_by(Chat.id.desc()).offset((page-1)*50).limit(50)
+        if userId is not None:
+            query = query.where(or_(Chat.user_a_id == userId, Chat.user_b_id == userId))
         if not can_all:
             query = query.where(Chat.has_report == True)  # noqa
         chats = list((await s.execute(query)).scalars())
@@ -747,11 +822,7 @@ async def list_chats(request: Request):
         uids = {c.user_a_id for c in chats} | {c.user_b_id for c in chats}
         users = {u.id: u for u in (await s.execute(
             select(User).where(User.id.in_(uids)))).scalars()}
-        msg_rows = (await s.execute(select(ChatMessage).where(
-            ChatMessage.chat_id.in_(cids)).order_by(ChatMessage.id))).scalars()
-        msgs_by_chat: dict[int, list] = {}
-        for m in msg_rows:
-            msgs_by_chat.setdefault(m.chat_id, []).append(m)
+        msgs_by_chat = {}
         rep_rows = (await s.execute(select(Report).where(
             Report.chat_id.in_(cids)).order_by(Report.id))).scalars()
         rep_by_chat: dict[int, int] = {}
@@ -774,6 +845,31 @@ async def list_chats(request: Request):
         privacy = await service.get_setting(s, "privacy")
         return {"chats": out, "scope": "all" if can_all else "reported_only",
                 "retentionDays": privacy.get("chatRetentionDays", 30)}
+
+
+@router.get("/chats/{chat_id}/messages")
+async def chat_messages(chat_id: int, request: Request, before: int | None = None,
+                        limit: int = Query(100, ge=1, le=300)):
+    admin, _ = await current_admin(request)
+    async with db.session_scope() as s:
+        perms = await service.role_permissions(s, admin.role)
+        chat = await s.get(Chat, chat_id)
+        if not chat:
+            raise ApiErr(404, "گفتگو یافت نشد.", "NOT_FOUND")
+        all_access = admin.role == "owner" and service.has_perm(admin.role,perms,"chats.view_all")
+        if not all_access and not (chat.has_report and service.has_perm(admin.role,perms,"chats.view_reported")):
+            raise ApiErr(403, "دسترسی به متن گفتگو ندارید.", "FORBIDDEN")
+        query = select(ChatMessage).where(ChatMessage.chat_id == chat_id)
+        if before is not None:
+            query = query.where(ChatMessage.id < before)
+        messages = list((await s.execute(query.order_by(ChatMessage.id.desc()).limit(limit+1))).scalars())
+        has_more = len(messages) > limit
+        messages = list(reversed(messages[:limit]))
+        people = {u.id:u for u in (await s.execute(select(User).where(User.id.in_([chat.user_a_id,chat.user_b_id])))).scalars()}
+        await service.audit(s, admin_id=admin.id, admin_name=admin.username, admin_role=admin.role,
+            action="chats.messages_viewed",module="chats",target_type="chat",target_id=str(chat_id),ip=_ip(request))
+        return {"messages":chat_session(chat,people,messages,chat.has_report,None)["messages"],
+            "hasMore":has_more,"before":messages[0].id if messages else None}
 
 
 class TerminateBody(BaseModel):
@@ -1254,37 +1350,16 @@ async def list_payments(request: Request):
 @router.post("/payments/{payment_id}/refund")
 async def refund_payment(payment_id: str, body: ReasonBody, request: Request):
     admin, _ = await require(request, "payments.refund")
+    from . import orders
+    try:
+        await orders.refund(int(payment_id),admin.username)
+    except (ValueError, orders.RefundError) as exc:
+        raise ApiErr(409,str(exc),getattr(exc,"code","INVALID_ID"))
     async with db.session_scope() as s:
-        p = await s.get(Payment, int(payment_id))
-        if not p:
-            raise ApiErr(404, "تراکنش پرداخت یافت نشد.", "PAYMENT_NOT_FOUND")
-        if p.status != "succeeded":
-            raise ApiErr(400, "فقط تراکنش‌های موفق قابل استردادند.", "NOT_REFUNDABLE")
-        if p.platform == "telegram":
-            adp = RUNTIME.get("adapter_telegram")
-            u = await s.get(User, p.user_id)
-            if not adp or not u or not p.telegram_payment_charge_id:
-                raise ApiErr(503, "بازوی تلگرام یا شناسه تراکنش در دسترس نیست.", "REFUND_UNAVAILABLE")
-            from .platform import PlatformError
-            try:
-                await adp.refund_payment(int(u.platform_user_id), p.telegram_payment_charge_id)
-            except PlatformError as exc:
-                raise ApiErr(502, f"خطای Telegram در استرداد: {exc}", "REFUND_FAILED")
-            p.status = "refunded"
-            p.refunded_at = utcnow()
-            p.refunded_by = admin.username
-            if u:
-                await service.debit(s, u, min(p.coins, u.coin_balance), "admin_deduct",
-                                    f"برداشت سکه خرید استردادشده: {body.reason}")
-        else:
-            raise HTTPException(400, "بازوی Bot API بله روش استرداد مستند ندارد؛ "
-                                     "استرداد باید از پنل کیف‌پول بله به‌صورت دستی انجام شود.",
-                                {"code": "BALE_REFUND_MANUAL"})
-        await service.audit(s, actor_type="web", admin_id=admin.id, admin_name=admin.username,
-                            admin_role=admin.role, action="payment.refunded", module="payments",
-                            target_type="payment", target_id=p.id, ip=_ip(request),
-                            details=f"استرداد ({p.telegram_payment_charge_id}): {body.reason}")
-        return {"ok": True, "status": p.status}
+        await service.audit(s,admin_id=admin.id,admin_name=admin.username,admin_role=admin.role,
+            action="payment.refunded",module="payments",target_type="payment",target_id=payment_id,
+            ip=_ip(request),details=body.reason)
+    return {"ok":True,"status":"refunded"}
 
 
 @router.get("/referrals")
@@ -1508,13 +1583,13 @@ async def create_broadcast(body: BroadcastBody, request: Request):
         except ValueError:
             raise ApiErr(400, "زمان‌بندی نامعتبر است.", "INVALID_SCHEDULE")
     async with db.session_scope() as s:
-        targets = await service.broadcast_targets(s, body.audience)
+        target_count = await service.broadcast_target_count(s, body.audience)
         camp = BroadcastCampaign(
             title=body.title[:120], message=body.message[:4000], audience=body.audience,
             audience_label=service.AUDIENCE_LABELS.get(body.audience, body.audience),
             rate_limit_per_sec=max(1, min(body.rateLimitPerSec, 25)),
             status="scheduled" if scheduled else "sending",
-            scheduled_for=scheduled, target_count=len(targets),
+            scheduled_for=scheduled, target_count=target_count,
             created_by=f"web:{admin.username}")
         s.add(camp)
         await s.flush()
@@ -1523,10 +1598,8 @@ async def create_broadcast(body: BroadcastBody, request: Request):
                             target_type="campaign", target_id=camp.id,
                             ip=_ip(request), details=body.title)
         cid = camp.id
-    if not scheduled:
-        RUNTIME.setdefault("broadcast_queue", []).append(cid)
     return {"id": str(cid), "status": "sending" if not scheduled else "scheduled",
-            "targetCount": len(targets)}
+            "targetCount": target_count}
 
 
 @router.post("/broadcasts/{bid}/toggle-pause")
@@ -1538,7 +1611,6 @@ async def toggle_broadcast(bid: str, request: Request):
             raise ApiErr(404, "کمپین یافت نشد.", "NOT_FOUND")
         if b.status == "paused":
             b.status = "sending"
-            RUNTIME.setdefault("broadcast_queue", []).append(b.id)
         elif b.status == "sending":
             b.status = "paused"
         return {"ok": True, "status": b.status}
@@ -1679,7 +1751,7 @@ async def create_admin(body: AdminCreateBody, request: Request):
     # password returned ONCE to the creating admin; never stored in plaintext
     return {"admin": ao,
             "temporaryPasswordHint": f"رمز موقت (فقط همین یک‌بار نمایش داده می‌شود): {temp_password} — "
-                                     "در اولین ورود باید تغییر کند و TOTP فعال شود."}
+                                     "در اولین ورود باید رمز تغییر کند."}
 
 
 class AdminPatch(BaseModel):
@@ -1786,14 +1858,14 @@ async def audit_logs(request: Request):
 async def backups_all(request: Request):
     await require(request, "backups.view")
     async with db.session_scope() as s:
-        rows = (await s.execute(select(db.BackupRecord).order_by(
-            db.BackupRecord.created_at.desc()).limit(100))).scalars()
+        rows = list((await s.execute(select(db.BackupRecord).order_by(
+            db.BackupRecord.created_at.desc()).limit(100))).scalars())
         cfg = await service.get_setting(s, "backup")
         out = []
         for b in rows:
             out.append({"id": b.id, "filename": b.filename, "trigger": b.trigger,
                         "status": b.status, "sizeMb": round(b.size_bytes / 1e6, 2),
-                        "sha256": b.sha256, "sha256Verified": True, "encrypted": b.encrypted,
+                        "sha256": b.sha256, "sha256Verified": False, "encrypted": b.encrypted,
                         "encryptionCipher": b.cipher, "deliveryTarget": b.delivery_target,
                         "deliveryStatus": b.delivery_status, "schemaVersion": b.schema_version,
                         "createdBy": b.created_by, "createdAt": iso(b.created_at),
@@ -1810,7 +1882,7 @@ async def backups_all(request: Request):
                              "encryptionEnabled": cfg.get("encryptionEnabled", True),
                              "deliveryChannels": [{
                                  "id": "tg-owner", "name": "بازوی تلگرام هم‌چت → مالک",
-                                 "type": "telegram_vault", "status": "connected",
+                                 "type": "telegram_vault", "status": ("connected" if last_delivered else "warning") if RUNTIME.get("adapter_telegram") else "disconnected",
                                  "lastDeliveredAt": last_delivered}]}}
 
 
@@ -1825,7 +1897,7 @@ async def backup_manual(request: Request):
         raise ApiErr(409, "یک فرآیند پشتیبان‌گیری دیگر در حال اجراست.", "BACKUP_IN_PROGRESS")
     return {"id": rec.id, "filename": rec.filename, "trigger": rec.trigger, "status": rec.status,
             "sizeMb": round(rec.size_bytes / 1e6, 2), "sha256": rec.sha256,
-            "sha256Verified": True, "encrypted": rec.encrypted, "encryptionCipher": rec.cipher,
+            "sha256Verified": False, "encrypted": rec.encrypted, "encryptionCipher": rec.cipher,
             "deliveryTarget": rec.delivery_target, "deliveryStatus": rec.delivery_status,
             "schemaVersion": rec.schema_version, "createdBy": rec.created_by,
             "createdAt": iso(rec.created_at), "errorMessage": rec.error_message or ""}
@@ -1839,7 +1911,7 @@ class BackupSettingsBody(BaseModel):
 
 @router.patch("/backups/settings")
 async def backup_settings(body: BackupSettingsBody, request: Request):
-    admin, _ = await require(request, "backups.view")
+    admin = await require_owner(request)
     async with db.session_scope() as s:
         cfg = await service.get_setting(s, "backup")
         if body.autoBackupEnabled is not None:
@@ -1861,7 +1933,7 @@ async def backup_settings(body: BackupSettingsBody, request: Request):
                 "retentionDays": cfg["retentionDays"],
                 "encryptionEnabled": cfg.get("encryptionEnabled", True),
                 "deliveryChannels": [{"id": "tg-owner", "name": "بازوی تلگرام هم‌چت → مالک",
-                                      "type": "telegram_vault", "status": "connected",
+                                      "type": "telegram_vault", "status": "warning" if RUNTIME.get("adapter_telegram") else "disconnected",
                                       "lastDeliveredAt": ""}]}
 
 
@@ -1882,80 +1954,62 @@ async def restore_validate(request: Request, body: ValidateBody | None = None):
             # v2.5 FIX: this branch answered valid=True without ever looking at
             # the archive. Be explicit that the record alone cannot prove the
             # file is intact (the FE shows this as an unverified backup).
-            return {"valid": True, "checksumMatch": None, "sha256": rec.sha256,
+            return {"valid": False, "checksumMatch": None, "sha256": rec.sha256,
                     "verified": False,
                     "compatible": rec.schema_version == "1.0.0",
                     "schemaVersion": rec.schema_version, "currentSchemaVersion": "1.0.0",
                     "sizeMb": round(rec.size_bytes / 1e6, 2), "encrypted": rec.encrypted,
                     "warnings": ["فایل پشتیبان در تلگرام ذخیره شده است؛ برای بازیابی کامل، "
                                  "خود فایل .enc را آپلود کنید یا از پنل بازو ارسال کنید."]}
-    uploads = RUNTIME.get("restore_uploads") or {}
-    if body and body.uploadedFileName and body.uploadedFileName in uploads:
-        blob = uploads[body.uploadedFileName]
-        return backup_mod.validate_blob(blob, password=settings.backup_password)
     raise ApiErr(400, "شناسه پشتیبان یا فایل آپلودشده مشخص نیست.", "NO_SOURCE")
 
 
 @router.post("/backups/restore/validate-file")
 async def restore_validate_file(request: Request, file: UploadFile = File(...)):
     await require_owner(request)
-    blob = await file.read()
-    if len(blob) > 200 * 1024 * 1024:
-        raise ApiErr(413, "حجم فایل بیش از حد مجاز است.", "TOO_LARGE")
-    uploads = RUNTIME.setdefault("restore_uploads", {})
-    name = file.filename or "upload.enc"
-    uploads[name] = blob
-    return backup_mod.validate_blob(blob, password=settings.backup_password)
+    from .uploads import store
+    import asyncio
+    try:
+        token, blob = await store(file, request.cookies.get(SESSION_COOKIE))
+    except ValueError as exc:
+        raise ApiErr(413, "حجم یا تعداد فایل‌های بازیابی بیش از حد مجاز است.", str(exc))
+    result = await asyncio.to_thread(backup_mod.validate_blob, blob, "", settings.backup_password)
+    result["uploadId"] = token
+    result["verified"] = result["valid"]
+    return result
 
 
 class ExecuteBody(BaseModel):
-    backupId: str | None = None
-    uploadedFileName: str | None = None
-    confirmationPhrase: str
-    totpCode: str
+    uploadId: str = Field(max_length=64)
+    confirmationPhrase: str = Field(max_length=64)
+    password: str = Field(max_length=512)
 
 
 @router.post("/backups/restore/execute")
 async def restore_execute(body: ExecuteBody, request: Request):
     admin = await require_owner(request)
-    if body.confirmationPhrase.strip() != "RESTORE KANAR DB":
+    if body.confirmationPhrase.strip() != "RESTORE HAMCHAT DB":
         raise ApiErr(400, "عبارت تأیید صحیح وارد نشده است.", "INVALID_CONFIRMATION")
-    # Owner TOTP verification is mandatory
-    async with db.session_scope() as s:
-        admin_full = await s.get(WebAdmin, admin.id)
-        try:
-            secret = security.decrypt_field(admin_full.totp_secret_enc, settings.encryption_key)
-        except Exception:
-            raise ApiErr(400, "TOTP مالک فعال نیست؛ ابتدا آن را در بخش امنیتی فعال کنید.", "TOTP_NOT_ENABLED")
-        if not security.totp_verify(secret, body.totpCode):
-            s.add(SecurityEvent(type="restore_attempt", severity="critical",
-                                admin_username=admin.username, ip_address=_ip(request),
-                                user_agent="", message="کد TOTP نامعتبر برای بازیابی"))
-            raise ApiErr(400, "کد TOTP مالک نامعتبر است.", "INVALID_TOTP")
-        s.add(SecurityEvent(type="restore_attempt", severity="critical",
-                            admin_username=admin.username, ip_address=_ip(request),
-                            user_agent="", message="شروع بازیابی پایگاه‌داده"))
-    uploads = RUNTIME.get("restore_uploads") or {}
-    blob = None
-    if body.uploadedFileName:
-        blob = uploads.get(body.uploadedFileName)
-    if blob is None:
-        raise ApiErr(400, "فایل پشتیبان آپلودشده یافت نشد؛ ابتدا آن را اعتبارسنجی و آپلود کنید.", "NO_SOURCE")
-    if RUNTIME.get("restore_in_progress"):
-        raise ApiErr(409, "یک عملیات بازیابی دیگر در جریان است.", "RESTORE_BUSY")
-    RUNTIME["restore_in_progress"] = True
+    key = "restore:" + str(admin.id)
+    if _rate_limited(key):
+        raise ApiErr(429, "تلاش‌های زیاد؛ چند دقیقه صبر کنید.", "RATE_LIMITED")
+    _record_fail(key)
+    import asyncio
+    if not await security.password_work(security.verify_password, admin.password_hash, body.password):
+        await _security_event(type="restore_attempt", severity="critical", admin_username=admin.username,
+            ip_address=_ip(request), user_agent="", message="رمز مالک برای بازیابی نامعتبر است")
+        raise ApiErr(403, "رمز فعلی مالک صحیح نیست.", "INVALID_CREDENTIALS")
+    from .uploads import consume
     try:
-        result = await backup_mod.execute_restore(blob, settings.backup_password)
-        async with db.session_scope() as s:
-            await service.audit(s, actor_type="web", admin_id=admin.id,
-                                admin_name=admin.username, admin_role="owner",
-                                action="backup.restored", module="backups",
-                                target_type="database",
-                                target_id=body.uploadedFileName or "uploaded",
-                                ip=_ip(request), details=result["message"])
-        return result
-    finally:
-        RUNTIME["restore_in_progress"] = False
+        blob = consume(body.uploadId, request.cookies.get(SESSION_COOKIE))
+    except ValueError:
+        raise ApiErr(400, "فایل منقضی شده است؛ دوباره آپلود کنید.", "UPLOAD_EXPIRED")
+    await _security_event(type="restore_attempt", severity="critical", admin_username=admin.username,
+        ip_address=_ip(request), user_agent="", message="بازیابی توسط مالک تأیید شد")
+    try:
+        return await backup_mod.execute_restore(blob, settings.backup_password)
+    except ValueError as exc:
+        raise ApiErr(409, "بازیابی شروع نشد؛ فایل و نبود عملیات هم‌زمان را بررسی کنید.", str(exc))
 
 
 # ------------------------------------------------- platforms/settings ----
@@ -2182,7 +2236,7 @@ async def privacy_put(body: PrivacyBody, request: Request):
 
 @router.get("/security/overview")
 async def security_overview(request: Request):
-    admin, sess = await current_admin(request)
+    admin, sess = await require(request, "security.manage")
     async with db.session_scope() as s:
         sessions = (await s.execute(select(WebSession).where(
             WebSession.admin_id == admin.id, WebSession.revoked == False))).scalars()  # noqa
@@ -2203,57 +2257,25 @@ async def security_overview(request: Request):
 @router.get("/monitoring/railway")
 async def monitoring(request: Request):
     await require(request, "monitoring.view")
-    on_railway = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_ID"))
-    # real process metrics from /proc
-    try:
-        with open("/proc/self/status") as f:
-            status = f.read()
-        ram_kb = int(next(l.split()[1] for l in status.splitlines() if l.startswith("VmRSS")))
-    except Exception:
-        ram_kb = 0
-    try:
-        with open("/proc/stat") as f:
-            parts = f.readline().split()
-        idle = sum(int(x) for x in parts[4:])
-        total = sum(int(x) for x in parts[1:])
-        cpu = round((1 - idle / total) * 100, 1) if total else 0.0
-    except Exception:
-        cpu = 0.0
+    from .telemetry import sample
+    result = sample()
+    active = db_size = None
+    health = "unavailable"
     async with db.session_scope() as s:
-        if settings.is_pg:
-            try:
-                active = (await s.execute(
-                    __import__("sqlalchemy").text(
-                        "select count(*) from pg_stat_activity where datname = current_database()")
-                )).scalar()
-                db_size = (await s.execute(__import__("sqlalchemy").text(
-                    "select pg_database_size(current_database())"))).scalar()
-            except Exception:
-                active, db_size = 0, 0
-        else:
-            active, db_size = 1, 0
-        err_24h = (await s.execute(select(func.count(SecurityEvent.id)).where(
-            SecurityEvent.created_at >= utcnow() - timedelta(days=1)))).scalar()
-    series = []
-    now = time.time()
-    for i in range(11, -1, -1):
-        series.append({"time": time.strftime("%H:%M", time.localtime(now - i * 300)),
-                       "cpu": cpu, "ramPct": round(ram_kb / 1024 / 1024 * 100 / 2, 1),
-                       "networkMbps": 0.0, "apiErrors": 0})
-    return {
-        "dataSource": "live_railway" if on_railway else "simulated_dev",
-        "lastSyncedAt": utcnow().isoformat() + "Z", "environment": os.getenv("RAILWAY_ENVIRONMENT", "local"),
-        "region": os.getenv("RAILWAY_REGION", "unknown"),
-        "serviceStatus": "online",
-        "uptimePct30d": 100.0 if on_railway else 0.0,
-        "cpuUsagePct": cpu, "cpuLimitCores": 2.0 if on_railway else 2.0,
-        "ramUsageMb": round(ram_kb / 1024, 1), "ramLimitMb": 1024 if on_railway else 4096,
-        "dbHealth": "healthy", "dbConnectionsActive": active or 1, "dbConnectionsMax": 100,
-        "dbSizeGb": round((db_size or 0) / 1e9, 3), "dbStorageLimitGb": 0.5,
-        "storageUsageGb": round((db_size or 0) / 1e9, 3), "storageLimitGb": 0.5,
-        "networkInMbps": 0.0, "networkOutMbps": 0.0, "apiErrors24h": err_24h,
-        "apiErrorRatePct": 0.0,
-        "estimatedMonthlyCostUsd": 5.0 if on_railway else 0.0,
-        "costBreakdown": ([{"item": "پلن Trial / Free Railway (اعتبار ۵ دلاری)", "usd": 5.0}]
-                          if on_railway else [{"item": "محیط توسعه محلی", "usd": 0.0}]),
-        "telemetrySeries": series, "restartHistory": []}
+        try:
+            from sqlalchemy import text
+            await s.execute(text("SELECT 1"))
+            health = "healthy"
+            if db.get_engine().dialect.name == "postgresql":
+                active = (await s.execute(text("select count(*) from pg_stat_activity where datname=current_database() AND state='active'"))).scalar_one()
+                db_size = (await s.execute(text("select pg_database_size(current_database())"))).scalar_one() / 1e9
+        except Exception:
+            health = "unavailable"
+    return {**result, "dataSource":"process_cgroup", "lastSyncedAt":iso(utcnow()),
+        "environment":os.getenv("RAILWAY_ENVIRONMENT", "local"), "region":os.getenv("RAILWAY_REGION", "unknown"),
+        "serviceStatus":"online", "uptimePct30d":None, "dbHealth":health,
+        "dbConnectionsActive":active, "dbConnectionsMax":None, "dbSizeGb":db_size,
+        "dbStorageLimitGb":None, "storageUsageGb":None, "storageLimitGb":None,
+        "networkInMbps":None, "networkOutMbps":None, "apiErrors24h":None,
+        "apiErrorRatePct":None, "estimatedMonthlyCostUsd":None, "costBreakdown":[],
+        "restartHistory":[], "limitations":["No Railway billing API integration", "Samples since process start only"]}
