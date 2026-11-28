@@ -197,7 +197,7 @@ async def setup_webhooks() -> None:
         try:
             await _a.wait_for(adp_t.set_webhook(url), timeout=20)
             RUNTIME["webhook_set_telegram"] = True
-            log.info("webhook registered for telegram -> %s", url)
+            log.info("webhook registered for telegram")
         except (PlatformError, _a.TimeoutError) as exc:
             log.warning("setWebhook failed for telegram: %s (falling back to polling)", exc)
     adp_b = RUNTIME.get("adapter_bale")
@@ -729,30 +729,9 @@ async def spa(full_path: str, request: Request):
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # httpx logs every request URL at INFO, and Bot-API request URLs carry the
-    # full bot token (/bot<token>/method) — redact it so tokens never reach the
-    # platform log storage (Railway keeps deployment logs indefinitely).
-    import re as _re
-
-    class _RedactBotTokens(logging.Filter):
-        _rx = _re.compile(r"/bot[^/\s]+/")
-
-        def filter(self, record: logging.LogRecord) -> bool:
-            try:
-                text = record.getMessage()
-            except Exception:
-                return True
-            if "/bot" in text:
-                record.msg = self._rx.sub("/bot***:REDACTED/", text)
-                record.args = ()
-            return True
-
-    for _name in ("httpx", "httpcore"):
-        logging.getLogger(_name).addFilter(_RedactBotTokens())
+    from .logging_config import log_config
     uvicorn.run("app.main:app", host="0.0.0.0", port=settings.port, proxy_headers=False,
-                log_level="info", access_log=False, limit_concurrency=100)
+                log_config=log_config(), log_level="info", access_log=False, limit_concurrency=100)
 
 
 if __name__ == "__main__":
