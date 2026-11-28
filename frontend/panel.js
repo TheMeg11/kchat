@@ -1,3 +1,4 @@
+import {createMonetizationScreen} from "./components/monetization.js";
 import {createPasswordChangeForm} from "./components/password-change.js";
 function E9(e, t) {
   for (var n = 0; n < t.length; n++) {
@@ -21447,6 +21448,13 @@ const Qu = [
       group: "اقتصاد و فروش",
       icon: Cs,
       permission: "economy.view",
+    },
+    {
+      path: "/monetization",
+      label: "محصولات و اشتراک",
+      group: "اقتصاد و فروش",
+      icon: ET,
+      permission: "store.manage",
     },
     {
       path: "/store",
@@ -66450,6 +66458,7 @@ function Vme() {
         })
     : u.jsx(en, {});
 }
+const MonetizationScreen = createMonetizationScreen({b,u,Te,Ke,Ae,ln,Bt});
 const PasswordChangeForm = createPasswordChangeForm({b,u,ln,Te,Ke,Ae});
 
 function Hme() {
@@ -67080,6 +67089,7 @@ function qme() {
                 u.jsx(zt, { path: "/moderation", element: u.jsx(jme, {}) }),
                 u.jsx(zt, { path: "/bans", element: u.jsx(Sme, {}) }),
                 u.jsx(zt, { path: "/economy", element: u.jsx(Ame, {}) }),
+                u.jsx(zt, { path: "/monetization", element: u.jsx(MonetizationScreen, {}) }),
                 u.jsx(zt, { path: "/store", element: u.jsx(Nme, {}) }),
                 u.jsx(zt, { path: "/payments", element: u.jsx(kme, {}) }),
                 u.jsx(zt, { path: "/referrals", element: u.jsx(Ome, {}) }),

@@ -48,3 +48,8 @@ External network sends cannot be atomically committed with SQL. A crash after se
 A failure in `settings.validate_production()` occurs before database initialization/migration. Set `PUBLIC_URL` on the **application service** to its real `https://` panel address (not the Postgres/private hostname), apply the variable change and deploy again. Do not rotate backup keys or reset the database to fix this error.
 
 The startup hotfix resolves a blank `PUBLIC_URL` from `RAILWAY_PUBLIC_DOMAIN` automatically, strips surrounding whitespace/trailing slashes, and validates the resulting HTTPS URL. If `PUBLIC_URL` is explicitly wrong, correct it or remove it to enable this fallback. If neither value exists, enable a Railway public domain or set the real custom HTTPS URL. The error alone cannot establish whether the original variable was blank or incorrectly formatted.
+
+
+## Commerce revision
+
+See [MONETIZATION.md](MONETIZATION.md) before enabling/promoting the new catalog. No new environment variables; startup adds eight business tables under `20261128_commerce_v2`. Back up PostgreSQL first; keep one process/replica. Existing VIP/pass entitlements are honored when the catalog's sales toggle is off. Review the initial coin prices and platform top-up rates in the two admin screens; do not present coin spending as cash revenue. Local tests are not evidence that Railway deployed or that a live payment succeeded.

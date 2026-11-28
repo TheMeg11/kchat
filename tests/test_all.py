@@ -1508,12 +1508,12 @@ async def test_wallet_menu_and_buy(adapters):
     joined = "".join(str(t_[1]) for t_ in tg.sent)
     assert "کیف پول" in joined and "30" in joined
     kb_any = [t_[2] for t_ in tg.sent if t_[2]]
-    assert any(any(b.get("callback_data") == "store" for r in k for b in r) for k in kb_any)
+    assert any(any(b.get("callback_data") == "m:coins" for r in k for b in r) for k in kb_any)
     # store (buy) opens from wallet — in tests no payment token is configured,
     # so the store answers with the graceful "unavailable" message (no crash)
     tg.sent.clear()
     await bot_mod.process_update("telegram", {"update_id": 600101, "callback_query": {
-        "id": "cw", "from": {"id": 992}, "message": {"chat": {"id": 992}}, "data": "store"}})
+        "id": "cw", "from": {"id": 992}, "message": {"chat": {"id": 992}}, "data": "m:coins"}})
     joined2 = "".join(str(t_[1]) for t_ in tg.sent)
     assert ("خرید سکه" in joined2) or ("درگاه" in joined2) or ("فعال نیست" in joined2)
 
@@ -1763,7 +1763,7 @@ async def test_store_packages_rates_and_custom_invoice(adapters):
     settings.telegram_bot_token = "test-token"
     try:
         await bot_mod.process_update("telegram", {"update_id": 730, "callback_query": {
-            "id": "cc1", "from": {"id": 761}, "message": {"chat": {"id": 761}}, "data": "store"}})
+            "id": "cc1", "from": {"id": 761}, "message": {"chat": {"id": 761}}, "data": "m:coins"}})
         kb_all = [t[2] for t in tg.sent if t[2]]
         datas = {b.get("callback_data") for k in kb_all for r in k for b in r}
         assert "custom_coins" in datas and "buy_pkg_20" in datas
@@ -1839,7 +1839,7 @@ async def test_bale_store_gate_and_admin_payment_toggles(adapters):
             assert app_cfg.get("paymentsBaleEnabled", False) is False
         # default OFF -> the Bale store is empty and shows the friendly gate text
         await bot_mod.process_update("bale", {"update_id": 800, "callback_query": {
-            "id": "bx0", "from": {"id": 781}, "message": {"chat": {"id": 781}}, "data": "store"}})
+            "id": "bx0", "from": {"id": 781}, "message": {"chat": {"id": 781}}, "data": "m:coins"}})
         assert any("درگاه پرداخت" in str(t[1]) for t in bale.sent)
         assert not [t for t in bale.sent if t[2] and any(
             str(b.get("callback_data", "")).startswith("buy_") for r in t[2] for b in r)]
@@ -1865,7 +1865,7 @@ async def test_bale_store_gate_and_admin_payment_toggles(adapters):
         # the same buyer now sees the packages + custom amount
         bale.sent.clear()
         await bot_mod.process_update("bale", {"update_id": 803, "callback_query": {
-            "id": "bx3", "from": {"id": 781}, "message": {"chat": {"id": 781}}, "data": "store"}})
+            "id": "bx3", "from": {"id": 781}, "message": {"chat": {"id": 781}}, "data": "m:coins"}})
         datas2 = {b.get("callback_data") for t in bale.sent if t[2]
                   for r in t[2] for b in r}
         assert "custom_coins" in datas2 and "buy_pkg_40" in datas2

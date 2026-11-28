@@ -33,6 +33,11 @@ async def find(session, platform, event, check_expiry=True):
     currency = event.get("currency") or ("IRR" if platform == "bale" else "")
     if type(event.get("total_amount")) is not int or order.amount != event["total_amount"] or currency != order.currency:
         return None
+    if check_expiry and order.package_id == "first_offer":
+        # A first offer is not available after another completed purchase.
+        previous = (await session.execute(select(db.Payment.id).where(db.Payment.user_id == order.payer_id).limit(1))).scalar_one_or_none()
+        if previous:
+            return None
     if check_expiry and (order.paid_at or order.expires_at < db.utcnow()):
         return None
     recipient = await session.get(db.User, order.recipient_id)

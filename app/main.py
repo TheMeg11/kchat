@@ -303,7 +303,8 @@ async def scheduler_loop() -> None:
                     await service.purge_expired(s)
             await run(purge)
             last_purge = now
-        for job in (expire_bans, enforce_search_timeout, enforce_idle_timeout,
+        from .reconnect import recover
+        for job in (recover, expire_bans, enforce_search_timeout, enforce_idle_timeout,
                     run_match_tick, process_broadcasts, maybe_daily_backup):
             await run(job)
         from . import growth
@@ -686,6 +687,8 @@ async def bale_webhook(secret: str, request: Request):
 # admin API router
 from .webadmin import router as admin_router, ApiErr  # noqa: E402
 app.include_router(admin_router)
+from .commerce_admin import router as commerce_router
+app.include_router(commerce_router)
 
 
 @app.exception_handler(ApiErr)
