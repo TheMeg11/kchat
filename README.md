@@ -19,7 +19,8 @@ python3 -m venv .venv
 cp .env.example .env
 # For local SQLite, remove DATABASE_URL or use sqlite+aiosqlite:///./kanarchat.db.
 # Set secrets, owner IDs, bot tokens and one-time admin bootstrap credentials.
-# PUBLIC_URL can be empty locally (polling); Railway requires HTTPS + PostgreSQL.
+# PUBLIC_URL can be empty locally (polling); Railway uses its public domain
+# when PUBLIC_URL is blank. Railway still requires HTTPS + PostgreSQL.
 .venv/bin/python -m app.main
 ```
 

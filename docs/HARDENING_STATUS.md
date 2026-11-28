@@ -39,7 +39,7 @@ Commands and final counts are recorded in the delivery message. Coverage include
 
 ## Still requires staging / follow-up
 
-1. Actual Docker image build/run and GitHub-hosted CI execution (workflow is supplied; neither is claimed to have run here).
+1. Docker image build and GitHub-hosted CI passed before PR #3 merged. Production container startup/health still needs verification; a subsequent Railway log exposed missing/invalid public-origin configuration, covered by the startup-origin hotfix and regression tests.
 2. Railway proxy/cookie/IP configuration, live Telegram/Bale webhook/polling/payment/backup delivery, load/soak comparison and measured billing. No numerical cost savings are asserted.
 3. Full screen-by-screen frontend decomposition, assistive-technology testing, exhaustive fa/en/ru translation/UX review and broader failure-injection coverage.
 4. Any multi-process/replica support. Keep one process/replica; SQL locks alone do not coordinate local caches, restore gates, throttles or broadcast ownership.
