@@ -1,83 +1,59 @@
-# Kanar Anonymous Chat — کانار چت ناشناس
+# هم‌چت / HamChat
 
-> **v2.5** — review hardening release. **Complete, categorized in-bot admin panel** (Telegram + Bale, one shared codebase): users/referrals/payments, reports with resolve actions, bans with revoke, appeals review, dictionary + allowlist + media switches, matching/privacy/daily-reward settings, store packages + gateway switches, broadcast campaign control, backups/restore, platforms, audit log, monitoring, admin management — every list paginated and every row actionable. The user lookup box accepts a numeric platform id, the internal row id, `@username` (case-insensitive), the public id or `platform:id`, and shows a picker when several users share a username. **Stale-keyboard fix:** chat controls live on ONE panel, relayed messages carry no keyboard, ending a chat turns the panel into a «find a new partner» CTA (`editMessageReplyMarkup`, supported on both platforms), and pressing a dead `next` button no longer re-queues the user. **Data-safety fixes:** FK-safe account deletion and expired-chat purge (Postgres used to reject the transaction), payment-gate enforcement on `buy_*` callbacks, scheduled broadcasts now actually run, `/health` reports the real maintenance state, deep-copied settings, `credit(0)` no-op. **Performance:** dashboard hourly/daily series grouped (≈100 queries → 8), chats/reports/payments/referrals/tickets/bans/store N+1 removed, broadcast runner flushes progress in batches. **UX:** cancel for every text step, clearer expired-button answer, Bale rate capped at its documented 20 msg/s.
+Anonymous chat bots for Telegram and Bale, with a Persian RTL web administration panel, PostgreSQL, matching, moderation, wallet/payments, and encrypted backup/restore.
 
-> **v2.4** — growth & reliability release: age-group separation removed (matching open to all ages, chats are fully moderated), friends list (chat-options add-friend + main-menu friends list with anonymous DM), admin actions notify the user's PV (coins/ban/unban — also fixed the dead `admub_`/`admuc_` buttons), signup funnel on the dashboard, admin session survives deploys (stateless CSRF + 30-day trusted-device cookie), panel error-boundary overlay, users-list N+1 fixed, polling hardened with auto alerts (polling down / webhook backlog / scheduler crash / backup failure) to the owner's Telegram PV, signup-rescue reminders (3-stage cadence, daily cap) with bot-blocked isolation list + auto-restore, first-match waiting nudge at 60s (user stays queued), referral upgraded (50 coins/party, top-inviter list, share button), stronger anon-link copy + post-signup anon-message landing, segmented broadcasts (incomplete / inactive-7d / low-balance), light gamification (levels, stats, daily-bonus streak).
+## Hardening revision (2026-11-28)
 
-> **v2.2** — display-name profanity filter (word lists in `app/profanity.py`), report reason step, coin store with changeable rates (500 Toman = 1 coin, 1 Star = 20 coins) + custom amounts + Telegram Stars, birthdate-based registration (Jalali/Gregorian, age confirmation, min age 13), Telegram/Bale send throttling with 429 cooldown, dual invite links, restructured menus, Railway data-persistence guard.
+- Refresh-safe panel sessions/CSRF, password rotation without forced logout of the current browser, server-side paginated user search (including old users, `@username`, IDs and Persian digits).
+- **No TOTP requirement or enrollment.** The existing age policy is unchanged; an age-policy decision is still pending. Do not assume verified ages or separated minor/adult pools.
+- Encrypted bounded backups, real file upload/validation and owner-password-confirmed restore; durable PostgreSQL inbox/retry, atomic wallet updates and server-side invoice orders.
+- Batched matching/broadcasts, bounded local caches/maps, precompressed versioned assets and local fonts. No measured Railway savings are claimed.
 
-Anonymous stranger-chat platform: Telegram ↔ Telegram, Bale ↔ Bale, and cross-platform Telegram ↔ Bale, with one Python codebase and one shared PostgreSQL database. Coins economy, moderation, in-bot admin panels, a Persian RTL Super Admin web panel, and daily encrypted DB backups delivered to the owner's Telegram.
+This repository supports **one process / one replica**. See the documented delivery/crash and multi-process limitations before deployment. No change to a deployed service is implied by these source changes.
 
-## Stack
-Python 3.12 · asyncio · FastAPI · HTTPX · SQLAlchemy 2 async · PostgreSQL (SQLite for dev/tests) · Argon2id · AES-256-GCM · Docker · Railway.
+## Local start
 
-## Layout
-- `app/` — application package
-  - `config.py` settings · `db.py` models · `security.py` crypto/TOTP · `moderation.py` filters · `i18n.py` fa/en/ru · `service.py` business logic · `platform.py` Telegram+Bale adapters · `bot.py` user bot · `bot_admin.py` in-bot admin panels · `backup.py` backup/restore engine · `webadmin.py` Super Admin REST API · `main.py` entrypoint (webhooks + schedulers + SPA)
-- `webadmin/index.html` — built single-file Super Admin frontend (from admin.zip)
-- `tests/test_all.py` — pytest suite (99 tests)
-- `docs/` — architecture, security, backup, deployment, compliance, platform capabilities, costs, competitors
-
-## Quick start (local)
-```bash
-cp .env.example .env   # fill tokens/secrets
-pip install -r requirements.txt
-python -m app.main     # serves web panel + bots (polling fallback when PUBLIC_URL empty)
+```sh
+python3 -m venv .venv
+.venv/bin/pip install --require-hashes -r requirements.txt
+cp .env.example .env
+# For local SQLite, remove DATABASE_URL or use sqlite+aiosqlite:///./kanarchat.db.
+# Set secrets, owner IDs, bot tokens and one-time admin bootstrap credentials.
+# PUBLIC_URL can be empty locally (polling); Railway requires HTTPS + PostgreSQL.
+.venv/bin/python -m app.main
 ```
 
-## Tests
-```bash
-python -m pytest tests/ -q
+The service binds `0.0.0.0:$PORT` (default 8000), serves the panel and `/health`. `ADMIN_PANEL_USERNAME` / `ADMIN_PANEL_PASSWORD` are used **once**, never to reset a changed password on redeploy. All production secrets and persistent PostgreSQL must be configured explicitly. `.env.example` is the environment reference; do not paste another operator's IDs or secrets.
+
+Bale uses long polling; Telegram uses webhooks when configured, falling back to polling if registration fails. Backup delivery uses the product Telegram bot; its owner must have started that bot.
+
+## Build and test
+
+```sh
+.venv/bin/pip install pytest==9.2.0 pytest-asyncio==1.5.0
+.venv/bin/python -m pytest tests/ -q
+npm ci
+npm run build:panel
+npm run check:panel
+npm run test:postgres
 ```
 
-## Railway deploy
-See `docs/DEPLOYMENT.md`. Set the variables from `.env.example` (esp. `DATABASE_URL`, `PUBLIC_URL`, `ENCRYPTION_KEY`, `BACKUP_PASSWORD`, `WEBHOOK_SECRET`, tokens), then deploy the Dockerfile. Health: `/health`.
+The default tests use disposable SQLite; PostgreSQL-only tests skip without an isolated database. The embedded PostgreSQL harness never uses the deployment database. See [test safety and browser prerequisites](docs/DEPLOYMENT.md#local-development-and-tests).
 
-## Environment variables (empty template)
+Frontend editable recovered sources live in `frontend/`; checked-in deployable outputs are in `webadmin/`. The original JSX project was not supplied. The build is reproducible, but the recovered bundle is **not a fully decomposed component source tree**; see [frontend notes](frontend/README.md).
 
-Copy the block into Railway → Variables (or a local `.env`) and fill in your own values. Railway injects `DATABASE_URL` (when a Postgres service is attached), `PORT` and `RAILWAY_*` automatically — do not set those by hand. Empty values are ignored and fall back to the built-in defaults, so pasting the whole block as-is is safe.
+`requirements.in` contains direct dependency constraints; `requirements.txt` is the exact transitive hash lock consumed by Docker. Update deliberately with `pip-compile --generate-hashes --strip-extras requirements.in`, audit, and retest. Node is needed for development/tests, not the production image.
 
-```
-DATABASE_URL=
-TELEGRAM_BOT_TOKEN=
-BALE_BOT_TOKEN=
-BALE_PROVIDER_TOKEN=
-DELIVERY_BOT_TOKEN=
-ENCRYPTION_KEY=
-BACKUP_PASSWORD=
-WEBHOOK_SECRET=
-PUBLIC_URL=
-ADMIN_TELEGRAM_IDS=
-ADMIN_BALE_IDS=
-BACKUP_OWNER_TELEGRAM_ID=
-BACKUP_HOUR_TEHRAN=
-ADMIN_PANEL_USERNAME=
-ADMIN_PANEL_PASSWORD=
-CROSS_MEDIA_MAX_BYTES=
-TELEGRAM_CHUNK_BYTES=
-ALLOW_SQLITE_ON_RAILWAY=
-```
+## Code map
 
-| Variable | Purpose |
-| --- | --- |
-| `DATABASE_URL` | PostgreSQL URL (Railway injects it when Postgres is attached; SQLite is used for local dev) |
-| `TELEGRAM_BOT_TOKEN` / `BALE_BOT_TOKEN` | Platform bot tokens from Telegram @BotFather / Bale @BotFather |
-| `BALE_PROVIDER_TOKEN` | Bale wallet payment token ("پرداخت در بازوها") — empty keeps Bale payments disabled |
-| `DELIVERY_BOT_TOKEN` | Separate bot used only for one-time credential / backup-password delivery |
-| `ENCRYPTION_KEY` | 32-byte key for AES-256-GCM message encryption |
-| `BACKUP_PASSWORD` | Passphrase for the daily encrypted DB backup |
-| `WEBHOOK_SECRET` | Shared secret between the platform webhook and the app |
-| `PUBLIC_URL` | Public HTTPS URL (webhook mode; empty → long polling fallback) |
+- `app/main.py`: lifecycle, webhooks, scheduler, static serving.
+- `app/inbox.py`, `orders.py`, `limits.py`, `http_limits.py`: durable ingress, payment validation and resource limits.
+- `app/db.py`, `migrations.py`, `service.py`: models, versioned forward migrations, atomic economy and matching.
+- `app/bot.py`, `bot_admin.py`, `panels.py`, `i18n.py`: bot flows, roles, chat-bound controls, translations.
+- `app/backup.py`, `uploads.py`, `security.py`: backup/restore, temporary uploads, password/session cryptography.
+- `app/webadmin.py`, `telemetry.py`: authorized panel API and measured monitoring.
+- `tests/`: baseline, security/UX/failure regressions and real PostgreSQL concurrency tests.
 
-> **v2.4.2 — Bale runs on long polling always.** Bale's servers accept `setWebhook`
-> (200 OK) but never actually deliver updates to Railway, while outbound
-> `tapi.bale.ai` calls are reliable — so the app registers webhooks for Telegram
-> only, clears the stale Bale registration via `deleteWebhook`, and consumes
-> Bale updates with a long-poll loop (`/health` → `modes.bale: "polling"`).
-| `ADMIN_TELEGRAM_IDS` / `ADMIN_BALE_IDS` | Owner user IDs per platform (comma separated) |
-| `BACKUP_OWNER_TELEGRAM_ID` | Telegram ID that receives the daily 03:00 (Asia/Tehran) backup |
-| `BACKUP_HOUR_TEHRAN` | Backup hour in Tehran time (default 3) |
-| `ADMIN_PANEL_USERNAME` / `ADMIN_PANEL_PASSWORD` | Super Admin web panel bootstrap credentials (reconciled at every startup) |
-| `CROSS_MEDIA_MAX_BYTES` | Cross-platform media relay cap (default 20 MB) |
-| `TELEGRAM_CHUNK_BYTES` | Telegram multipart upload chunk (default 40 MB) |
-| `ALLOW_SQLITE_ON_RAILWAY` | Escape hatch: `1` permits SQLite on Railway (normally guarded against) |
+## Operations
+
+[Deployment/migrations](docs/DEPLOYMENT.md) · [Security](docs/SECURITY.md) · [Backup/restore](docs/BACKUP_RESTORE.md) · [Architecture](docs/ARCHITECTURE.md) · [Privacy/age policy](docs/COMPLIANCE.md) · [Resources/cost measurement](docs/COSTS.md)

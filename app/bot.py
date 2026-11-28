@@ -8,7 +8,7 @@ from typing import Optional
 
 from sqlalchemy import delete, func, select
 
-from . import service
+from . import service, orders
 from .config import RUNTIME, settings
 from .db import (AnonThread, Block, Chat, ChatMessage, Friend, MediaType, Payment,
                  QueueEntry, Report, StorePackage, User, session_scope, utcnow)
@@ -70,25 +70,28 @@ async def send(user: User, key: str, keyboard=None, reply_to=None,
 
 
 async def send_controls(user: User, chat_id: int, key: str = "chat_controls_hint",
-                        text: Optional[str] = None, keyboard=None) -> None:
+                        text: Optional[str] = None, keyboard=None) -> bool:
     """Send/refresh the ONE chat-control panel of an active chat.
 
     The panel is tagged with the chat id so panels.retire_chat() can turn it
     into a search CTA the moment the chat ends (v2.5 stale-keyboard fix)."""
     adp = adapter(user.platform)
     if not adp:
-        return
+        return False
     kb_ = keyboard if keyboard is not None else chat_controls(user.language)
     txt = text if text is not None else tr(user.language, key)
     try:
         from . import panels
         await panels.send(adp, user.platform, user.platform_user_id, txt,
                           keyboard=kb_, kind="chat", chat_id=chat_id)
+        return True
     except PlatformError as exc:
         if exc.error_code in (400, 403):
             await growth.mark_bot_blocked(user.id, user.platform, str(exc))
         log.warning("control panel send failed to %s/%s: %s",
                     user.platform, user.public_id, exc)
+
+    return False
 
 
 async def retire_controls(user: User, chat_id: int) -> None:
@@ -134,7 +137,8 @@ async def main_menu(user: User) -> None:
     rows.append([btn(tr(lang, "btn_help"), "help")])
     if await _is_admin(user):
         rows.append([btn(tr(lang, "btn_admin"), "admin_open")])
-    await send(user, "main_menu", keyboard=kb(*rows))
+    await send(user, "main_menu", keyboard=kb(*rows), kind="chat" if chatting else "panel",
+               chat_id=chatting.id if chatting else None)
 
 
 async def show_rewards(user: User) -> None:
@@ -172,20 +176,16 @@ async def show_friends(user: User, page: int = 0) -> None:
     lang = user.language
     async with session_scope() as s:
         u = await s.get(User, user.id)
-        rows_q = (await s.execute(select(Friend).where(Friend.user_id == u.id)
-                                  .order_by(Friend.id.desc()))).scalars()
-        friends = list(rows_q)
-        people = []
-        for f in friends:
-            p = await s.get(User, f.friend_id)
-            if p and p.status == "active":
-                people.append(p)
-    count = len(people)
+        query = select(User).join(Friend, Friend.friend_id == User.id).where(
+            Friend.user_id == u.id, User.status == "active")
+        count = (await s.execute(select(func.count()).select_from(query.subquery()))).scalar_one()
+        page = min(max(0, page), max(0,(count-1)//FRIENDS_PAGE))
+        start = page * FRIENDS_PAGE
+        chunk = list((await s.execute(query.order_by(Friend.id.desc())
+            .offset(start).limit(FRIENDS_PAGE))).scalars())
     if count == 0:
         await send(user, "friends_empty", keyboard=back_kb(lang))
         return
-    start = max(0, page) * FRIENDS_PAGE
-    chunk = people[start:start + FRIENDS_PAGE]
     kb_rows = []
     for p in chunk:
         kb_rows.append([btn(f"💬 {p.display_name}", f"frdm_{p.id}"),
@@ -297,6 +297,9 @@ async def cmd_start(user: User, payload: str = "") -> None:
         if u.status == "deleted":
             u.status = "active"
             u.deleted_at = None
+        if not payload and needs_registration(u) and (u.state or {}).get("step"):
+            await resume_registration(u)
+            return
         # --- deep-link payloads work for BOTH new and already-registered users ---
         anon_code = None
         if payload.startswith("msg_"):
@@ -407,7 +410,7 @@ REG_CB_DATA = ("accept_rules", "back_name", "resume_signup")
 
 
 def needs_registration(u: User) -> bool:
-    return u.age == 0 or not u.accepted_rules_at
+    return u.age == 0 or not u.accepted_rules_at or (u.state or {}).get("step") == "gender"
 
 
 def _reg_callback(data: str) -> bool:
@@ -428,6 +431,41 @@ async def resume_registration(user: User) -> None:
     if (user.state or {}).get("step") == "name":
         await send(user, "reg_resume_hint")
         await send(user, "ask_name")
+        return
+    state = user.state or {}
+    step = state.get("step")
+    cal = state.get("calendar", "jalali")
+    await send(user, "reg_resume_hint")
+    if step == "gender":
+        await send(user,"ask_gender",keyboard=kb([btn(tr(user.language,"girl"),"reg_female"),btn(tr(user.language,"boy"),"reg_male")]))
+        return
+    if step == "birth_calendar":
+        await send(user,"birth_intro",keyboard=kb(
+            [btn(tr(user.language,"birth_jalali"),"bcal_jalali"),btn(tr(user.language,"birth_gregorian"),"bcal_gregorian")],
+            [btn(tr(user.language,"btn_back_step"),"back_name")]))
+        return
+    if step == "birth_month" and state.get("year"):
+        months = _months_for(user.language,cal)
+        rows = [[btn(months[i].strip(),f"bmon_{i+1}"),btn(months[i+6].strip(),f"bmon_{i+7}")] for i in range(6)]
+        await send(user,"birthday_ask_month",keyboard=rows+[[btn(tr(user.language,"btn_back_step"),"bmon_back")]])
+        return
+    if step == "birth_day" and state.get("year") and state.get("month"):
+        month = state["month"]
+        maxday = service.birthday_month_days(cal,state["year"],month)
+        rows = [[btn(str(d),f"bday_{d}") for d in range(i+1,min(i+6,maxday)+1)] for i in range(0,maxday,6)]
+        await send(user,"birthday_ask_day",month=_months_for(user.language,cal)[month-1].strip(),maxday=maxday,
+            keyboard=rows+[[btn(tr(user.language,"btn_back_step"),"bday_back")]])
+        return
+    if step == "birth_confirm" and all(state.get(k) for k in ("year","month","day")):
+        birth = (state["year"],state["month"],state["day"])
+        if cal == "jalali":
+            birth = service.jalali_to_gregorian(*birth)
+        await send(user,"age_confirm_q",age=service.compute_age_from_birthday(*birth),keyboard=kb(
+            [btn(tr(user.language,"age_confirm_yes"),"bage_ok")],
+            [btn(tr(user.language,"btn_back_step"),"bage_back"),btn(tr(user.language,"age_confirm_no"),"bage_redo")]))
+        return
+    if step == "birth_year":
+        await send_birth_year_page(user,int(state.get("page",0)))
         return
     cal = (user.state or {}).get("calendar", "jalali")
     user.state = _st_with_after(user.state, {"step": "birth_year", "calendar": cal, "page": 0,
@@ -556,6 +594,9 @@ async def deliver_anon_message(session, sender: User, owner: User, text: str,
                                is_reply: bool = False) -> bool:
     """Deliver an anonymous message to the link owner with action buttons.
     Creates/updates the AnonThread. Returns True when delivered."""
+    from .limits import message_limiter
+    if not message_limiter.allow(f"dm:{sender.id}", 10, 60):
+        return False
     blocked = await session.execute(select(Block).where(
         Block.blocker_id == owner.id, Block.blocked_id == sender.id))
     if blocked.scalar_one_or_none():
@@ -708,6 +749,10 @@ async def direct_message_flow(user: User, target_text: str) -> None:
 
 async def deliver_direct_message(sender: User, target_id: Optional[int], text: str) -> None:
     """Deliver anonymously; NEVER reveal the outcome to the sender (item 14)."""
+    from .limits import message_limiter
+    if not message_limiter.allow(f"dm:{sender.id}", 10, 60):
+        await send(sender, "direct_msg_neutral")
+        return
     async with session_scope() as s:
         u = await s.get(User, sender.id)
         u.state = None
@@ -789,7 +834,9 @@ async def send_gift_invoice(user: User, coins: int) -> None:
             return
         partner = await partner_of(s, chat, user)
         store_cfg = await service.get_setting(s, "store")
-        payload = f"gift:{coins}:{user.id}:{partner.id}"
+        amount = service.coins_price_stars(store_cfg, coins) if user.platform == "telegram" else service.coins_price_toman(store_cfg, coins) * 10
+        payload = await orders.create(s, user, coins, amount, recipient=partner)
+        await s.commit()
         try:
             if user.platform == "telegram":
                 await adp.send_invoice(user.platform_user_id, f"🎁 هدیه {coins} سکه",
@@ -880,45 +927,47 @@ async def invite_recently_active(seeker: User) -> None:
 
 
 async def run_match_cycle() -> None:
-    """Try to pair queued users; notify both on success.
-
-    v2.5: the match card is the chat's ONE control panel (tagged with the chat
-    id). Relayed messages carry no keyboard at all, and when the chat ends the
-    panel's keyboard is swapped for a «find a new partner» CTA."""
-    while True:
+    # At most 20 pairs per invocation; the scheduler handles further work.
+    for _ in range(20):
         async with session_scope() as s:
             matched = await service.try_match(s)
             if not matched:
                 return
             ua, ub, _charged = matched
-            chat_id = None
+            chat = await service.active_chat_for(s, ua.id)
+            chat_id = chat.id
+        delivered = []
+        for me, other in ((ua,ub),(ub,ua)):
+            card = tr(me.language, "matched", name=other.display_name, age=other.age,
+                gender=GENDER_LABEL.get(other.gender or "male", GENDER_LABEL["male"])[me.language], bio=other.bio or "")
+            adp = adapter(me.platform)
             try:
-                row = await service.active_chat_for(s, ua.id)
-                chat_id = row.id if row else None
-            except Exception:
-                chat_id = None
-            if not chat_id:
-                chat_id = 0
-            for me, other in ((ua, ub), (ub, ua)):
-                gender = GENDER_LABEL.get(other.gender or "male", GENDER_LABEL["male"])[me.language]
-                bio = other.bio or ""
-                card = tr(me.language, "matched", name=other.display_name, age=other.age,
-                          gender=gender, bio=bio)
-                adp = adapter(me.platform)
-                if adp is None:
-                    continue
-                try:
-                    if other.photo_file_id and other.platform == me.platform:
-                        await adp.send_media(me.platform_user_id, "photo", other.photo_file_id,
-                                             caption=card)
-                        await send_controls(me, chat_id or 0,
-                                            text="⬇️💬 دکمه‌های کنترل گفتگو:")
-                    else:
-                        if other.platform != me.platform:
-                            card += "\n" + tr(me.language, "default_avatar")
-                        await send_controls(me, chat_id or 0, text=card)
-                except PlatformError as exc:
-                    log.warning("match notify failed: %s", exc)
+                if other.photo_file_id and other.platform == me.platform and adp:
+                    await adp.send_media(me.platform_user_id, "photo", other.photo_file_id, caption=card)
+                delivered.append(await send_controls(me, chat_id, text=card))
+            except PlatformError:
+                delivered.append(False)
+        if all(delivered):
+            continue
+        # Never leave someone paying for an unreachable partner.
+        async with session_scope() as s:
+            chat = await s.get(Chat, chat_id)
+            if chat and chat.status == "active":
+                chat.status, chat.end_reason, chat.ended_at = "terminated", "delivery_failed", service.utcnow()
+                for person in (ua,ub):
+                    user = await s.get(User,person.id)
+                    from .db import CoinTransaction
+                    charge = (await s.execute(select(CoinTransaction).where(
+                        CoinTransaction.user_id == user.id, CoinTransaction.type == "gender_filter_cost",
+                        CoinTransaction.reference_id == f"chat:{chat_id}")
+                        .order_by(CoinTransaction.id.desc()).limit(1))).scalar_one_or_none()
+                    if charge:
+                        await service.credit(s,user,-charge.amount,"refund","عدم دسترسی به هم‌صحبت",
+                            idempotency_key=f"match_refund:{chat_id}:{user.id}")
+        for index,user in enumerate((ua,ub)):
+            if delivered[index]:
+                await retire_controls(user,chat_id)
+                await send(user,"partner_left",keyboard=search_cta(user.language))
 
 
 async def do_next(user: User) -> None:
@@ -1186,7 +1235,11 @@ async def birth_year_chosen(user: User, year: int) -> None:
 async def birth_month_chosen(user: User, month: int) -> None:
     state = user.state or {}
     calendar = state.get("calendar", "jalali")
-    maxday = 31 if calendar == "gregorian" else service.JALALI_MONTH_DAYS[month - 1]
+    try:
+        maxday = service.birthday_month_days(calendar,int(state.get("year") or 0),month)
+    except (ValueError, TypeError):
+        await send(user,"invalid_input")
+        return
     async with session_scope() as s:
         u = await s.get(User, user.id)
         u.state = _st_with_after(u.state, {"step": "birth_day", "calendar": calendar,
@@ -1205,12 +1258,14 @@ async def birth_day_chosen(user: User, day: int) -> None:
     calendar = state.get("calendar", "jalali")
     year = state.get("year")
     month = state.get("month", 1)
-    maxday = state.get("maxday", 31)
+    try:
+        maxday = service.birthday_month_days(calendar,int(year or 0),month)
+    except (ValueError, TypeError):
+        await send(user,"invalid_input")
+        return
     if not year or not (1 <= day <= maxday):
         await send(user, "invalid_input")
         return
-    if calendar == "jalali" and month == 12 and day == 30:
-        day = 29  # esfand 30 only in leap years — clamp
     if calendar == "jalali":
         gy, gm, gd = service.jalali_to_gregorian(year, month, day)
     else:
@@ -1505,7 +1560,11 @@ async def start_custom_invoice(user: User, coins: int) -> None:
             await send(u, "pay_unavailable")
             return
         u.state = None
-        payload = f"custom:{coins}:{u.id}"
+        if not store_cfg.get("customMinCoins", 10) <= coins <= store_cfg.get("customMaxCoins", 5000):
+            return
+        amount = service.coins_price_stars(store_cfg, coins) if u.platform == "telegram" else service.coins_price_toman(store_cfg, coins) * 10
+        payload = await orders.create(s, u, coins, amount)
+        await s.commit()
         title = tr(u.language, "custom_invoice_title", coins=coins)
         desc = tr(u.language, "invoice_desc")
         try:
@@ -1532,12 +1591,14 @@ async def start_purchase(user: User, package_id: str) -> None:
     async with session_scope() as s:
         pkg = await s.get(StorePackage, package_id)
         u = await s.get(User, user.id)
-        if not pkg:
+        if not pkg or not pkg.active:
             return
         # v2.4.4: price is computed from the store rate so the configured
         # Toman/coin (and coins-per-Star) rate applies to ALL packages.
         store_cfg = await service.get_setting(s, "store")
-        payload = f"pkg:{pkg.id}:{u.id}"
+        amount = service.coins_price_stars(store_cfg, pkg.coins) if u.platform == "telegram" else service.coins_price_toman(store_cfg, pkg.coins) * 10
+        payload = await orders.create(s, u, pkg.coins, amount, package_id=pkg.id)
+        await s.commit()
         try:
             if u.platform == "telegram":
                 await adp.send_invoice(u.platform_user_id, f"🪙 {pkg.coins} سکه هم‌چت",
@@ -1560,88 +1621,18 @@ async def handle_pre_checkout(platform: str, query: dict) -> None:
     adp = adapter(platform)
     if not adp:
         return
-    ok = bool(query.get("invoice_payload"))
+    async with session_scope() as s:
+        ok = await orders.find(s, platform, query) is not None
     await adp.call("answerPreCheckoutQuery", {
         "pre_checkout_query_id": query["id"], "ok": ok,
-        **({} if ok else {"error_message": "خطا در پردازش سفارش؛ لطفاً دوباره تلاش کنید."})})
-    log.info("pre_checkout answered (%s): id=%s ok=%s", platform, query.get("id"), ok)
+        **({} if ok else {"error_message": "سفارش معتبر نیست یا منقضی شده؛ فاکتور جدید بگیرید."})})
 
 
 async def handle_successful_payment(platform: str, msg: dict) -> None:
-    sp = msg.get("successful_payment") or {}
-    payload = sp.get("invoice_payload", "")
-    charge = sp.get("telegram_payment_charge_id") or sp.get("provider_payment_charge_id") or ""
-    if not charge:
-        return
-    if payload.startswith("gift:"):
-        # gift flow (item 18): payer pays, PARTNER receives the coins
-        _, coins, payer_id, partner_id = payload.split(":", 3)
-        coins, payer_id, partner_id = int(coins), int(payer_id), int(partner_id)
-        async with session_scope() as s:
-            existing = await s.execute(select(Payment).where(
-                Payment.telegram_payment_charge_id == charge))
-            if existing.scalar_one_or_none():
-                return
-            payer = await s.get(User, payer_id)
-            partner = await s.get(User, partner_id)
-            if not payer or not partner:
-                return
-            s.add(Payment(platform=platform, user_id=payer.id, package_id=f"gift_{coins}",
-                          coins=0, amount=sp.get("total_amount", 0),
-                          currency=sp.get("currency", "XTR"), status="succeeded",
-                          telegram_payment_charge_id=charge,
-                          provider_payment_charge_id=sp.get("provider_payment_charge_id"),
-                          invoice_payload=payload))
-            await service.credit(s, partner, coins, "gift_received",
-                                 "هدیه از هم‌چت ناشناس",
-                                 reference_id=charge, idempotency_key=f"pay:{charge}")
-            await send(payer, "gift_sent_payer", coins=coins)
-            await send(partner, "gift_received", coins=coins)
-        return
-    if payload.startswith("custom:"):
-        # v2.2 (item 3): custom-amount purchase — coins priced via store rates
-        _, coins_raw, user_row_id = payload.split(":", 2)
-        coins = int(coins_raw)
-        async with session_scope() as s:
-            existing = await s.execute(select(Payment).where(
-                Payment.telegram_payment_charge_id == charge))
-            if existing.scalar_one_or_none():
-                return
-            user = await s.get(User, int(user_row_id))
-            if not user:
-                return
-            s.add(Payment(platform=platform, user_id=user.id, package_id="custom",
-                          coins=coins, amount=sp.get("total_amount", 0),
-                          currency=sp.get("currency", "XTR"), status="succeeded",
-                          telegram_payment_charge_id=charge,
-                          provider_payment_charge_id=sp.get("provider_payment_charge_id"),
-                          invoice_payload=payload))
-            await service.credit(s, user, coins, "store_purchase",
-                                 f"خرید دلخواه {coins} سکه",
-                                 reference_id=charge, idempotency_key=f"pay:{charge}")
-            await send(user, "pay_ok", coins=coins)
-        return
-    if not payload.startswith("pkg:"):
-        return
-    _, pkg_id, user_row_id = payload.split(":", 2)
-    async with session_scope() as s:
-        existing = await s.execute(select(Payment).where(
-            Payment.telegram_payment_charge_id == charge))
-        if existing.scalar_one_or_none():
-            return
-        user = await s.get(User, int(user_row_id))
-        pkg = await s.get(StorePackage, pkg_id)
-        if not user or not pkg:
-            return
-        s.add(Payment(platform=platform, user_id=user.id, package_id=pkg.id, coins=pkg.coins,
-                      amount=sp.get("total_amount", 0), currency=sp.get("currency", "XTR"),
-                      status="succeeded", telegram_payment_charge_id=charge,
-                      provider_payment_charge_id=sp.get("provider_payment_charge_id"),
-                      invoice_payload=payload))
-        await service.credit(s, user, pkg.coins, "store_purchase",
-                             f"خرید بسته {pkg.coins} سکه",
-                             reference_id=charge, idempotency_key=f"pay:{charge}")
-        await send(user, "pay_ok", coins=pkg.coins)
+    result = await orders.settle(platform, msg)
+    if result:
+        target, coins = result
+        await send(target, "pay_ok", coins=coins)
 
 
 # ------------------------------------------------------------ text/media ----
@@ -1649,7 +1640,7 @@ async def handle_message(platform: str, msg: dict) -> None:
     adp = adapter(platform)
     from_u = msg.get("from", {})
     text = msg.get("text") or msg.get("caption") or ""
-    if not from_u.get("id"):
+    if not from_u.get("id") or (msg.get("chat") or {}).get("type", "private") != "private":
         return
     async with session_scope() as s:
         res = await s.execute(select(User).where(
@@ -1672,6 +1663,8 @@ async def handle_message(platform: str, msg: dict) -> None:
         # --- registration FSM ---
         state = user.state or {}
         step = state.get("step")
+        if step in {"birth_year", "birth_month", "birth_day", "edit_age", "custom_coins"}:
+            text = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
         if text.startswith("/"):
             await s.commit()
             cmd, _, args = text.partition(" ")
@@ -1699,10 +1692,11 @@ async def handle_message(platform: str, msg: dict) -> None:
         # --- owner forwards a backup file during restore wait-state ---
         doc = msg.get("document")
         if doc:
-            from .bot_admin import RESTORE_WAIT, admin_document
-            if str(user.platform_user_id) in RESTORE_WAIT:
+            from .bot_admin import RESTORE_WAIT, admin_document, cleanup_restore_wait
+            cleanup_restore_wait()
+            if f"{user.platform}:{user.platform_user_id}" in RESTORE_WAIT:
                 try:
-                    data = await adp.download_file(doc["file_id"], 200 * 1024 * 1024)
+                    data = await adp.download_file(doc["file_id"], min(settings.restore_max_bytes,settings.cross_media_max_bytes))
                     if await admin_document(user, data,
                                             caption=msg.get("caption") or "",
                                             filename=doc.get("file_name") or ""):
@@ -1889,6 +1883,9 @@ async def handle_message(platform: str, msg: dict) -> None:
             return
         partner = await partner_of(s, chat, user)
 
+        source_key = f"msg:{platform}:{user.id}:{chat.id}:{msg.get('message_id')}" if msg.get("message_id") is not None else None
+        if source_key and (await s.execute(select(ChatMessage.id).where(ChatMessage.source_key == source_key))).first():
+            return
         # determine message type
         mtype = None
         media = None
@@ -1951,11 +1948,12 @@ async def handle_message(platform: str, msg: dict) -> None:
         cost = eco.get("messageCost", 1)
         if cost > 0:
             txn = await service.debit(s, user, cost, "message_cost", "هزینه ارسال پیام",
-                                      idempotency_key=None)
+                                      idempotency_key=source_key)
             if txn is None:
                 await send(user, "no_coins", keyboard=back_kb(user.language))
                 return
 
+        await s.commit()  # release wallet/connection before waiting on platform I/O
         delivered = False
         padp = adapter(partner.platform)
         try:
@@ -1974,20 +1972,22 @@ async def handle_message(platform: str, msg: dict) -> None:
 
         if not delivered:
             if cost > 0:
-                await service.credit(s, user, cost, "refund", "بازگشت هزینه پیام ارسال‌نشده")
+                await service.credit(s, user, cost, "refund", "بازگشت هزینه پیام ارسال‌نشده",
+                                     idempotency_key=f"refund:{source_key}" if source_key else None)
             await send(user, "invalid_input")
             return
 
         # store message record
-        s.add(ChatMessage(chat_id=chat.id, sender_id=user.id, msg_type=mtype,
+        s.add(ChatMessage(chat_id=chat.id, sender_id=user.id, msg_type=mtype, source_key=source_key,
                           text=text if text else None,
                           media_file_id=(media or {}).get("file_id") if media else None,
                           media_file_unique_id=(media or {}).get("file_unique_id") if media else None,
                           media_size=(media or {}).get("file_size") if media else None,
                           mime=(media or {}).get("mime_type") if media else None))
-        chat.message_count += 1
-        chat.last_activity_at = utcnow()
-        user.total_messages += 1
+        from sqlalchemy import update
+        await s.execute(update(Chat).where(Chat.id == chat.id).values(
+            message_count=Chat.message_count + 1, last_activity_at=utcnow()))
+        await s.execute(update(User).where(User.id == user.id).values(total_messages=User.total_messages + 1))
         # first valid chat activity unlocks referral rewards (spec: first valid chat)
         await service.on_first_chat_completed(s, user)
 
@@ -2045,6 +2045,16 @@ async def handle_callback(platform: str, query: dict) -> None:
         if user is None:
             return
         user.last_seen_at = utcnow()
+        if data.startswith("c:"):
+            try:
+                _, expected_chat, action = data.split(":", 2)
+                current = await service.active_chat_for(s, user.id)
+                if not current or str(current.id) != expected_chat:
+                    await send(user, "not_in_chat", keyboard=search_cta(user.language))
+                    return
+                data = action
+            except ValueError:
+                return
         # v2.4: blocked-bot user pressing any button returns to the active population
         if user.bot_blocked:
             await growth.restore_from_blocklist(user.id)
@@ -2061,6 +2071,8 @@ async def handle_callback(platform: str, query: dict) -> None:
             await resume_registration(user)
             return
         if data.startswith("lang_"):
+            if data[5:] not in LANG_NAMES:
+                return
             user.language = data[5:]
             await send(user, "language_set")
             if not user.accepted_rules_at:
@@ -2445,14 +2457,16 @@ async def process_update(platform: str, upd: dict) -> None:
             or (upd.get("pre_checkout_query") or {}).get("from") or {})
     if _frm.get("is_bot"):
         return
+    from .limits import message_limiter
+    payment = bool((upd.get("message") or {}).get("successful_payment") or upd.get("pre_checkout_query"))
+    if not payment and not message_limiter.allow(f"update:{platform}:{_frm.get('id')}", 120, 60):
+        return
     async with session_scope() as s:
         from .db import ProcessedUpdate
-        try:
-            s.add(ProcessedUpdate(platform=platform, update_id=uid))
-            await s.flush()
-        except Exception:
-            await s.rollback()
-            return  # duplicate update
+        exists = (await s.execute(select(ProcessedUpdate.id).where(
+            ProcessedUpdate.platform == platform, ProcessedUpdate.update_id == uid))).scalar_one_or_none()
+        if exists:
+            return
     try:
         if "message" in upd and upd["message"]:
             msg = upd["message"]
@@ -2478,3 +2492,7 @@ async def process_update(platform: str, upd: dict) -> None:
             await handle_pre_checkout(platform, upd["pre_checkout_query"])
     except Exception:
         log.exception("update processing failed (%s)", platform)
+        raise
+    async with session_scope() as s:
+        from .db import ProcessedUpdate
+        s.add(ProcessedUpdate(platform=platform, update_id=uid))

@@ -64,15 +64,11 @@ def ensure_persistent_database() -> None:
             "DATA SAFETY: running on Railway without a PostgreSQL DATABASE_URL. "
             "A local SQLite file would be erased on every deploy. Attach the "
             "Railway Postgres service (DATABASE_URL is injected automatically) "
-            "and redeploy. Set ALLOW_SQLITE_ON_RAILWAY=1 only for throwaway "
-            "test deployments.")
-    if on_railway and os.getenv("ALLOW_SQLITE_ON_RAILWAY") == "1" \
-            and not settings.database_url.startswith("postgres"):
-        log.warning("ALLOW_SQLITE_ON_RAILWAY=1 — ephemeral SQLite in use; "
-                    "ALL DATA WILL BE LOST ON THE NEXT DEPLOY.")
+            "and redeploy.")
 
 
 async def init_app() -> None:
+    settings.validate_production()
     ensure_persistent_database()
     db.init_engine(settings.database_url)
     engine = db.get_engine()
@@ -83,9 +79,8 @@ async def init_app() -> None:
     widened = await db.ensure_widened_columns(engine)
     if widened:
         log.info("v2.4.1 column widening applied: %s", ", ".join(widened))
-    await _one_shot_boot_restore()
-    async with session_scope() as s:
-        await service.seed(s)
+    from .migrations import migrate
+    await migrate(engine)
     # STABLE webhook path secret: derived from WEBHOOK_SECRET so redeploys never
     # invalidate the URLs registered with Telegram/Bale (v3 fix).
     import hashlib
@@ -97,6 +92,9 @@ async def init_app() -> None:
     if settings.bale_bot_token:
         RUNTIME["adapter_bale"] = BaleAdapter(settings.bale_bot_token,
                                               settings.bale_provider_token)
+    await _one_shot_boot_restore()
+    async with session_scope() as s:
+        await service.seed(s)
     await ensure_webadmin()
     await setup_commands()
     await setup_webhooks()
@@ -216,43 +214,38 @@ async def setup_webhooks() -> None:
 async def ensure_webadmin() -> None:
     """Bootstrap the Owner web-admin.
 
-    v2.3.1: credentials can be pinned via the ADMIN_PANEL_USERNAME /
-    ADMIN_PANEL_PASSWORD variables (Railway) — every startup reconciles the
-    admin account to them (create / rename / password reset). Without them
-    the legacy flow runs once: random credentials delivered by the delivery
-    bot; the plaintext password is never stored or logged."""
+    Environment credentials bootstrap once, never reset a changed password.
+    Without them, generate one-time credentials for private delivery."""
     from sqlalchemy import select as _sel
     async with session_scope() as s:
         admins = list((await s.execute(
             _sel(WebAdmin).order_by(WebAdmin.id))).scalars())
     env_user = (settings.admin_panel_username or "").strip().lower()
     env_pass = (settings.admin_panel_password or "").strip()
-    if env_user:
-        if env_pass and len(env_pass) < 10:
-            log.error("ADMIN_PANEL_PASSWORD is shorter than 10 chars — ignored")
-            env_pass = ""
-        first_admin_id = admins[0].id if admins else None
-        async with session_scope() as s:
-            admin = (await s.execute(
-                _sel(WebAdmin).where(WebAdmin.username == env_user))).scalar_one_or_none()
-            if admin is None:
-                admin = await s.get(WebAdmin, first_admin_id) if first_admin_id else None
-                if admin is None:
-                    s.add(WebAdmin(username=env_user, full_name="مالک هم‌چت", email="",
-                                   password_hash=security.hash_password(env_pass or "!unset!"),
-                                   role="owner", must_change_password=False, status="active"))
-                    log.info("web admin created from ADMIN_PANEL_USERNAME: %s", env_user)
+    # Quarantine accounts created by the old public fallback password.
+    for previous in admins:
+        if await security.password_work(security.verify_password,previous.password_hash,"!unset!"):
+            async with session_scope() as s:
+                old = await s.get(WebAdmin,previous.id)
+                from sqlalchemy import update
+                from .db import WebSession
+                await s.execute(update(WebSession).where(WebSession.admin_id==old.id).values(revoked=True))
+                if env_user and len(env_pass)>=10 and env_pass!="!unset!":
+                    old.password_hash=await security.password_work(security.hash_password,env_pass)
+                    old.must_change_password=True
                 else:
-                    log.info("web admin renamed %s -> %s", admin.username, env_user)
-                    admin.username = env_user
-            if not admin:
-                return
-            if env_pass:
-                admin.password_hash = security.hash_password(env_pass)
-                admin.must_change_password = False
-                log.info("web admin password reconciled from ADMIN_PANEL_PASSWORD: %s", env_user)
-            else:
-                log.warning("ADMIN_PANEL_PASSWORD not set — password for %s unchanged", env_user)
+                    old.status="suspended"
+                    log.critical("unsafe legacy owner account suspended; operator recovery required")
+    if env_user:
+        if not env_pass or len(env_pass) < 10 or env_pass == "!unset!":
+            raise RuntimeError("ADMIN_PANEL_PASSWORD (10+ characters) is required with ADMIN_PANEL_USERNAME")
+        async with session_scope() as s:
+            admin = (await s.execute(_sel(WebAdmin).where(WebAdmin.role == "owner"))).scalars().first()
+            if admin is None:
+                s.add(WebAdmin(username=env_user, full_name="مالک هم‌چت", email="",
+                    password_hash=security.hash_password(env_pass), role="owner",
+                    must_change_password=True, status="active"))
+        # Environment credentials bootstrap ONCE. Never undo a password change on deploy.
         return
     if admins:
         return
@@ -282,46 +275,50 @@ async def ensure_webadmin() -> None:
 
 # ---------------------------------------------------------- schedulers ----
 async def scheduler_loop() -> None:
-    last_purge = 0.0
-    last_daily = ""
-    tick = 0
-    while True:
+    """Independent jobs: one slow or broken task must not skip the rest."""
+    last_purge, last_daily, tick = 0.0, "", 0
+    async def run(job):
+        if RUNTIME.get("restore_in_progress"):
+            return
         try:
-            tick += 1
-            now = utcnow().timestamp()
-            if now - last_purge > 3600:
-                last_purge = now
-                async with session_scope() as s:
-                    stats = await service.purge_expired(s)
-                    if any(stats.values()):
-                        log.info("hourly purge: %s", stats)
-            await expire_bans()
-            await enforce_search_timeout()
-            await enforce_idle_timeout()
-            await run_match_tick()
-            await process_broadcasts()
-            await maybe_daily_backup()
-            # v2.4 growth engine: queue-wait nudge every tick (cheap), signup
-            # rescue + reliability alerts once a minute (every 3rd tick).
-            from . import growth
-            await growth.notify_stale_queue_waiters()
-            if tick % 3 == 0:
-                await growth.rescue_incomplete_signups()
-                await growth.check_alerts()
-            # daily jobs: dynamic ages + birthday greetings (Tehran day)
-            today = service.tehran_day()
-            if last_daily != today:
-                last_daily = today
-                await daily_maintenance_jobs()
+            await asyncio.wait_for(job(), timeout=90)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            log.exception("scheduler tick failed")
+        except Exception:
+            log.exception("scheduler job failed: %s", job.__name__)
             try:
-                from . import growth
-                await growth.report_scheduler_crash(exc)
+                from .growth import report_scheduler_crash
+                await asyncio.wait_for(report_scheduler_crash(RuntimeError(job.__name__)),timeout=5)
             except Exception:
                 pass
+    while True:
+        if RUNTIME.get("restore_in_progress"):
+            await asyncio.sleep(1)
+            continue
+        tick += 1
+        now = asyncio.get_running_loop().time()
+        if now - last_purge > 3600:
+            async def purge():
+                async with session_scope() as s:
+                    await service.purge_expired(s)
+            await run(purge)
+            last_purge = now
+        for job in (expire_bans, enforce_search_timeout, enforce_idle_timeout,
+                    run_match_tick, process_broadcasts, maybe_daily_backup):
+            await run(job)
+        from . import growth
+        await run(growth.notify_stale_queue_waiters)
+        if tick % 3 == 0:
+            await run(growth.rescue_incomplete_signups)
+            await run(growth.check_alerts)
+            from .uploads import cleanup
+            from .bot_admin import cleanup_restore_wait
+            cleanup()
+            cleanup_restore_wait()
+        today = service.tehran_day()
+        if last_daily != today:
+            await run(daily_maintenance_jobs)
+            last_daily = today
         await asyncio.sleep(20)
 
 
@@ -384,34 +381,32 @@ async def enforce_search_timeout() -> None:
     async with session_scope() as s:
         cfg = await service.get_setting(s, "matching")
         cutoff = utcnow() - timedelta(seconds=cfg.get("searchTimeoutSec", 300))
-        stale = (await s.execute(select(QueueEntry).where(
-            QueueEntry.created_at < cutoff))).scalars()
-        for e in stale:
-            u = await s.get(User, e.user_id)
-            await s.delete(e)
-            if u:
-                await bot_mod.send(u, "search_timeout")
-                await bot_mod.main_menu(u)
+        stale = list((await s.execute(select(QueueEntry).where(
+            QueueEntry.created_at < cutoff).limit(50))).scalars())
+        people = list((await s.execute(select(User).where(User.id.in_([e.user_id for e in stale])))).scalars())
+        for entry in stale:
+            await s.delete(entry)
+    for user in people:
+        await bot_mod.send(user, "search_timeout", keyboard=bot_mod.search_cta(user.language))
 
 
 async def enforce_idle_timeout() -> None:
     from . import bot as bot_mod
+    notices = []
     async with session_scope() as s:
         cfg = await service.get_setting(s, "matching")
         cutoff = utcnow() - timedelta(seconds=cfg.get("idleTimeoutSec", 900))
-        stale = (await s.execute(select(Chat).where(
-            Chat.status == "active", Chat.last_activity_at < cutoff))).scalars()
-        for c in stale:
-            cid = c.id
-            await service.end_chat(s, c, "idle_timeout")
-            for uid in (c.user_a_id, c.user_b_id):
-                u = await s.get(User, uid)
-                if u:
-                    await bot_mod.send(u, "chat_idle_timeout")
-                    await bot_mod.main_menu(u)
-                    # v2.5: the chat's control panel must not keep offering
-                    # next/end/report after the timeout ended the chat
-                    await bot_mod.retire_controls(u, cid)
+        stale = list((await s.execute(select(Chat).where(
+            Chat.status == "active", Chat.last_activity_at < cutoff).limit(50))).scalars())
+        for chat in stale:
+            await service.end_chat(s, chat, "idle_timeout")
+            for uid in (chat.user_a_id, chat.user_b_id):
+                user = await s.get(User, uid)
+                if user:
+                    notices.append((user,chat.id))
+    for user,cid in notices:
+        await bot_mod.send(user, "chat_idle_timeout", keyboard=bot_mod.search_cta(user.language))
+        await bot_mod.retire_controls(user,cid)
 
 
 async def run_match_tick() -> None:
@@ -434,8 +429,6 @@ async def promote_scheduled_broadcasts() -> list[int]:
                 camp = await s.get(BroadcastCampaign, cid)
                 if camp:
                     camp.status = "sending"
-            if due_ids:
-                RUNTIME.setdefault("broadcast_queue", []).extend(due_ids)
             return due_ids
     except Exception:
         log.exception("scheduled broadcast promotion failed")
@@ -444,87 +437,58 @@ async def promote_scheduled_broadcasts() -> list[int]:
 
 async def process_broadcasts() -> None:
     await promote_scheduled_broadcasts()
-    queue: list = RUNTIME.get("broadcast_queue") or []
-    if not queue:
-        return
-    bid = queue.pop(0)
     active = RUNTIME.setdefault("broadcast_active", set())
-    if bid in active:
-        queue.append(bid)
+    if active:
         return
-    active.add(bid)
-    spawn(_run_broadcast(bid, active))
+    async with session_scope() as s:
+        bid = (await s.execute(select(BroadcastCampaign.id).where(
+            BroadcastCampaign.status == "sending").order_by(BroadcastCampaign.id).limit(1))).scalar_one_or_none()
+    if bid is not None:
+        active.add(bid)
+        spawn(_run_broadcast(bid, active))
 
 
 async def _run_broadcast(bid: int, active: set) -> None:
-    from .platform import PlatformError as PE
-    # v2.4.5 FIX: this function referenced bot_mod without importing it —
-    # every broadcast died with NameError on the FIRST target (campaign stuck
-    # "sending", delivered 0), while the owner thought the bot ignored them.
     from . import bot as bot_mod
     try:
-        async with session_scope() as s:
-            camp = await s.get(BroadcastCampaign, bid)
-            if not camp or camp.status not in ("sending",):
-                return
-            targets = await service.broadcast_targets(s, camp.audience)
-            camp_id, rate = camp.id, max(1, min(camp.rate_limit_per_sec, 25))
-        delivered = failed = 0
-        failures: dict[str, int] = {}
-        # v2.5 PERF: the old loop opened a DB session (and wrote two counters)
-        # for EVERY recipient — thousands of transactions for a big campaign.
-        # Progress is now flushed every CHECK_EVERY targets and on exit.
-        CHECK_EVERY = 25
-        since_check = 0
-
-        async def _flush(final: bool = False) -> bool:
-            nonlocal since_check
+        while not RUNTIME.get("restore_in_progress"):
             async with session_scope() as s:
-                camp = await s.get(BroadcastCampaign, camp_id)
-                if not camp:
-                    return False
-                if not final and camp.status != "sending":
-                    return False       # paused / cancelled mid-run
-                camp.delivered_count = delivered
-                camp.failed_count = failed
-            since_check = 0
-            return True
-
-        for u in targets:
-            if since_check >= CHECK_EVERY:
-                if not await _flush():
+                camp = await s.get(BroadcastCampaign,bid)
+                if not camp or camp.status != "sending":
                     return
-            since_check += 1
-            adp = bot_mod.adapter(u.platform)
-            if not adp:
-                failed += 1
-                failures["adapter_missing"] = failures.get("adapter_missing", 0) + 1
-                continue
-            try:
-                await adp.send_message(u.platform_user_id, camp.message)
-                delivered += 1
-            except PE as exc:
-                failed += 1
-                # v2.4: users who blocked the bot are isolated automatically so
-                # future broadcasts skip them (excluded from broadcast_targets).
-                if exc.error_code in (400, 403):
-                    from . import growth
-                    await growth.mark_bot_blocked(u.id, u.platform, str(exc))
-                key = str(exc)[:60]
-                failures[key] = failures.get(key, 0) + 1
-            await asyncio.sleep(1.0 / rate)
-        async with session_scope() as s:
-            camp = await s.get(BroadcastCampaign, camp_id)
-            camp.delivered_count = delivered
-            camp.failed_count = failed
-            camp.status = "completed"
-            camp.failure_summary = [{"reason": k, "count": v} for k, v in failures.items()]
+                targets = await service.broadcast_targets(s,camp.audience,camp.last_user_id,25)
+                if not targets:
+                    camp.status = "completed"
+                    return
+                message,rate = camp.message,max(1,min(camp.rate_limit_per_sec,25))
+                delivered,failed,cursor = camp.delivered_count,camp.failed_count,camp.last_user_id
+            for user in targets:
+                if RUNTIME.get("restore_in_progress"):
+                    return
+                adp = bot_mod.adapter(user.platform)
+                try:
+                    if adp is None:
+                        raise PlatformError("sendMessage",503,"adapter unavailable")
+                    await adp.send_message(user.platform_user_id,message)
+                    delivered += 1
+                except PlatformError as exc:
+                    failed += 1
+                    if exc.error_code == 403:
+                        from .growth import mark_bot_blocked
+                        await mark_bot_blocked(user.id,user.platform,str(exc))
+                cursor = user.id
+                await asyncio.sleep(1.0/rate)
+            # Durable cursor: after a hard crash at most one batch can repeat.
+            async with session_scope() as s:
+                camp = await s.get(BroadcastCampaign,bid)
+                if camp:
+                    camp.last_user_id, camp.delivered_count, camp.failed_count = cursor,delivered,failed
     except asyncio.CancelledError:
         raise
     except Exception:
-        log.exception("broadcast %s failed", bid)
+        log.exception("broadcast %s failed",bid)
         async with session_scope() as s:
-            camp = await s.get(BroadcastCampaign, bid)
+            camp = await s.get(BroadcastCampaign,bid)
             if camp:
                 camp.status = "failed"
     finally:
@@ -545,6 +509,10 @@ async def maybe_daily_backup() -> None:
     bot = RUNTIME.get("adapter_telegram")
     if not bot:
         return
+    monotonic = asyncio.get_running_loop().time()
+    if monotonic - RUNTIME.get("backup_last_attempt", -3600) < 300:
+        return
+    RUNTIME["backup_last_attempt"] = monotonic
     log.info("starting scheduled daily backup")
     rec = await backup_mod.run_backup_job(bot, "scheduled_daily")
     log.info("scheduled backup finished: %s", rec.id if rec else "skipped (locked)")
@@ -558,39 +526,19 @@ async def maybe_daily_backup() -> None:
 
 
 async def polling_task(platform: str) -> None:
-    from . import bot as bot_mod
+    from .inbox import enqueue
     adp = RUNTIME.get(f"adapter_{platform}")
     if not adp:
         return
     stop = asyncio.Event()
     log.info("starting long-polling fallback for %s", platform)
-    # v2.4.3 backlog flush: after an outage the platform queue can hold
-    # thousands of stale updates (incident 2026-11-14: 1512 pending on Bale
-    # after the poller died for ~6h). Replaying them spams users with
-    # hours-old state machines, so a huge backlog is dropped instead.
     start_offset = 0
-    try:
-        info = await adp.get_webhook_info()
-        pending = int(info.get("pending_update_count") or 0)
-        if pending > 200:
-            # offset=-1 returns the most recent update (Telegram Bot API
-            # semantics; Bale mirrors it). max() keeps it correct even if a
-            # platform ignores -1 and returns the whole queue.
-            last = await adp.call("getUpdates", {"offset": -1, "limit": 1}) or []
-            if last:
-                start_offset = max(int(u.get("update_id", 0)) for u in last) + 1
-                log.warning("%s: dropping stale backlog of %d pending updates "
-                            "(resume from update_id=%d)", platform, pending,
-                            start_offset)
-    except Exception:
-        log.exception("backlog check failed for %s (continuing from oldest)",
-                      platform)
     # Supervisor: poll_updates returns only when `stop` is set (shutdown). If
     # it ever exits or raises for any other reason, restart it — the poller
     # must never go dark permanently.
     while not stop.is_set():
         try:
-            await adp.poll_updates(lambda upd: bot_mod.process_update(platform, upd),
+            await adp.poll_updates(lambda upd: enqueue(platform, upd),
                                    stop, start_offset=start_offset)
         except asyncio.CancelledError:
             raise
@@ -605,7 +553,9 @@ async def polling_task(platform: str) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_app()
+    from .inbox import worker
     tasks = [asyncio.create_task(scheduler_loop())]
+    tasks.extend(asyncio.create_task(worker(i)) for i in range(max(1, settings.update_workers) + 1))
     for plat in ("telegram", "bale"):
         if RUNTIME.get(f"adapter_{plat}") and not RUNTIME.get(f"webhook_set_{plat}"):
             tasks.append(asyncio.create_task(polling_task(plat)))
@@ -614,15 +564,23 @@ async def lifespan(app: FastAPI):
     yield
     for t in tasks:
         t.cancel()
+    for task in list(_BG_TASKS):
+        task.cancel()
+    await asyncio.gather(*tasks, *list(_BG_TASKS), return_exceptions=True)
     for plat in ("telegram", "bale"):
         adp = RUNTIME.get(f"adapter_{plat}")
         if adp:
             await adp.close()
+    from .uploads import clear_uploads
+    clear_uploads()
     await db.dispose_engine()
 
 
+from .http_limits import BodyLimitMiddleware
+
 app = FastAPI(title="HamChat — Anonymous Chat", lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(BodyLimitMiddleware)
 
 
 @app.middleware("http")
@@ -631,17 +589,42 @@ async def csrf_middleware(request: Request, call_next):
     if (path.startswith("/api/admin/v1") and
             request.method in ("POST", "PUT", "PATCH", "DELETE") and
             not path.endswith(("/auth/login",
-                               "/auth/change-initial-password",
-                               "/auth/logout"))):
+                               "/auth/change-initial-password"))):
         sid = request.cookies.get(SESSION_COOKIE)
         token = request.headers.get("X-CSRF-Token")
         # v2.4: stateless CSRF derived from the session id — admin sessions now
         # survive deploys/restarts (the old in-memory map died on every boot).
         expected = security.csrf_token(sid or "", settings.webhook_secret) if sid else ""
-        if not sid or not expected or token != expected:
+        import secrets
+        if not sid or not expected or not token or not secrets.compare_digest(token.encode(), expected.encode()):
             return JSONResponse({"detail": "توکن CSRF نامعتبر است. دوباره وارد شوید.",
                                  "code": "CSRF"}, status_code=403)
-    return await call_next(request)
+    mutating = request.method in ("POST", "PUT", "PATCH", "DELETE") and path.startswith("/api/")
+    if mutating and RUNTIME.get("restore_in_progress"):
+        return JSONResponse({"detail":"بازیابی در حال اجراست؛ کمی صبر کنید.", "code":"RESTORE_BUSY"}, status_code=503)
+    if mutating:
+        RUNTIME["admin_writes"] = RUNTIME.get("admin_writes", 0) + 1
+    try:
+        response = await call_next(request)
+    finally:
+        if mutating:
+            RUNTIME["admin_writes"] -= 1
+    # Rehydrate CSRF on /me and every authenticated response, including after refresh.
+    sid = request.cookies.get(SESSION_COOKIE)
+    if sid and path.startswith("/api/admin/v1") and path not in ("/api/admin/v1/auth/login", "/api/admin/v1/auth/change-initial-password", "/api/admin/v1/auth/change-password") and response.status_code < 400:
+        response.headers["X-CSRF-Token"] = security.csrf_token(sid, settings.webhook_secret)
+    if path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; "
+        "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'")
+    if settings.public_url.startswith("https://"):
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    return response
 
 
 @app.get("/health")
@@ -655,13 +638,13 @@ async def health():
         db_ok = True
     except Exception:
         db_ok = False
-    return {"status": "ok" if db_ok else "degraded", "db": db_ok,
+    return JSONResponse(status_code=200 if db_ok else 503, content={"status": "ok" if db_ok else "degraded", "db": db_ok,
             "webhooks": {"telegram": bool(RUNTIME.get("webhook_set_telegram")),
                          "bale": bool(RUNTIME.get("webhook_set_bale"))},
             "modes": {"telegram": "webhook" if RUNTIME.get("webhook_set_telegram")
                       else "polling" if RUNTIME.get("adapter_telegram") else "off",
                       "bale": "polling" if RUNTIME.get("adapter_bale") else "off"},
-            "maintenance": maintenance}
+            "maintenance": maintenance})
 
 
 async def _handle_webhook(platform: str, secret: str, request: Request) -> JSONResponse:
@@ -674,12 +657,19 @@ async def _handle_webhook(platform: str, secret: str, request: Request) -> JSONR
         if not adp.verify_webhook_secret(
                 request.headers.get("X-Telegram-Bot-Api-Secret-Token")):
             return JSONResponse({"ok": True}, status_code=403)
+    from .inbox import enqueue, validate_update
+    import json
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > settings.webhook_max_bytes:
+            return JSONResponse({"detail": "Too large"}, status_code=413)
     try:
-        upd = await request.json()
-    except Exception:
-        return JSONResponse({"ok": True})
-    from . import bot as bot_mod
-    spawn(bot_mod.process_update(platform, upd))
+        upd = json.loads(raw)
+        validate_update(upd)
+    except (ValueError, TypeError):
+        return JSONResponse({"detail": "Invalid update"}, status_code=400)
+    await enqueue(platform, upd)  # database errors return 5xx; platform must retry
     return JSONResponse({"ok": True})
 
 
@@ -714,20 +704,24 @@ async def apierr_flat_handler(request: Request, exc: ApiErr):
 async def index():
     f = WEB_DIR / "index.html"
     if f.exists():
-        return FileResponse(f)
+        return FileResponse(f, headers={"Cache-Control":"no-cache"})
     return JSONResponse({"app": "kanar", "panel": "webadmin bundle missing"})
 
 
 @app.get("/{full_path:path}")
-async def spa(full_path: str):
+async def spa(full_path: str, request: Request):
     if full_path.startswith(("api/", "webhook/", "health")):
         return JSONResponse({"detail": "Not Found"}, status_code=404)
     f = (WEB_DIR / full_path).resolve()
-    if str(f).startswith(str(WEB_DIR.resolve())) and f.is_file():
-        return FileResponse(f)
+    if f.is_relative_to(WEB_DIR.resolve()) and f.is_file():
+        headers = {"Cache-Control":"public, max-age=86400"} if f.suffix in (".js", ".css", ".woff2") else {"Cache-Control":"no-cache"}
+        if f.suffix in (".js", ".css") and "gzip" in request.headers.get("accept-encoding", "") and f.with_suffix(f.suffix+".gz").exists():
+            return FileResponse(f.with_suffix(f.suffix+".gz"), media_type="text/javascript" if f.suffix==".js" else "text/css",
+                headers={**headers,"Content-Encoding":"gzip","Vary":"Accept-Encoding"})
+        return FileResponse(f, headers={**headers,"Vary":"Accept-Encoding"})
     f = WEB_DIR / "index.html"
     if f.exists():
-        return FileResponse(f)
+        return FileResponse(f, headers={"Cache-Control":"no-cache"})
     return JSONResponse({"detail": "Not Found"}, status_code=404)
 
 
@@ -754,8 +748,8 @@ def main() -> None:
 
     for _name in ("httpx", "httpcore"):
         logging.getLogger(_name).addFilter(_RedactBotTokens())
-    uvicorn.run("app.main:app", host="0.0.0.0", port=settings.port,
-                log_level="info", access_log=False)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=settings.port, proxy_headers=False,
+                log_level="info", access_log=False, limit_concurrency=100)
 
 
 if __name__ == "__main__":

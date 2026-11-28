@@ -172,3 +172,19 @@ def random_backup_password() -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
     raw = "".join(secrets.choice(alphabet) for _ in range(32))
     return "-".join(raw[i:i + 8] for i in range(0, 32, 8))
+
+
+# Argon2 uses ~64 MiB per operation. Never let login floods allocate N hashes
+# concurrently or block the event loop that relays chats.
+_password_gate = None
+_password_loop = None
+
+
+async def password_work(function, *args):
+    import asyncio
+    global _password_gate, _password_loop
+    loop = asyncio.get_running_loop()
+    if _password_loop is not loop:
+        _password_gate, _password_loop = asyncio.Semaphore(2), loop
+    async with _password_gate:
+        return await asyncio.to_thread(function, *args)

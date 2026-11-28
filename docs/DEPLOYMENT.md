@@ -1,31 +1,44 @@
-# Deployment (Railway)
+# Deployment and verification — 2026-11-28
 
-Target project: `satisfied-fulfillment`, service name: `kanarchat`.
+## Supported topology
+One Python service, **one process / one replica**, one persistent PostgreSQL database. No Redis or separate worker is required. Durable inbox workers, schedulers, bot adapters and FastAPI run together. Do not add `--workers` or replicas: cache invalidation, ordering partitions, broadcasts, throttles and restore gates are partly process-local. PostgreSQL row/advisory locks do not remove this restriction.
 
-1. Create service `kanarchat` (Dockerfile builder) and add the Railway **PostgreSQL** service; `DATABASE_URL` is injected automatically.
-2. Set variables (see `.env.example`): `TELEGRAM_BOT_TOKEN`, `BALE_BOT_TOKEN`, `BALE_PROVIDER_TOKEN` (optional; empty keeps Bale payments disabled), `DELIVERY_BOT_TOKEN`, `ENCRYPTION_KEY`, `BACKUP_PASSWORD`, `WEBHOOK_SECRET`, `ADMIN_TELEGRAM_IDS=860835914`, `ADMIN_BALE_IDS=133609405`, `PUBLIC_URL=https://<service>.up.railway.app`.
-3. Generate a public domain on the service; the app listens on `$PORT`.
-4. `railway.json` sets healthcheck `/health` (timeout 300s), restart ON_FAILURE (10 retries).
-5. On boot the app runs migrations via `create_all`, seeds defaults (store packages, roles, media types, moderation dictionary), sets bot commands, registers webhooks (`/webhook/telegram/<secret>`, `/webhook/bale/<secret>`), and starts schedulers. First boot also creates the initial web-admin Owner account and DMs the credentials via the delivery bot (change password + TOTP enrollment are enforced).
-6. Free/Trial plan limits (verified 2026-11): $5 one-time credit / 30 days, 2 vCPU / 1 GB RAM per service, 1 GB ephemeral disk, Postgres volume 0.5 GB, 1 custom domain/service, no ALWAYS restart policy. Botted traffic must stay within these; upgrade to Hobby ($5/mo) to persist volumes beyond trial.
+## Before Railway deployment
+1. Back up the existing PostgreSQL service at provider level and validate an encrypted application archive in an isolated database. Review existing duplicate active chats and negative balances before migration.
+2. Attach PostgreSQL and set `DATABASE_URL` via Railway's service reference. Never copy a local SQLite URL to Railway. Production startup rejects SQLite (including the former `ALLOW_SQLITE_ON_RAILWAY` escape hatch).
+3. Configure three independent secrets (`ENCRYPTION_KEY`, `BACKUP_PASSWORD`, `WEBHOOK_SECRET`, >=24 characters each), bot tokens, explicit platform owner IDs and `BACKUP_OWNER_TELEGRAM_ID`. Keep backup keys outside Railway as well.
+4. Set `PUBLIC_URL` to the public HTTPS service URL. Start the product Telegram bot privately as the backup owner. Set a strong one-time `ADMIN_PANEL_USERNAME` / `ADMIN_PANEL_PASSWORD` for bootstrap, or configure the delivery bot for generated one-time credentials. Environment bootstrap values do not reset an existing owner's changed password.
+5. Review `.env.example`, resource budgets and pool size; include PostgreSQL's own connections in the budget. Defaults are a 3-connection app pool with 2 overflow connections, two ordinary update lanes plus a payment lane, Uvicorn concurrency 100. Do not tune down purely to chase cost numbers.
+6. Build checked-in frontend assets if modified: `npm ci && npm run build:panel`. Docker only needs Python at runtime. `requirements.txt` is hash-locked; direct dependency constraints are in `requirements.in`.
+7. Build/deploy the Docker image using `railway.json`. It runs as UID 10001, binds `0.0.0.0:$PORT`, and has `/health` health checking. Local tests do not prove the production Docker image or Railway proxy configuration; run a staging smoke test first.
 
-## Data persistence across deploys (v2.2)
+## Migrations
+Startup creates missing tables, applies legacy additive/widening changes and then the versioned migration `20261128_hardening_v1` in `app/migrations.py`. PostgreSQL DDL is serialized by advisory lock `71389203`; the migration marker prevents repeat work. This introduces inbox/orders/source keys, indexes and wallet/chat guards; it is forward-only. The balance check is `NOT VALID` for historical rows (new writes are checked). Startup is **not** a destructive reset. Index creation is not concurrent: schedule a maintenance window for a large database. Versioned migrations supplement the old additive bootstrap; this is not a complete Alembic conversion.
 
-Railway recycles the container filesystem on every deploy, so data must live in
-PostgreSQL — never in a local file.
+## After deployment
+- First owner login: change the initial password. Refresh and perform a harmless mutation; `/auth/me` must return a fresh CSRF header without requiring logout/login. No TOTP enrollment is required.
+- Search an old user by `@username`, public/platform/internal ID, name and Persian digits; check pagination and phone-width rendering.
+- Verify Telegram/Bale updates, payment pre-checkout latency, matching, stale chat buttons, queue compensation, and outbound rate limits.
+- Create a manual backup, confirm **delivered**, download all parts and validate in isolation. A configured channel is not proof of delivery.
+- Inspect security events and scheduler errors, inbox retries/dead letters, DB connections and measured process/cgroup memory. Billing/network/disk metrics absent from the Railway API are shown as unknown, not estimated zeros.
+- Do not delete/recreate the PostgreSQL service during application redeploys. Monitor post-migration data and keep recovery artifacts until accepted.
 
-1. **Attach the Railway PostgreSQL service** to the `kanarchat` service. Railway
-   injects `DATABASE_URL` automatically; the app normalizes it for asyncpg.
-   The database is NOT dropped or recreated on deploys: boot runs
-   `create_all` (missing tables only) plus additive seeds guarded by
-   emptiness/version markers. Nothing is ever `drop_all`-ed.
-2. **Boot guard:** if `RAILWAY_ENVIRONMENT` / `RAILWAY_PROJECT_ID` is present
-   and `DATABASE_URL` is not a Postgres URL, startup FAILS with a clear error
-   instead of silently booting on an ephemeral SQLite file (which would wipe
-   all user data on the next deploy). Escape hatch for throwaway test deploys:
-   `ALLOW_SQLITE_ON_RAILWAY=1` (logs a loud warning; data is still ephemeral).
-3. **Startup summary:** each boot logs the engine type and user/chat row counts
-   so a wiped database is immediately visible in the deploy logs.
-4. **Backups:** the daily 03:00 Tehran encrypted backup (delivered to the
-   owner's Telegram) plus the instant backup button in the admin panel remain
-   the restore path of last resort; see `docs/BACKUP_RESTORE.md`.
+## Local development and tests
+```sh
+python3 -m venv .venv
+.venv/bin/pip install --require-hashes -r requirements.txt
+.venv/bin/pip install pytest==9.2.0 pytest-asyncio==1.5.0
+.venv/bin/python -m pytest tests/ -q
+npm ci
+npm run build:panel
+npm run check:panel
+npm run test:postgres
+```
+The default suite uses disposable SQLite and skips the PostgreSQL-only tests. `test:postgres` starts embedded PostgreSQL on port 55432 with a temporary `hamchat_test` database, then stops it. Alternatively set `TEST_PG_URL` for `tests/test_postgres.py`: **the database must end in `_test` and its public schema will be dropped**. Never point tests at a deployment database. PostgreSQL tests include concurrent wallet/payment/matching and restore rollback cases.
+
+`npm run test:panel` requires a separately running, deliberately seeded **local-only** preview on port 8000 with the test `preview` account and 550 synthetic users (old target `@Old_Test_User`, public ID `100000`, display name `علی آزمایشی`). It rejects remote hosts. It is not a general production smoke-test command. Chromium on minimal Linux may require NSS/NSPR runtime libraries; use the distribution libraries or the runtime supplied with `@sparticuz/chromium` and `LD_LIBRARY_PATH`. Screenshots are ignored under `artifacts/`.
+
+## Delivery semantics / recovery
+Inbox receipts commit before HTTP acknowledgement, retry with backoff and eventually dead-letter after `UPDATE_MAX_ATTEMPTS`. Successful payloads are cleared. Inspect dead updates before replay, especially payments. Partition count must remain stable until the queue drains; changing `UPDATE_WORKERS` with pending rows changes actor ordering.
+
+External network sends cannot be atomically committed with SQL. A crash after send/before recording may duplicate a message. Broadcasts persist a keyset cursor every 25 targets and may repeat that batch after a hard crash; failed targets are counted, not automatically guaranteed eventual delivery. Broadcast recipients are selected from the current audience on each batch, not a frozen snapshot. Pause/cancel takes effect at a batch boundary. Refunds with ambiguous results stay `refund_pending`; reconcile/retry the same payment rather than manually crediting coins back.

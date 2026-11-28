@@ -11,4 +11,5 @@ node_modules/
 dist/
 *.enc
 *.log
-.github/
+
+artifacts/

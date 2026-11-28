@@ -18,6 +18,7 @@ Solution implemented here:
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Optional
 
 from .config import RUNTIME
@@ -33,7 +34,10 @@ def _key(platform: str, platform_user_id) -> str:
 
 
 def _map() -> dict:
-    return RUNTIME.setdefault(_PANELS, {})
+    panels = RUNTIME.setdefault(_PANELS, OrderedDict())
+    while len(panels) > 10000:
+        panels.pop(next(iter(panels)))
+    return panels
 
 
 def get(platform: str, platform_user_id):
@@ -62,6 +66,10 @@ async def send(adp, platform: str, platform_user_id, text: str,
     The previous panel of the same user loses its keyboard right after the new
     message is on its way, so there is never more than one live keyboard.
     """
+    if kind == "chat" and chat_id and keyboard:
+        keyboard = [[{**button, "callback_data": f"c:{chat_id}:" + button["callback_data"]}
+            if button.get("callback_data", "").startswith("chat_") else dict(button)
+            for button in row] for row in keyboard]
     res = await adp.send_message(platform_user_id, text, keyboard=keyboard,
                                  reply_to=reply_to)
     if keyboard:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -101,7 +102,21 @@ def tehran_day(d: Optional[datetime] = None) -> str:
 
 
 # ------------------------------------------------------------- settings ----
+_SETTINGS_CACHE = {}
+_MOD_CACHE = {}
+
+
+def invalidate_cache():
+    _SETTINGS_CACHE.clear()
+    _MOD_CACHE.clear()
+
+
 async def get_setting(session, key: str) -> Any:
+    # Never cache coordination flags or read-your-own pending writes.
+    cacheable = key in DEFAULT_SETTINGS and not session.info.get("settings_changed")
+    cached = _SETTINGS_CACHE.get(key) if cacheable else None
+    if cached and time.monotonic() - cached[0] < 15:
+        return copy.deepcopy(cached[1])
     row = await session.get(AppSetting, key)
     if row is None:
         # v2.3.4: hand out a COPY — the live DEFAULT_SETTINGS dict must never
@@ -116,11 +131,15 @@ async def get_setting(session, key: str) -> Any:
     if isinstance(base, dict) and isinstance(row.value, dict):
         merged = copy.deepcopy(base)
         merged.update(copy.deepcopy(row.value))
+        if cacheable:
+            _SETTINGS_CACHE[key] = (time.monotonic(), copy.deepcopy(merged))
         return merged
     return copy.deepcopy(row.value)
 
 
 async def set_setting(session, key: str, value: Any) -> None:
+    session.info["settings_changed"] = True
+    invalidate_cache()
     row = await session.get(AppSetting, key)
     if row is None:
         session.add(AppSetting(key=key, value=value))
@@ -155,48 +174,46 @@ async def notify(session, title: str, body: str, severity="info", route="/") -> 
 
 
 # --------------------------------------------------------------- economy ----
+async def _wallet_change(session, user, amount, type_, description, reference_id, idempotency_key):
+    from sqlalchemy.orm.attributes import set_committed_value
+    # Flush pending profile/state changes, then serialize ALL wallet operations.
+    await session.flush()
+    if session.bind.dialect.name == "postgresql":
+        await session.execute(select(User.id).where(User.id == user.id).with_for_update())
+    if idempotency_key:
+        found = (await session.execute(select(CoinTransaction).where(
+            CoinTransaction.idempotency_key == idempotency_key))).scalar_one_or_none()
+        if found:
+            await session.refresh(user, ["coin_balance"])
+            return found
+    query = update(User).where(User.id == user.id)
+    if amount < 0:
+        query = query.where(User.coin_balance >= -amount)
+    balance = (await session.execute(query.values(coin_balance=User.coin_balance + amount)
+        .returning(User.coin_balance).execution_options(synchronize_session=False))).scalar_one_or_none()
+    if balance is None:
+        return None
+    set_committed_value(user, "coin_balance", balance)
+    txn = CoinTransaction(user_id=user.id, amount=amount, balance_after=balance,
+        type=type_, description=description, reference_id=reference_id,
+        idempotency_key=idempotency_key or None)
+    session.add(txn)
+    await session.flush()
+    return txn
+
+
 async def credit(session, user: User, amount: int, type_: str, description: str = "",
                  reference_id: str = "", idempotency_key: str = "") -> Optional[CoinTransaction]:
-    """Add coins to a wallet. amount == 0 is a no-op (returns None) so callers
-    like a zero-value daily bonus or a 0-coin admin grant never crash."""
     if amount <= 0:
         return None
-    if idempotency_key:
-        existing = await session.execute(
-            select(CoinTransaction).where(CoinTransaction.idempotency_key == idempotency_key))
-        found = existing.scalar_one_or_none()
-        if found:
-            return found
-    user.coin_balance += amount
-    txn = CoinTransaction(user_id=user.id, amount=amount, balance_after=user.coin_balance,
-                          type=type_, description=description, reference_id=reference_id,
-                          idempotency_key=idempotency_key or None)
-    session.add(txn)
-    return txn
+    return await _wallet_change(session, user, amount, type_, description, reference_id, idempotency_key)
 
 
 async def debit(session, user: User, amount: int, type_: str, description: str = "",
                 reference_id: str = "", idempotency_key: str = "") -> Optional[CoinTransaction]:
-    """Atomically deduct; returns None when balance is insufficient (no negative balances)."""
-    assert amount > 0
-    if idempotency_key:
-        existing = await session.execute(
-            select(CoinTransaction).where(CoinTransaction.idempotency_key == idempotency_key))
-        found = existing.scalar_one_or_none()
-        if found:
-            return found
-    # Lock the wallet row on Postgres to serialize concurrent spends.
-    if session.bind is not None and session.bind.dialect.name == "postgresql":
-        await session.execute(select(User).where(User.id == user.id).with_for_update())
-        await session.refresh(user)
-    if user.coin_balance < amount:
-        return None
-    user.coin_balance -= amount
-    txn = CoinTransaction(user_id=user.id, amount=-amount, balance_after=user.coin_balance,
-                          type=type_, description=description, reference_id=reference_id,
-                          idempotency_key=idempotency_key or None)
-    session.add(txn)
-    return txn
+    if amount <= 0:
+        raise ValueError("debit amount must be positive")
+    return await _wallet_change(session, user, -amount, type_, description, reference_id, idempotency_key)
 
 
 async def grant_daily_bonus(session, user: User) -> int:
@@ -391,8 +408,22 @@ async def grant_birthday_gift(session, user: User) -> int:
     return amount
 
 
+def birthday_month_days(calendar: str, year: int, month: int) -> int:
+    if calendar not in {"jalali", "gregorian"} or not 1 <= month <= 12:
+        raise ValueError("INVALID_BIRTH_DATE")
+    if calendar == "gregorian":
+        import calendar as cal
+        return cal.monthrange(year, month)[1]
+    if month != 12:
+        return JALALI_MONTH_DAYS[month - 1]
+    converted = jalali_to_gregorian(year, 12, 30)
+    return 30 if gregorian_to_jalali(*converted) == (year, 12, 30) else 29
+
+
 def save_birthday(user: User, calendar: str, y: int, m: int, d: int) -> int:
     """v2.1: store year/month/day + derive the age. Returns the new age."""
+    if not 1 <= d <= birthday_month_days(calendar, y, m):
+        raise ValueError("INVALID_BIRTH_DATE")
     if calendar == "jalali":
         gy, gm, gd = jalali_to_gregorian(y, m, d)
     else:
@@ -469,70 +500,71 @@ def _filters_compatible(a: QueueEntry, b: QueueEntry) -> bool:
 
 
 async def try_match(session) -> Optional[tuple[User, User, bool]]:
-    """FIFO matching with row locks; returns (user_a, user_b, charged_b_id) or None.
+    """Bounded FIFO matching: fixed round-trips instead of a query per pair.
 
-    charged_b_id marks the entry whose gender filter caused the coin charge.
+    Cross-age matching policy is intentionally unchanged pending owner choice.
+    A Postgres transaction advisory lock serializes match creators; wallet
+    updates use ascending user-id lock order to avoid cross-operation deadlocks.
     """
-    dialect = session.bind.dialect.name if session.bind is not None else ""
-    if dialect == "postgresql":
-        res = await session.execute(
-            select(QueueEntry).order_by(QueueEntry.created_at, QueueEntry.id)
-            .with_for_update(skip_locked=True).limit(500))
-    else:
-        res = await session.execute(
-            select(QueueEntry).order_by(QueueEntry.created_at, QueueEntry.id).limit(500))
+    from sqlalchemy import text, or_
+    if session.bind.dialect.name == "postgresql":
+        if not (await session.execute(text("SELECT pg_try_advisory_xact_lock(71389202)"))).scalar_one():
+            return None
+    eco = await get_setting(session, "economy")
+    cfg = await get_setting(session, "matching")
+    cost = eco["genderFilterMatchCost"]
+    res = await session.execute(select(QueueEntry).join(User, User.id == QueueEntry.user_id)
+        .where(User.status == "active", User.bot_blocked == False,
+            or_(QueueEntry.gender_filter == "everyone", User.coin_balance >= cost))
+        .order_by(QueueEntry.created_at, QueueEntry.id).limit(500))
     entries = list(res.scalars())
     if len(entries) < 2:
         return None
-    eco = await get_setting(session, "economy")
-    cost = eco["genderFilterMatchCost"]
-    for i in range(len(entries)):
-        for j in range(i + 1, len(entries)):
-            a, b = entries[i], entries[j]
-            # v2.4: age-group separation (13-17 vs 18-60) REMOVED by product
-            # decision — chats are fully moderated; matching is open to all ages.
-            if await is_blocked(session, a.user_id, b.user_id) or await is_blocked(session, b.user_id, a.user_id):
+    ids = [e.user_id for e in entries]
+    people = {u.id:u for u in (await session.execute(select(User).where(User.id.in_(ids)))).scalars()}
+    active = (await session.execute(select(Chat.user_a_id, Chat.user_b_id).where(Chat.status == "active",
+        or_(Chat.user_a_id.in_(ids), Chat.user_b_id.in_(ids))))).all()
+    busy = {uid for pair in active for uid in pair}
+    blocked = {(a,b) for a,b in (await session.execute(select(Block.blocker_id, Block.blocked_id)
+        .where(Block.blocker_id.in_(ids), Block.blocked_id.in_(ids)))).all()}
+    since = utcnow() - timedelta(minutes=cfg.get("repeatMatchCooldownMin", 30))
+    recent = {tuple(sorted((a,b))) for a,b in (await session.execute(
+        select(RecentPair.user_a_id, RecentPair.user_b_id).where(RecentPair.ended_at >= since,
+        RecentPair.user_a_id.in_(ids), RecentPair.user_b_id.in_(ids)))).all()}
+    for i,a in enumerate(entries):
+        if a.user_id in busy:
+            continue
+        for b in entries[i+1:]:
+            if b.user_id in busy or not _filters_compatible(a,b):
                 continue
-            if not _filters_compatible(a, b):
+            if (a.user_id,b.user_id) in blocked or (b.user_id,a.user_id) in blocked:
                 continue
-            cooldown = (await get_setting(session, "matching")).get("repeatMatchCooldownMin", 30)
-            since = utcnow() - timedelta(minutes=cooldown)
-            # v2.4.4: limit(1)+first() — a pair can have SEVERAL RecentPair rows
-            # inside the window (two chats in different orientations, restored
-            # rows, …) and scalar_one_or_none() raised MultipleResultsFound,
-            # crashing every match attempt and the scheduler match tick (prod
-            # incident 2026-11-17). We only need to know "at least one exists".
-            recent = await session.execute(select(RecentPair.id).where(
-                ((RecentPair.user_a_id == a.user_id) & (RecentPair.user_b_id == b.user_id)) |
-                ((RecentPair.user_a_id == b.user_id) & (RecentPair.user_b_id == a.user_id)),
-                RecentPair.ended_at >= since).limit(1))
-            if recent.first():
+            if tuple(sorted((a.user_id,b.user_id))) in recent:
                 continue
-            ua, ub = await session.get(User, a.user_id), await session.get(User, b.user_id)
-            if not ua or not ub or ua.status != "active" or ub.status != "active":
+            ua,ub = people[a.user_id],people[b.user_id]
+            # Acquire both wallet locks before checking the fresh balances.
+            if session.bind.dialect.name == "postgresql":
+                for uid in sorted((ua.id,ub.id)):
+                    await session.execute(select(User.id).where(User.id == uid).with_for_update())
+                    await session.refresh(people[uid])
+            if any(e.gender_filter != "everyone" and people[e.user_id].coin_balance < cost for e in (a,b)):
                 continue
-            # verify affordability BEFORE any debit so a failed pair never charges
-            if a.gender_filter != "everyone" and ua.coin_balance < cost:
-                continue
-            if b.gender_filter != "everyone" and ub.coin_balance < cost:
-                continue
-            charged = None
-            if a.gender_filter != "everyone":
-                await debit(session, ua, cost, "gender_filter_cost",
-                            "هزینه فیلتر جنسیت", idempotency_key=f"gf:{a.id}")
-                charged = a.user_id
-            if b.gender_filter != "everyone":
-                await debit(session, ub, cost, "gender_filter_cost",
-                            "هزینه فیلتر جنسیت", idempotency_key=f"gf:{b.id}")
-                charged = charged or b.user_id
-            chat = Chat(user_a_id=ua.id, user_b_id=ub.id, cross_platform=(ua.platform != ub.platform),
-                        age_group=a.age_group)
+            chat = Chat(user_a_id=ua.id,user_b_id=ub.id,
+                cross_platform=ua.platform != ub.platform,age_group=a.age_group)
             session.add(chat)
+            await session.flush()
+            charged = None
+            for e in (a,b):
+                if e.gender_filter != "everyone" and cost > 0:
+                    await debit(session, people[e.user_id], cost, "gender_filter_cost",
+                        "هزینه فیلتر جنسیت", reference_id=f"chat:{chat.id}",
+                        idempotency_key=f"gf:{chat.id}:{e.user_id}")
+                    charged = charged or e.user_id
             ua.total_chats += 1
             ub.total_chats += 1
-            for e in (a, b):
+            for e in (a,b):
                 await session.delete(e)
-            return ua, ub, charged
+            return ua,ub,charged
     return None
 
 
@@ -553,13 +585,22 @@ async def end_chat(session, chat: Chat, reason: str, by_user_id: Optional[int] =
 
 # ------------------------------------------------------------ moderation ----
 async def dictionary(session):
+    cached = _MOD_CACHE.get("dictionary")
+    if cached and time.monotonic() - cached[0] < 30:
+        return cached[1]
     res = await session.execute(select(DictionaryWord).order_by(DictionaryWord.id.desc()))
-    return [(w.word, w.severity, w.action) for w in res.scalars()]
+    rows = [(w.word, w.severity, w.action) for w in res.scalars()]
+    _MOD_CACHE["dictionary"] = (time.monotonic(), rows)
+    return rows
 
 
 async def allowlist(session):
-    res = await session.execute(select(AllowlistPhrase))
-    return [p.phrase for p in res.scalars()]
+    cached = _MOD_CACHE.get("allowlist")
+    if cached and time.monotonic() - cached[0] < 30:
+        return cached[1]
+    rows = [p.phrase for p in (await session.execute(select(AllowlistPhrase))).scalars()]
+    _MOD_CACHE["allowlist"] = (time.monotonic(), rows)
+    return rows
 
 
 async def check_message(session, body: str) -> tuple[bool, Optional[str]]:
@@ -680,6 +721,11 @@ async def purge_expired(session) -> dict:
     # v2.4: expired web-admin sessions (30-day trusted-device lifetime)
     w = (await session.execute(delete(db.WebSession).where(
         db.WebSession.created_at < utcnow() - timedelta(days=30)))).rowcount
+    await session.execute(delete(db.UpdateInbox).where(
+        db.UpdateInbox.status == "done", db.UpdateInbox.created_at < utcnow() - timedelta(hours=48)))
+    await session.execute(delete(db.LoginChallenge).where(db.LoginChallenge.expires_at < utcnow()))
+    await session.execute(delete(db.InvoiceOrder).where(db.InvoiceOrder.paid_at.is_(None),
+        db.InvoiceOrder.expires_at < utcnow() - timedelta(days=7)))
     # expired temporary bans
     await session.execute(update(Ban).where(
         Ban.type == "temporary", Ban.status == "active", Ban.expires_at < utcnow()).values(status="expired"))
@@ -726,10 +772,9 @@ async def delete_account(session, user: User) -> None:
         (ChatMessage.sender_id == uid) | (ChatMessage.chat_id.in_(my_chats))))
     for chat in (await session.execute(select(Chat).where(
             (Chat.user_a_id == uid) | (Chat.user_b_id == uid)))).scalars():
-        await end_chat(session, chat, "terminated", uid)
         await session.delete(chat)
     # 6) wallet / queue / referral ledger
-    for model in (QueueEntry, DailyClaim, CoinTransaction, Payment):
+    for model in (QueueEntry, DailyClaim):
         await session.execute(delete(model).where(model.user_id == uid))
     await session.execute(delete(Referral).where(
         (Referral.referrer_id == uid) | (Referral.referred_id == uid)))
@@ -739,11 +784,17 @@ async def delete_account(session, user: User) -> None:
     await session.execute(update(User).where(User.linked_user_id == uid)
                           .values(linked_user_id=None))
     # 8) scrub the row itself (kept for audit/ledger integrity)
+    user.platform_user_id = "deleted:" + secrets.token_hex(12)
+    user.city = ""
+    user.linked_user_id = None
+    user.referred_by_id = None
+    user.last_invite_at = None
     user.display_name = "Deleted User"
     user.username = None
     user.bio = None
     user.photo_file_id = None
-    user.coin_balance = 0
+    if user.coin_balance:
+        await debit(session, user, user.coin_balance, "account_closed", "تسویه حساب حذف‌شده")
     user.status = "deleted"
     user.deleted_at = utcnow()
     user.state = None
@@ -756,7 +807,7 @@ async def delete_account(session, user: User) -> None:
 
 
 # ------------------------------------------------------------ broadcast ----
-async def broadcast_targets(session, audience: str) -> list[User]:
+def _broadcast_query(audience: str):
     q = select(User).where(User.status == "active", User.bot_blocked == False)  # noqa
     if audience == "telegram":
         q = q.where(User.platform == "telegram")
@@ -773,6 +824,17 @@ async def broadcast_targets(session, audience: str) -> list[User]:
     elif audience == "incomplete":
         # v2.4 segmented broadcast: users whose registration never completed
         q = q.where(User.age == 0)
+    return q
+
+
+async def broadcast_target_count(session, audience):
+    return (await session.execute(select(func.count()).select_from(_broadcast_query(audience).subquery()))).scalar_one()
+
+
+async def broadcast_targets(session, audience: str, after_id: int = 0, limit: int | None = None) -> list[User]:
+    q = _broadcast_query(audience).where(User.id > after_id).order_by(User.id)
+    if limit is not None:
+        q = q.limit(limit)
     return list((await session.execute(q)).scalars())
 
 

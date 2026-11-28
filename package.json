@@ -1,0 +1,18 @@
+{
+  "name": "hamchat-maintenance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:panel": "node scripts/build-panel.mjs",
+    "check:panel": "node --check webadmin/panel.js",
+    "test:postgres": "node scripts/test-postgres.mjs",
+    "test:panel": "node scripts/test-panel.mjs"
+  },
+  "devDependencies": {
+    "@sparticuz/chromium": "141.0.0",
+    "embedded-postgres": "18.4.0-beta.17",
+    "esbuild": "0.27.0",
+    "playwright-core": "1.56.1",
+    "prettier": "3.6.2"
+  }
+}
