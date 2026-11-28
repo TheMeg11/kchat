@@ -53,3 +53,11 @@ The startup hotfix resolves a blank `PUBLIC_URL` from `RAILWAY_PUBLIC_DOMAIN` au
 ## Commerce revision
 
 See [MONETIZATION.md](MONETIZATION.md) before enabling/promoting the new catalog. No new environment variables; startup adds eight business tables under `20261128_commerce_v2`. Back up PostgreSQL first; keep one process/replica. Existing VIP/pass entitlements are honored when the catalog's sales toggle is off. Review the initial coin prices and platform top-up rates in the two admin screens; do not present coin spending as cash revenue. Local tests are not evidence that Railway deployed or that a live payment succeeded.
+
+## INFO messages marked as errors in Railway (2026-11-28 hotfix)
+
+Python's default `logging.basicConfig` and Uvicorn's default startup logger write to stderr. A collector may label those lines `error` even when their text starts with `INFO`. Logs showing `Application startup complete`, successful database initialization and Bot API `200 OK` responses are not by themselves an application crash or evidence of a Railway outage.
+
+The `python -m app.main` entrypoint now supplies a shared Uvicorn/root JSON log configuration: one record per stdout line, explicit `level`, timestamp, logger and message. Real warnings/errors retain their severity and exception traces (escaped into one JSON record). Successful low-level HTTP request logs are suppressed; warnings/errors remain. Bot-API tokens and private webhook URL paths are redacted in messages and traces, and webhook registration no longer prints its secret-bearing URL.
+
+No Railway variable, database reset, token rotation or payment configuration change is required for this logging correction. Redeploy the fixed main revision through the usual deployment flow. This does not prove that every bot feature works: investigate a specific failed action using an actual WARNING/ERROR traceback, failed inbox record or failed HTTP request, not the old collector label alone. Custom Uvicorn launchers should pass `app.logging_config.log_config()` as `log_config`, as the repository entrypoint does.
