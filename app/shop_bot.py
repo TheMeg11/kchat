@@ -647,7 +647,15 @@ async def deliver_purchase(user, q, fresh):
                 ),
             )
             async with db.session_scope() as s:
-                (await s.get(db.ShopQuote, q.id)).status = "delivered"
+                current = (
+                    await s.execute(
+                        select(db.ShopQuote)
+                        .where(db.ShopQuote.id == q.id)
+                        .with_for_update()
+                    )
+                ).scalar_one()
+                if current.status == "paid":
+                    current.status = "delivered"
         except PlatformError:
             if q.sku in C.VISUAL:
                 await C.refund_visual(q.id)

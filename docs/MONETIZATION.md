@@ -64,7 +64,7 @@ The debit is a transactionally reserved charge immediately after acceptance; it 
 
 Local isolated runs (no production database or live bot sends):
 
-- `python -m pytest tests/ -q`: **179 passed, 13 PostgreSQL-only skipped**.
+- `python -m pytest tests/ -q`: **180 passed, 13 PostgreSQL-only skipped**.
 - `npm run test:postgres`: **13 passed**, including concurrent quotes/payment, last promo slot, immutable starter invoice, versioned game moves, reconnect accept replay, encrypted restore/deletion, and upgrade from old schema.
 - `npm run build:panel`, `npm run check:panel`; browser regression on local seeded data: login/session/CSRF, search, password/session rotation, commerce price save/reload, real code creation/revocation, desktop/mobile layout.
 - `npm audit --audit-level=high`: zero vulnerabilities; `pip check`: clean.

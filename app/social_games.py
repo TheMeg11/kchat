@@ -239,7 +239,11 @@ async def _publish(gid):
     # Persist per-player message IDs; edit the same inline 3x3 board on each move.
     async with db.session_scope() as s:
         g = await s.get(db.SocialGame, gid)
+        if not g:
+            return
         chat = await s.get(db.Chat, g.chat_id)
+        if not chat:
+            return
         if chat.status != "active" or g.expires_at <= db.utcnow():
             return
         users = [
@@ -267,10 +271,29 @@ async def _publish(gid):
                     user.platform_user_id, text, keyboard=keyboard
                 )
                 ids.append((user.id, (res or {}).get("message_id")))
-        except PlatformError:
-            continue
+        except PlatformError as exc:
+            # Deleted/too-old boards can be recreated from durable state. Do
+            # not duplicate on a transient error or "message not modified".
+            missing = any(
+                phrase in exc.description.lower()
+                for phrase in (
+                    "message to edit not found",
+                    "message can't be edited",
+                    "message_id_invalid",
+                )
+            )
+            if mid and exc.error_code == 400 and missing:
+                try:
+                    res = await adp.send_message(
+                        user.platform_user_id, text, keyboard=keyboard
+                    )
+                    ids.append((user.id, (res or {}).get("message_id")))
+                except PlatformError:
+                    pass
     async with db.session_scope() as s:
         current = await s.get(db.SocialGame, gid)
+        if not current:
+            return
         for uid, mid in ids:
             if uid == chat.user_a_id:
                 current.message_a = mid

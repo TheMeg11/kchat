@@ -638,3 +638,29 @@ async def test_opening_store_cancels_invisible_compose_flow(adapters):
     )
     async with db.session_scope() as s:
         assert (await s.get(db.User, a.id)).state is None
+
+
+async def test_game_boards_recreated_when_deleted_without_resetting_game(
+    adapters, monkeypatch
+):
+    tg, _ = adapters
+    a, b, cid = await pair()
+    gid = await social_games.invite(a.id, "ttt")
+    await social_games.publish(gid)
+    async with db.session_scope() as s:
+        g = await s.get(db.SocialGame, gid)
+        assert g.message_a and g.message_b
+    await social_games.act(b.id, gid, 0, "accept")
+
+    async def missing(*args, **kwargs):
+        raise PlatformError(
+            "editMessageText", 400, "Bad Request: message to edit not found"
+        )
+
+    monkeypatch.setattr(tg, "edit_message", missing, raising=False)
+    await social_games.publish(gid)
+    async with db.session_scope() as s:
+        g = await s.get(db.SocialGame, gid)
+        assert g.version == 1 and g.status == "playing"
+        assert g.message_a > 2 and g.message_b > 2
+    await social_games.publish("already-deleted")
