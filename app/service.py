@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, update, or_
 
 from . import db
 from .db import (AdminNotification, AllowlistPhrase, Appeal, AppSetting, AuditLog,
@@ -708,6 +708,8 @@ async def purge_expired(session) -> dict:
     # point at them (Postgres raised IntegrityError; SQLite silently kept
     # orphans). Delete the children of the expired chats first.
     old_chats = select(Chat.id).where(Chat.status != "active", Chat.ended_at < cutoff)
+    await session.execute(delete(db.SocialGame).where(db.SocialGame.chat_id.in_(old_chats)))
+    await session.execute(delete(db.ReconnectRequest).where(or_(db.ReconnectRequest.old_chat_id.in_(old_chats),db.ReconnectRequest.new_chat_id.in_(old_chats))))
     await session.execute(delete(ChatMessage).where(ChatMessage.chat_id.in_(old_chats)))
     await session.execute(delete(Report).where(Report.chat_id.in_(old_chats)))
     c = (await session.execute(delete(Chat).where(
@@ -724,8 +726,11 @@ async def purge_expired(session) -> dict:
     await session.execute(delete(db.UpdateInbox).where(
         db.UpdateInbox.status == "done", db.UpdateInbox.created_at < utcnow() - timedelta(hours=48)))
     await session.execute(delete(db.LoginChallenge).where(db.LoginChallenge.expires_at < utcnow()))
-    await session.execute(delete(db.InvoiceOrder).where(db.InvoiceOrder.paid_at.is_(None),
+    await session.execute(delete(db.InvoiceOrder).where(db.InvoiceOrder.paid_at.is_(None), or_(db.InvoiceOrder.package_id.is_(None),db.InvoiceOrder.package_id != "first_offer"),
         db.InvoiceOrder.expires_at < utcnow() - timedelta(days=7)))
+    await session.execute(delete(db.ShopQuote).where(db.ShopQuote.status.in_(["quoted","cancelled"]),
+        db.ShopQuote.expires_at < utcnow()-timedelta(days=7)))
+    await session.execute(delete(db.SocialGame).where(db.SocialGame.expires_at < utcnow()-timedelta(days=7)))
     # expired temporary bans
     await session.execute(update(Ban).where(
         Ban.type == "temporary", Ban.status == "active", Ban.expires_at < utcnow()).values(status="expired"))
@@ -743,7 +748,29 @@ async def delete_account(session, user: User) -> None:
     production while looking fine on SQLite.
     """
     uid = user.id
+    # Resolve any undelivered virtual gifts before scrubbing either party.
+    # Refund to the payer, not the deleted recipient, in this same transaction.
+    pending_visual = list((await session.execute(select(db.ShopQuote).where(
+        or_(db.ShopQuote.payer_id == uid, db.ShopQuote.recipient_id == uid),
+        db.ShopQuote.sku.in_(["rose", "coffee", "book"]),
+        db.ShopQuote.status == "paid").order_by(db.ShopQuote.id).with_for_update())).scalars())
+    if pending_visual:
+        from .commerce import lock_users
+        payers = await lock_users(session, [q.payer_id for q in pending_visual])
+        for q in pending_visual:
+            await credit(session, payers[q.payer_id], q.coins, "shop_refund", "هدیه تحویل نشد",
+                idempotency_key=f"shop-refund:{q.id}")
+            q.status = "refunded"
     my_chats = select(Chat.id).where((Chat.user_a_id == uid) | (Chat.user_b_id == uid))
+    await session.execute(delete(db.SocialGame).where(db.SocialGame.chat_id.in_(my_chats)))
+    await session.execute(delete(db.ReconnectRequest).where(or_(db.ReconnectRequest.old_chat_id.in_(my_chats),db.ReconnectRequest.new_chat_id.in_(my_chats))))
+    await session.execute(delete(db.TopicLink).where(db.TopicLink.owner_id == uid))
+    await session.execute(delete(db.MemberProfile).where(db.MemberProfile.user_id == uid))
+    await session.execute(delete(db.MemberGrant).where(db.MemberGrant.user_id == uid))
+    await session.execute(update(db.ShopQuote).where(db.ShopQuote.payer_id == uid,
+        db.ShopQuote.status == "quoted").values(status="cancelled"))
+    # Financial quotes / promo uses retain only internal IDs for reconciliation
+    # and quota enforcement, like the existing payment/coin ledger. User is soft-deleted.
     # 1) threads / friends / blocks / recent pairs that mention the user
     await session.execute(delete(db.AnonThread).where(
         (db.AnonThread.owner_id == uid) | (db.AnonThread.sender_id == uid)))

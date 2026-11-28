@@ -104,6 +104,12 @@ async def retire_controls(user: User, chat_id: int) -> None:
         log.debug("retire_controls failed for %s", user.public_id, exc_info=True)
 
 
+def ended_cta(lang: str, chat_id: int):
+    # No arbitrary final message: a single neutral, consent-based request.
+    label = {"fa":"↩️ درخواست اتصال مجدد (با هزینه)","en":"↩️ Request reconnect (paid)","ru":"↩️ Запросить соединение (платно)"}.get(lang,"↩️ درخواست اتصال مجدد (با هزینه)")
+    return search_cta(lang) + [[btn(label,f"m:recon:{chat_id}")]]
+
+
 def search_cta(lang: str):
     """Inline CTA attached to 'not in chat' style messages."""
     return kb([btn(tr(lang, "btn_search"), "search")])
@@ -121,17 +127,19 @@ async def main_menu(user: User) -> None:
         queued = (await s.execute(select(QueueEntry).where(
             QueueEntry.user_id == u.id))).scalar_one_or_none()
     if chatting:
+        rows.append([btn({"fa":"💬 بازگشت به کنترل گفتگو","en":"💬 Chat controls","ru":"💬 Управление чатом"}.get(lang,"💬"),"chat_back")])
         rows.append([btn("⏭ " + tr(lang, "btn_next"), "chat_next"),
                      btn(tr(lang, "btn_end"), "chat_end")])
     elif queued:
         rows.append([btn(tr(lang, "btn_stop_search"), "stop_search")])
     else:
         rows.append([btn(tr(lang, "btn_search"), "search")])
-    rows.append([btn(tr(lang, "btn_profile"), "profile")])
+    rows.append([btn(tr(lang, "btn_profile"), "profile"), btn(tr(lang, "btn_friends"), "friends_list")])
     rows.append([btn(tr(lang, "btn_anon_link"), "anon_link"),
                  btn(tr(lang, "btn_direct_msg"), "direct_msg")])
     # v2.4: friends list lives in the main menu
-    rows.append([btn(tr(lang, "btn_friends"), "friends_list")])
+    from .commerce import local
+    rows.append([btn(local(user,"🛍 فروشگاه و VIP","🛍 Shop & VIP","🛍 Магазин и VIP"), "store")])
     rows.append([btn(tr(lang, "btn_coins"), "wallet"),
                  btn(tr(lang, "btn_rewards"), "rewards")])
     rows.append([btn(tr(lang, "btn_help"), "help")])
@@ -250,7 +258,7 @@ async def deliver_friend_message(user: User, target_id: Optional[int], text: str
 def chat_controls(lang: str):
     return kb([btn(tr(lang, "btn_next"), "chat_next"), btn(tr(lang, "btn_end"), "chat_end")],
               [btn(tr(lang, "btn_report"), "chat_report"), btn(tr(lang, "btn_block"), "chat_block")],
-              [btn(tr(lang, "btn_gift"), "chat_gift")],
+              [btn(tr(lang, "btn_gift"), "chat_gift"), btn({"fa":"🎮 سرگرمی و هدیه","en":"🎮 Activities & gifts","ru":"🎮 Игры и подарки"}.get(lang,"🎮 سرگرمی"), "chat_fun")],
               [btn(tr(lang, "btn_add_friend"), "chat_addfriend")])
 
 
@@ -273,6 +281,11 @@ def deep_link(user: User, param: str) -> str:
 
 
 # ------------------------------------------------------------ registration ----
+def db_topic_model():
+    from .db import TopicLink
+    return TopicLink
+
+
 def anon_start_payload(code: str) -> str:
     """v2.2 (item 7): anonymous-link start payload WITHOUT '/' or '_' characters.
     Legacy payloads ("msg_<code>") keep working via cmd_start."""
@@ -302,6 +315,18 @@ async def cmd_start(user: User, payload: str = "") -> None:
             return
         # --- deep-link payloads work for BOTH new and already-registered users ---
         anon_code = None
+        topic = None
+        if payload.startswith("t") and len(payload) > 1:
+            topic = await s.get(db_topic_model(),payload[1:])
+            if not topic or not topic.active:
+                await send(u,"link_expired")
+                return
+            from .commerce import owns
+            if not await owns(s,topic.owner_id,"links"):
+                await send(u,"link_expired")
+                return
+            owner = await s.get(User,topic.owner_id)
+            anon_code = await service.ensure_anon_link(s,owner)
         if payload.startswith("msg_"):
             anon_code = payload[4:]          # legacy v3 links
         elif payload.startswith("m") and len(payload) > 1 and not payload.startswith("msg"):
@@ -315,7 +340,7 @@ async def cmd_start(user: User, payload: str = "") -> None:
                 # the pending target is remembered — right after signup the
                 # user lands straight in the anon-message flow.
                 if needs_registration(u):
-                    u.state = _st_with_after(u.state, {"step": "language", "after_reg": {"anon": target.id}})
+                    u.state = _st_with_after(u.state, {"step": "language", "after_reg": {"anon": target.id, **({"topic":topic.id} if topic else {})}})
                     await send(u, "anon_gate_teaser")
                     await send(u, "welcome", keyboard=kb(
                         [btn(LANG_NAMES["fa"], "lang_fa"), btn(LANG_NAMES["en"], "lang_en"),
@@ -326,7 +351,7 @@ async def cmd_start(user: User, payload: str = "") -> None:
                 if blocked.scalar_one_or_none():
                     await main_menu(u)
                     return
-                u.state = _st_with_after(u.state, {"step": "anon_msg", "target": target.id})
+                u.state = _st_with_after(u.state, {"step": "anon_msg", "target": target.id, **({"topic":topic.id} if topic else {})})
                 await send(u, "anon_msg_intro")
                 return
             # invalid/expired code or the owner themself -> normal entry
@@ -575,7 +600,7 @@ async def show_anon_links(user: User) -> None:
     await send(user, "anon_link_info",
                tg_link=tg_link(anon_start_payload(code)),
                bale_link=bale_link(anon_start_payload(code)),
-               keyboard=back_kb(user.language))
+               keyboard=back_kb(user.language, [[btn({"fa":"🔗 لینک‌های موضوعی","en":"🔗 Topic links","ru":"🔗 Тематические ссылки"}.get(user.language,"🔗"), "m:links")]]))
 
 
 # ------------------------------------------------------ anon threads (v3) ----
@@ -940,6 +965,9 @@ async def run_match_cycle() -> None:
         for me, other in ((ua,ub),(ub,ua)):
             card = tr(me.language, "matched", name=other.display_name, age=other.age,
                 gender=GENDER_LABEL.get(other.gender or "male", GENDER_LABEL["male"])[me.language], bio=other.bio or "")
+            from .commerce import profile_card
+            async with session_scope() as card_session:
+                card = await profile_card(card_session, me, other, card)
             adp = adapter(me.platform)
             try:
                 if other.photo_file_id and other.platform == me.platform and adp:
@@ -972,52 +1000,44 @@ async def run_match_cycle() -> None:
 
 async def do_next(user: User) -> None:
     async with session_scope() as s:
-        u = await s.get(User, user.id)
-        chat = await service.active_chat_for(s, u.id)
+        u = await s.get(User,user.id)
+        chat = await service.active_chat_for(s,u.id)
         if not chat:
-            # v2.5: this is what a stale «next partner» keyboard used to do —
-            # silently push the user back into the search queue. Tell them
-            # instead, with a fresh CTA.
-            await s.commit()
-            await send(u, "not_in_chat", keyboard=search_cta(u.language))
-            return
-        partner = await partner_of(s, chat, u)
-        ended_id = chat.id
-        await service.end_chat(s, chat, "next", u.id)
-        if partner:
-            await send(partner, "partner_left", keyboard=search_cta(partner.language))
-        if not (await s.execute(select(QueueEntry).where(QueueEntry.user_id == u.id))).scalar_one_or_none():
-            s.add(QueueEntry(user_id=u.id, age_group=service.age_group(u.age),
-                             gender=u.gender, gender_filter="everyone"))
-        # v2.5: retire both users' control panels for this chat
-        await retire_controls(u, ended_id)
-        if partner:
-            await retire_controls(partner, ended_id)
-    await send(user, "searching", keyboard=kb(
-        [btn(tr(user.language, "btn_stop_search"), "stop_search")]))
+            partner,ended_id = None,None
+        else:
+            partner = await partner_of(s,chat,u)
+            ended_id = chat.id
+            await service.end_chat(s,chat,"next",u.id)
+            if not (await s.execute(select(QueueEntry).where(QueueEntry.user_id==u.id))).scalar_one_or_none():
+                s.add(QueueEntry(user_id=u.id,age_group=service.age_group(u.age),gender=u.gender,gender_filter="everyone"))
+    if not ended_id:
+        await send(user,"not_in_chat",keyboard=search_cta(user.language))
+        return
+    await retire_controls(u,ended_id)
+    if partner:
+        await retire_controls(partner,ended_id)
+        await send(partner,"partner_left",keyboard=ended_cta(partner.language,ended_id))
+    await send(user,"searching",keyboard=kb([btn(tr(user.language,"btn_stop_search"),"stop_search")]))
     await run_match_cycle()
     await invite_recently_active(user)
 
 
 async def do_stop(user: User) -> None:
     async with session_scope() as s:
-        u = await s.get(User, user.id)
-        removed = (await s.execute(
-            delete(QueueEntry).where(QueueEntry.user_id == u.id))).rowcount
-        chat = await service.active_chat_for(s, u.id)
+        u = await s.get(User,user.id)
+        removed = (await s.execute(delete(QueueEntry).where(QueueEntry.user_id==u.id))).rowcount
+        chat = await service.active_chat_for(s,u.id)
+        partner = None
         if chat:
-            partner = await partner_of(s, chat, u)
+            partner = await partner_of(s,chat,u)
             ended_id = chat.id
-            await service.end_chat(s, chat, "left", u.id)
-            if partner:
-                await send(partner, "partner_left", keyboard=search_cta(partner.language))
-            await retire_controls(u, ended_id)
-            if partner:
-                await retire_controls(partner, ended_id)
-    if removed:
-        await send(user, "search_cancel")
-    else:
-        await send(user, "chat_ended")
+            await service.end_chat(s,chat,"left",u.id)
+    if chat:
+        await retire_controls(u,ended_id)
+        if partner:
+            await retire_controls(partner,ended_id)
+            await send(partner,"partner_left",keyboard=ended_cta(partner.language,ended_id))
+    await send(user,"search_cancel" if removed else "chat_ended")
     await main_menu(user)
 
 
@@ -1486,12 +1506,19 @@ async def show_wallet(user: User) -> None:
         u = await s.get(User, user.id)
         coins = u.coin_balance
     rows = [
-        [btn(tr(lang, "btn_store"), "store")],
+        [btn(tr(lang, "btn_store"), "m:coins")],
     ]
     await send(user, "wallet_title", coins=coins, keyboard=back_kb(lang, rows))
 
 
 async def show_store(user: User) -> None:
+    from .shop_bot import home
+    async with session_scope() as s:
+        (await s.get(User,user.id)).state=None
+    await home(user)
+
+
+async def show_coin_store(user: User) -> None:
     """v2.2: coin purchase packages + custom amount (inside the wallet menu).
     v2.4.4: package prices are ALWAYS derived from the store rate
     (store.tomanPerCoin / store.coinsPerStar) so a rate change applies to
@@ -1665,7 +1692,18 @@ async def handle_message(platform: str, msg: dict) -> None:
         step = state.get("step")
         if step in {"birth_year", "birth_month", "birth_day", "edit_age", "custom_coins"}:
             text = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+        if step == "m_promo" and (not text.startswith("/") or text.strip().lower()=="/cancel"):
+            if needs_registration(user) or user.status != "active":
+                return
+            if (await service.get_setting(s,"app")).get("maintenanceMode") and not await _is_admin(user):
+                await send(user,"maintenance")
+                return
+            await s.commit()
+            from .shop_bot import text_flow
+            await text_flow(user,text)
+            return
         if text.startswith("/"):
+            if step=="m_promo": user.state=None
             await s.commit()
             cmd, _, args = text.partition(" ")
             # v2.3.4: unfinished signups may only use the harmless commands —
@@ -1809,6 +1847,16 @@ async def handle_message(platform: str, msg: dict) -> None:
             target = await s.get(User, state.get("target", 0))
             # keep the anon_msg state so the sender can continue the thread
             if target and target.status == "active":
+                if state.get("topic"):
+                    from .db import TopicLink
+                    from .shop_bot import TOPICS, L
+                    from .commerce import owns
+                    topic = await s.get(TopicLink,state["topic"])
+                    if not topic or topic.owner_id != target.id or not topic.active or not await owns(s,target.id,"links"):
+                        user.state = None
+                        await send(user,"link_expired")
+                        return
+                    text = "["+L(target,*TOPICS[topic.label])+"] " + text
                 delivered = await deliver_anon_message(s, user, target, text)
                 if not delivered:
                     user.state = None
@@ -1945,7 +1993,8 @@ async def handle_message(platform: str, msg: dict) -> None:
 
         # charge sender BEFORE delivery; refund if delivery fails
         eco = await service.get_setting(s, "economy")
-        cost = eco.get("messageCost", 1)
+        from .commerce import pass_active
+        cost = 0 if await pass_active(s,user.id) else eco.get("messageCost", 1)
         if cost > 0:
             txn = await service.debit(s, user, cost, "message_cost", "هزینه ارسال پیام",
                                       idempotency_key=source_key)
@@ -2087,6 +2136,15 @@ async def handle_callback(platform: str, query: dict) -> None:
         if app_cfg.get("maintenanceMode") and not await _is_admin(user):
             await send(user, "maintenance")
             return
+        if data.startswith(("m:","g:")) or data == "chat_fun":
+            if user.status != "active":
+                return
+            # Opening commerce/game controls ends any invisible compose flow.
+            user.state=None
+            await s.commit()
+            from .shop_bot import handle
+            await handle(user, "m:fun" if data == "chat_fun" else data)
+            return
         if data == "back_home":
             user.state = None
             await main_menu(user)
@@ -2129,7 +2187,7 @@ async def handle_callback(platform: str, query: dict) -> None:
                     blocked = await s.execute(select(Block).where(
                         Block.blocker_id == target.id, Block.blocked_id == user.id))
                     if not blocked.scalar_one_or_none():
-                        user.state = _st_with_after(user.state, {"step": "anon_msg", "target": target.id})
+                        user.state = _st_with_after(user.state, {"step": "anon_msg", "target": target.id, **({"topic":after["topic"]} if after.get("topic") else {})})
                         await send(user, "anon_msg_intro")
                         return
             await main_menu(user)

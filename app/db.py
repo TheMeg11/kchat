@@ -713,3 +713,98 @@ def _invalidate_committed_config(session):
     if changed:
         from .service import invalidate_cache
         invalidate_cache()
+
+
+# Monetization v2: separate tables keep the legacy user/payment schema intact.
+class MemberProfile(Base):
+    __tablename__ = "member_profiles"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    theme: Mapped[str] = mapped_column(String(24), default="plain")
+    active_coupon: Mapped[Optional[str]] = mapped_column(String(32), default=None)
+    first_order: Mapped[Optional[str]] = mapped_column(String(64), default=None)
+    game_trial_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    allow_reconnect: Mapped[bool] = mapped_column(Boolean, default=True)
+    allow_gifts: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class ShopQuote(Base):
+    __tablename__ = "shop_quotes"
+    __table_args__ = (Index("ix_shop_recovery", "status", "sku", "created_at"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    payer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    recipient_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    sku: Mapped[str] = mapped_column(String(32))
+    coins: Mapped[int] = mapped_column(Integer)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(24), default="quoted")
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class MemberGrant(Base):
+    __tablename__ = "member_grants"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    sku: Mapped[str] = mapped_column(String(32), index=True)
+    purchase_id: Mapped[str] = mapped_column(String(32), unique=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class PromoCode(Base):
+    __tablename__ = "promo_codes"
+    code: Mapped[str] = mapped_column(String(32), primary_key=True)
+    percent: Mapped[int] = mapped_column(Integer, default=0)
+    gift_coins: Mapped[int] = mapped_column(Integer, default=0)
+    max_uses: Mapped[int] = mapped_column(Integer)
+    used: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class PromoUse(Base):
+    __tablename__ = "promo_uses"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(ForeignKey("promo_codes.code"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    __table_args__ = (UniqueConstraint("code", "user_id", name="uq_promo_user"),)
+
+
+class TopicLink(Base):
+    __tablename__ = "topic_links"
+    id: Mapped[str] = mapped_column(String(24), primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    label: Mapped[str] = mapped_column(String(40))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class ReconnectRequest(Base):
+    __tablename__ = "reconnect_requests"
+    __table_args__ = (Index("ix_reconnect_recovery", "status", "expires_at"),)
+    id: Mapped[str] = mapped_column(String(24), primary_key=True)
+    toman_equivalent: Mapped[int] = mapped_column(Integer, default=0)
+    old_chat_id: Mapped[int] = mapped_column(ForeignKey("chats.id"), unique=True)
+    requester_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    target_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    new_chat_id: Mapped[Optional[int]] = mapped_column(ForeignKey("chats.id"), default=None)
+    coins: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class SocialGame(Base):
+    __tablename__ = "social_games"
+    id: Mapped[str] = mapped_column(String(24), primary_key=True)
+    chat_id: Mapped[int] = mapped_column(ForeignKey("chats.id"), index=True)
+    host_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    kind: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(24), default="invited")
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    message_a: Mapped[Optional[int]] = mapped_column(BigInteger, default=None)
+    message_b: Mapped[Optional[int]] = mapped_column(BigInteger, default=None)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

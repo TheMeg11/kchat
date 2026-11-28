@@ -11,6 +11,12 @@ Anonymous chat bots for Telegram and Bale, with a Persian RTL web administration
 
 This repository supports **one process / one replica**. See the documented delivery/crash and multi-process limitations before deployment. No change to a deployed service is implied by these source changes.
 
+## Store, VIP and chat activities (2026-11-28)
+
+A consent-based reconnect flow, 30-day VIP, message pass, starter bundle, membership gifts, inline tic-tac-toe/co-op, virtual gifts, introduction themes, topic links and bounded discount/gift codes are implemented. New products use explicitly confirmed wallet quotes; the existing Stars/Bale flows still top up coins. Prices and limited codes are managed under **محصولات و اشتراک** in the web panel.
+
+See [features, pricing defaults, consent, recovery and test evidence](docs/MONETIZATION.md). Reconnect initially references 1,000 Toman (5 wallet coins at the default store rate); no arbitrary paid last-message or block bypass. VIP is not unlimited messaging or queue priority. All prices are configurable; subscriptions never auto-renew.
+
 ## Local start
 
 ```sh

@@ -53,6 +53,37 @@ try {
   await page.setViewportSize({width:390,height:844});
   await page.screenshot({path:'artifacts/user-search-mobile.png',fullPage:true});
   assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),'mobile horizontal overflow');
+  // Real commerce screen: persisted settings, bounded promo creation and revocation.
+  await page.goto(base+'/monetization');
+  await page.getByRole('heading',{name:'قیمت‌گذاری و توقف فروش'}).waitFor();
+  const reconnectPrice=page.getByLabel('قیمت پایه اتصال مجدد (تومان)',{exact:true});
+  const originalPrice=await reconnectPrice.inputValue();
+  await reconnectPrice.fill('1200');
+  const saved=page.waitForResponse(r=>r.url().endsWith('/monetization') && r.request().method()==='PUT');
+  await page.getByRole('button',{name:'ذخیره قیمت‌ها',exact:true}).click();
+  assert.equal((await saved).status(),200);
+  await page.reload();
+  await reconnectPrice.waitFor();
+  assert.equal(await reconnectPrice.inputValue(),'1200');
+  await reconnectPrice.fill(originalPrice);
+  const restored=page.waitForResponse(r=>r.url().endsWith('/monetization') && r.request().method()==='PUT');
+  await page.getByRole('button',{name:'ذخیره قیمت‌ها',exact:true}).click();
+  assert.equal((await restored).status(),200);
+  const code='E2E-'+Date.now();
+  await page.getByLabel('کد (حروف لاتین، عدد و خط تیره)',{exact:true}).fill(code);
+  await page.getByLabel('انقضا (به وقت دستگاه شما)',{exact:true}).fill(new Date(Date.now()+86400000).toISOString().slice(0,16));
+  const created=page.waitForResponse(r=>r.url().endsWith('/monetization/promos') && r.request().method()==='POST');
+  await page.getByRole('button',{name:'ساخت کد',exact:true}).click();
+  assert.equal((await created).status(),200);
+  await page.getByText(code+' · ',{exact:false}).waitFor();
+  const promoRow=page.locator('div').filter({has:page.locator('p').filter({hasText:code})}).filter({has:page.getByRole('button',{name:'غیرفعال کردن',exact:true})}).last();
+  const revoked=page.waitForResponse(r=>r.url().endsWith('/promos/'+code) && r.request().method()==='DELETE');
+  await promoRow.getByRole('button',{name:'غیرفعال کردن',exact:true}).click();
+  assert.equal((await revoked).status(),200);
+  await page.screenshot({path:'artifacts/commerce-admin-mobile.png',fullPage:true});
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),'commerce mobile overflow');
+  await page.setViewportSize({width:1440,height:960});
+  await page.screenshot({path:'artifacts/commerce-admin-desktop.png',fullPage:true});
   for(const path of ['/monitoring','/backups','/security']) {
     await page.goto(base+path); await page.waitForTimeout(500);
   }
@@ -66,5 +97,5 @@ try {
   await page.reload();
   assert.equal(await page.evaluate(async()=>(await fetch('/api/admin/v1/auth/me')).status),200);
   assert.deepEqual(errors,[]);
-  console.log('PASS: login, refresh+mutation, old-user server search, Persian digits, dialog Escape, offline recovery, mobile width, monitoring/backups/security rendering, password+session rotation');
-} finally {await browser.close();}
+  console.log('PASS: login, refresh+mutation, old-user server search, Persian digits, dialog Escape, offline recovery, mobile width, monitoring/backups/security rendering, commerce prices+promos+mobile, password+session rotation');
+} catch(e) {console.error('browser errors',errors);console.error((await page.locator('body').innerText()).slice(-5000));await page.screenshot({path:'artifacts/panel-failure.png',fullPage:true});throw e;} finally {await browser.close();}

@@ -24,6 +24,13 @@ async def migrate(engine):
             await conn.execute(text("SELECT pg_advisory_xact_lock(71389203)"))
         await conn.execute(text("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(64) PRIMARY KEY)"))
         applied = set((await conn.execute(text("SELECT version FROM schema_migrations"))).scalars())
+        if "20261128_commerce_v2" not in applied:
+            from . import db
+            tables = [db.MemberProfile.__table__,db.ShopQuote.__table__,db.MemberGrant.__table__,
+                db.PromoCode.__table__,db.PromoUse.__table__,db.TopicLink.__table__,
+                db.ReconnectRequest.__table__,db.SocialGame.__table__]
+            await conn.run_sync(lambda sync: db.Base.metadata.create_all(sync,tables=tables))
+            await conn.execute(text("INSERT INTO schema_migrations(version) VALUES ('20261128_commerce_v2')"))
         if "20261128_hardening_v1" in applied:
             return
         for statement in INDEXES:
