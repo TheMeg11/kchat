@@ -59,8 +59,47 @@ class Settings(BaseSettings):
         for key in ("encryption_key", "backup_password", "webhook_secret"):
             if len(getattr(self, key)) < 24:
                 raise RuntimeError(f"{key.upper()} must be configured with at least 24 characters")
-        if not self.public_url.startswith("https://"):
-            raise RuntimeError("PUBLIC_URL must use HTTPS in production")
+        self.resolve_production_public_url()
+
+    def resolve_production_public_url(self) -> None:
+        """Use Railway's public HTTPS domain only when no explicit URL is set.
+
+        Do not infer an origin from request headers or the private service domain,
+        and never silently replace an explicitly configured insecure URL.
+        """
+        from urllib.parse import urlsplit
+
+        url = self.public_url.strip()
+        if not url:
+            domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+            if domain:
+                # Railway supplies a hostname, not a URL, credentials or path.
+                import re
+                labels = domain.split(".")
+                if len(domain) > 253 or len(labels) < 2 or not all(
+                    re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                    for label in labels
+                ):
+                    raise RuntimeError("RAILWAY_PUBLIC_DOMAIN must be a public hostname, without a scheme or path")
+                url = "https://" + domain
+        try:
+            parsed = urlsplit(url)
+            valid = (
+                parsed.scheme == "https" and bool(parsed.hostname)
+                and parsed.username is None and parsed.password is None
+                and not parsed.query and not parsed.fragment
+                and not any(char.isspace() or ord(char) < 32 for char in url)
+            )
+            parsed.port  # Reject malformed or out-of-range ports too.
+        except ValueError:
+            valid = False
+        if not valid:
+            raise RuntimeError(
+                "PUBLIC_URL must be a valid HTTPS URL in production. "
+                "Set PUBLIC_URL to the panel's https:// address, or enable a Railway "
+                "public domain (RAILWAY_PUBLIC_DOMAIN)."
+            )
+        self.public_url = url.rstrip("/")
 
     # Networking
     public_url: str = ""
